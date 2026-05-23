@@ -113,6 +113,15 @@ void collect_benchmark_results(size_t input_size, size_t number_strings) {
       std::cerr << "bmh_search index: " << idx_bmh << "\n";
       exit(1);
     }
+    auto [found64, idx64] = neon_naive_search64(source.data(), source.size(), str.data(), str.size());
+    if (!found64 || p != idx64) {
+      std::cerr << "Error: neon_naive_search64 index mismatch\n";
+      std::cerr << "Source: " << source << "\n";
+      std::cerr << "Substring: " << str << "\n";
+      std::cerr << "std::string::find index: " << p << "\n";
+      std::cerr << "neon_naive_search64 index: " << idx64 << "\n";
+      exit(1);
+    }
 
   }
   volatile uint64_t counter = 0;
@@ -139,6 +148,17 @@ void collect_benchmark_results(size_t input_size, size_t number_strings) {
     counter += c;
   };
   pretty_print("find_neon", number_strings, counters::bench(find_neon));
+  auto find_neon64 = [&strings, &counter, &source]() {
+    size_t c = 0;
+    for (const auto &str : strings) {
+      auto [found, idx] = neon_naive_search64(source.data(), source.size(), str.data(), str.size());
+      if(found) {
+        c += idx;
+      }
+    }
+    counter += c;
+  };
+  pretty_print("find_neon64", number_strings, counters::bench(find_neon64));
   auto find_neon_sz = [&strings, &counter, &source]() {
     size_t c = 0;
     for (const auto &str : strings) {

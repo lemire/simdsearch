@@ -103,6 +103,86 @@ std::pair<bool, size_t> neon_naive_search(const char* text, size_t n, const char
 }
 
 
+// Same as neon_naive_search but with a 64-byte stride: each iteration loads
+// four 16-byte chunks (A/B/C/D), so each vdupq_n_u8 broadcast of a pattern
+// byte is reused across four match accumulators instead of one.
+std::pair<bool, size_t> neon_naive_search64(const char* text, size_t n, const char* pattern, size_t m) {
+    if (m == 0 || n < m) return {false, 0};
+
+    size_t i = 0;
+    // SIMD reads bytes [i, i + 63 + (m - 1)], so require i + m + 63 <= n.
+    if (m >= 4 && n >= m + 63) {
+        for (; i + m + 63 <= n; i += 64) {
+            uint8x16_t p0 = vdupq_n_u8((uint8_t)pattern[0]);
+            uint8x16_t fA = vceqq_u8(vld1q_u8((const uint8_t*)(text + i +  0)), p0);
+            uint8x16_t fB = vceqq_u8(vld1q_u8((const uint8_t*)(text + i + 16)), p0);
+            uint8x16_t fC = vceqq_u8(vld1q_u8((const uint8_t*)(text + i + 32)), p0);
+            uint8x16_t fD = vceqq_u8(vld1q_u8((const uint8_t*)(text + i + 48)), p0);
+
+            uint8x16_t p1 = vdupq_n_u8((uint8_t)pattern[1]);
+            fA = vandq_u8(fA, vceqq_u8(vld1q_u8((const uint8_t*)(text + i +  1)), p1));
+            fB = vandq_u8(fB, vceqq_u8(vld1q_u8((const uint8_t*)(text + i + 17)), p1));
+            fC = vandq_u8(fC, vceqq_u8(vld1q_u8((const uint8_t*)(text + i + 33)), p1));
+            fD = vandq_u8(fD, vceqq_u8(vld1q_u8((const uint8_t*)(text + i + 49)), p1));
+
+            uint8x16_t p2 = vdupq_n_u8((uint8_t)pattern[2]);
+            fA = vandq_u8(fA, vceqq_u8(vld1q_u8((const uint8_t*)(text + i +  2)), p2));
+            fB = vandq_u8(fB, vceqq_u8(vld1q_u8((const uint8_t*)(text + i + 18)), p2));
+            fC = vandq_u8(fC, vceqq_u8(vld1q_u8((const uint8_t*)(text + i + 34)), p2));
+            fD = vandq_u8(fD, vceqq_u8(vld1q_u8((const uint8_t*)(text + i + 50)), p2));
+
+            uint8x16_t p3 = vdupq_n_u8((uint8_t)pattern[3]);
+            fA = vandq_u8(fA, vceqq_u8(vld1q_u8((const uint8_t*)(text + i +  3)), p3));
+            fB = vandq_u8(fB, vceqq_u8(vld1q_u8((const uint8_t*)(text + i + 19)), p3));
+            fC = vandq_u8(fC, vceqq_u8(vld1q_u8((const uint8_t*)(text + i + 35)), p3));
+            fD = vandq_u8(fD, vceqq_u8(vld1q_u8((const uint8_t*)(text + i + 51)), p3));
+
+            for (size_t j = 4; j < m; ++j) {
+                uint8x16_t any = vorrq_u8(vorrq_u8(fA, fB), vorrq_u8(fC, fD));
+                if (vmaxvq_u32(any) == 0) break;
+                uint8x16_t pj = vdupq_n_u8((uint8_t)pattern[j]);
+                fA = vandq_u8(fA, vceqq_u8(vld1q_u8((const uint8_t*)(text + i + j +  0)), pj));
+                fB = vandq_u8(fB, vceqq_u8(vld1q_u8((const uint8_t*)(text + i + j + 16)), pj));
+                fC = vandq_u8(fC, vceqq_u8(vld1q_u8((const uint8_t*)(text + i + j + 32)), pj));
+                fD = vandq_u8(fD, vceqq_u8(vld1q_u8((const uint8_t*)(text + i + j + 48)), pj));
+            }
+
+            uint8x16_t any = vorrq_u8(vorrq_u8(fA, fB), vorrq_u8(fC, fD));
+            if (vmaxvq_u32(any) == 0) continue;
+
+            // Walk lanes in order so we return the lowest-index match.
+            if (vmaxvq_u32(fA) != 0) {
+                uint8x8_t nm = vshrn_n_u16(vreinterpretq_u16_u8(fA), 4);
+                uint64_t mask = vget_lane_u64(vreinterpret_u64_u8(nm), 0);
+                return {true, i + (__builtin_ctzll(mask) >> 2)};
+            }
+            if (vmaxvq_u32(fB) != 0) {
+                uint8x8_t nm = vshrn_n_u16(vreinterpretq_u16_u8(fB), 4);
+                uint64_t mask = vget_lane_u64(vreinterpret_u64_u8(nm), 0);
+                return {true, i + 16 + (__builtin_ctzll(mask) >> 2)};
+            }
+            if (vmaxvq_u32(fC) != 0) {
+                uint8x8_t nm = vshrn_n_u16(vreinterpretq_u16_u8(fC), 4);
+                uint64_t mask = vget_lane_u64(vreinterpret_u64_u8(nm), 0);
+                return {true, i + 32 + (__builtin_ctzll(mask) >> 2)};
+            }
+            uint8x8_t nm = vshrn_n_u16(vreinterpretq_u16_u8(fD), 4);
+            uint64_t mask = vget_lane_u64(vreinterpret_u64_u8(nm), 0);
+            return {true, i + 48 + (__builtin_ctzll(mask) >> 2)};
+        }
+    }
+
+    // Scalar tail for positions the 64-byte SIMD loop could not safely cover.
+    for (; i + m <= n; ++i) {
+        if (std::memcmp(text + i, pattern, m) == 0) {
+            return {true, i};
+        }
+    }
+
+    return {false, 0};
+}
+
+
 // Returns {found, index} of first occurrence (matches neon_naive_search interface).
 std::pair<bool, size_t> neon_stringzilla_find(const char* haystack, size_t h_len,
                                               const char* needle, size_t n_len)
