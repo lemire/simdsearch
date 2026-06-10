@@ -117,6 +117,7 @@ static const std::vector<Algo> kAlgos = {
     {"find_neon64", Kind::Stateless, neon_naive_search64},
     {"find_neon_stringzilla", Kind::Stateless, neon_stringzilla_find},
     {"find_bmh", Kind::Stateless, bmh_search},
+    {"find_bmh16", Kind::Stateless, bmh_search16},
     {"find_strstr", Kind::Stateless, strstr_search},
     {"find_std_default_searcher", Kind::Stateless, std_default_searcher},
     {"find_std_boyer_moore_searcher", Kind::Stateless, std_boyer_moore_searcher},
@@ -182,6 +183,14 @@ static inline std::pair<bool, size_t> do_find(const Algo &a,
   return {false, 0};
 }
 
+// True if any selected algorithm uses pre-built (amortized) searchers, so the
+// AmortState build cost is only paid when it is actually needed.
+static bool needs_amort(const std::vector<const Algo *> &algos) {
+  for (const Algo *a : algos)
+    if (a->kind != Kind::Stateless) return true;
+  return false;
+}
+
 // Count all non-overlapping occurrences of needle #id in haystack by repeatedly
 // searching the remaining suffix and advancing past each match (StringWars'
 // forward find-all loop).
@@ -226,14 +235,15 @@ std::vector<std::string> tokenize_words(const std::string &s) {
 
 // Synthetic mode: random 1KB text, many short random needles, first-occurrence
 // search timed per needle.
-void collect_benchmark_results(size_t input_size, size_t number_strings) {
+void collect_benchmark_results(size_t input_size, size_t number_strings,
+                               const std::vector<const Algo *> &algos) {
   std::string source = generate_random_string(input_size);
   auto strings = extract_random_substrings(source, number_strings);
 
   AmortState am;
-  am.prepare(strings);
+  if (needs_amort(algos)) am.prepare(strings);
 
-  // Validate every algorithm against std::string::find before timing.
+  // Validate every selected algorithm against std::string::find before timing.
   for (size_t id = 0; id < strings.size(); ++id) {
     const auto &str = strings[id];
     size_t p = source.find(str);
@@ -241,11 +251,11 @@ void collect_benchmark_results(size_t input_size, size_t number_strings) {
       std::cerr << "Error: reference substring not found\n";
       exit(1);
     }
-    for (const auto &a : kAlgos) {
-      auto [f, idx] = do_find(a, am, id, source.data(), source.size(),
+    for (const Algo *a : algos) {
+      auto [f, idx] = do_find(*a, am, id, source.data(), source.size(),
                               str.data(), str.size());
       if (!f || idx != p) {
-        std::cerr << "Error: " << a.name << " index mismatch (got " << idx
+        std::cerr << "Error: " << a->name << " index mismatch (got " << idx
                   << ", expected " << p << ")\n";
         exit(1);
       }
@@ -253,39 +263,76 @@ void collect_benchmark_results(size_t input_size, size_t number_strings) {
   }
 
   volatile uint64_t counter = 0;
-  for (const auto &a : kAlgos) {
+  for (const Algo *a : algos) {
     auto run = [&]() {
       size_t c = 0;
       for (size_t id = 0; id < strings.size(); ++id) {
         const auto &str = strings[id];
-        auto [f, idx] = do_find(a, am, id, source.data(), source.size(),
+        auto [f, idx] = do_find(*a, am, id, source.data(), source.size(),
                                 str.data(), str.size());
         if (f) c += idx;
       }
       counter += c;
     };
-    pretty_print(a.name, number_strings, counters::bench(run));
+    pretty_print(a->name, number_strings, counters::bench(run));
   }
 }
 
-// Horspool mode: draw random substrings of the data file at each length from 2
-// to 20 and time first-occurrence search for every algorithm. Patterns are cut
-// from the text itself, so each is guaranteed to be found. The table is printed
-// with one row per algorithm and one column per length, so reading across a row
-// shows how that algorithm's cost evolves with pattern length.
-void horspool_benchmark(const std::string &text) {
+// Look up an algorithm by its exact name in kAlgos; nullptr if not found.
+static const Algo *find_algo_by_name(const std::string &name) {
+  for (const auto &a : kAlgos)
+    if (name == a.name) return &a;
+  return nullptr;
+}
+
+// Split a comma-separated list, dropping empty fields.
+static std::vector<std::string> split_csv(const std::string &s) {
+  std::vector<std::string> out;
+  std::stringstream ss(s);
+  std::string cur;
+  while (std::getline(ss, cur, ',')) {
+    if (!cur.empty()) out.push_back(cur);
+  }
+  return out;
+}
+
+void list_algos() {
+  std::print("available algorithms:\n");
+  for (const auto &a : kAlgos) std::print("  {}\n", a.name);
+}
+
+// Horspool mode: draw 2000 random substrings of the data file at each requested
+// length and time first-occurrence search for each selected algorithm. Patterns
+// are cut from the text itself, so each is guaranteed to be found. The table has
+// one row per algorithm and one column per length, so reading across a row shows
+// how that algorithm's cost evolves with pattern length.
+void horspool_benchmark(const std::string &text, const std::string &source_desc,
+                        const std::vector<size_t> &requested_lengths,
+                        const std::vector<const Algo *> &algos) {
   static std::mt19937 gen(std::random_device{}());
   const size_t patterns_per_len = 2000;
-  const size_t min_len = 2, max_len = 20;
   volatile uint64_t sink = 0;
 
+  // Keep only lengths that fit the text.
   std::vector<size_t> lengths;
-  for (size_t L = min_len; L <= max_len && text.size() >= L; ++L)
-    lengths.push_back(L);
+  for (size_t L : requested_lengths) {
+    if (L < 1) {
+      std::print(stderr, "horspool: skipping invalid length 0\n");
+    } else if (L > text.size()) {
+      std::print(stderr, "horspool: skipping length {} (> text size {})\n", L,
+                 text.size());
+    } else {
+      lengths.push_back(L);
+    }
+  }
+  if (lengths.empty()) {
+    std::cerr << "horspool: no usable lengths\n";
+    exit(1);
+  }
 
   // ns[algo_index][length_index]
   std::vector<std::vector<double>> ns(
-      kAlgos.size(), std::vector<double>(lengths.size(), 0.0));
+      algos.size(), std::vector<double>(lengths.size(), 0.0));
 
   for (size_t li = 0; li < lengths.size(); ++li) {
     size_t L = lengths[li];
@@ -296,24 +343,24 @@ void horspool_benchmark(const std::string &text) {
       pats.emplace_back(text.substr(start_dist(gen), L));
 
     AmortState am;
-    am.prepare(pats);
+    if (needs_amort(algos)) am.prepare(pats);
 
-    // Validate every algorithm against std::string::find before timing.
+    // Validate every selected algorithm against std::string::find before timing.
     for (size_t id = 0; id < pats.size(); ++id) {
       size_t ref = text.find(pats[id]);
-      for (const auto &a : kAlgos) {
-        auto [f, idx] = do_find(a, am, id, text.data(), text.size(),
+      for (const Algo *a : algos) {
+        auto [f, idx] = do_find(*a, am, id, text.data(), text.size(),
                                 pats[id].data(), pats[id].size());
         if (!f || idx != ref) {
-          std::cerr << "Error: horspool mismatch in " << a.name << " at length "
+          std::cerr << "Error: horspool mismatch in " << a->name << " at length "
                     << L << " (got " << idx << ", expected " << ref << ")\n";
           exit(1);
         }
       }
     }
 
-    for (size_t ai = 0; ai < kAlgos.size(); ++ai) {
-      const Algo &a = kAlgos[ai];
+    for (size_t ai = 0; ai < algos.size(); ++ai) {
+      const Algo &a = *algos[ai];
       auto run = [&]() {
         size_t c = 0;
         for (size_t id = 0; id < pats.size(); ++id) {
@@ -330,18 +377,19 @@ void horspool_benchmark(const std::string &text) {
   }
 
   std::print("# horspool mode\n");
+  std::print("source: {}\n", source_desc);
   std::print("text size: {} bytes, {} random patterns per length\n", text.size(),
              patterns_per_len);
   std::print("values are ns per first-occurrence search (lower is better)\n");
   std::print("rows = algorithm, columns = pattern length\n\n");
 
   std::print("{:<48}", "algo");
-  for (size_t L : lengths) std::print(" {:>8}", L);
+  for (size_t L : lengths) std::print(" {:>10}", L);
   std::print("\n");
-  for (size_t ai = 0; ai < kAlgos.size(); ++ai) {
-    std::print("{:<48}", kAlgos[ai].name);
+  for (size_t ai = 0; ai < algos.size(); ++ai) {
+    std::print("{:<48}", algos[ai]->name);
     for (size_t li = 0; li < lengths.size(); ++li)
-      std::print(" {:>8.1f}", ns[ai][li]);
+      std::print(" {:>10.1f}", ns[ai][li]);
     std::print("\n");
   }
 }
@@ -352,7 +400,8 @@ void horspool_benchmark(const std::string &text) {
 // all non-overlapping occurrences. Throughput is reported as GB/s of haystack
 // scanned, crediting one full haystack length per needle (the StringWars
 // convention), plus ns per needle.
-void ashvardanian_benchmark(const std::string &hay) {
+void ashvardanian_benchmark(const std::string &hay,
+                            const std::vector<const Algo *> &algos) {
   const size_t max_needles = 1000;  // keep one pass quick; StringWars cycles all
   auto needles = tokenize_words(hay);
   if (needles.size() > max_needles) needles.resize(max_needles);
@@ -362,12 +411,13 @@ void ashvardanian_benchmark(const std::string &hay) {
   }
 
   AmortState am;
-  am.prepare(needles);
+  if (needs_amort(algos)) am.prepare(needles);
 
   std::print("# ashvardanian mode (StringWars-style forward find-all)\n");
   std::print("haystack: {} bytes, {} word needles (capped at {})\n", hay.size(),
              needles.size(), max_needles);
 
+  // Reference match count via std::string::find (kAlgos[0]), always available.
   size_t ref_total = 0;
   for (size_t id = 0; id < needles.size(); ++id)
     ref_total += count_all(kAlgos[0], am, id, hay, needles[id]);
@@ -376,13 +426,13 @@ void ashvardanian_benchmark(const std::string &hay) {
   std::print("{:<48} {:>10} {:>14} {:>12}\n", "algo", "GB/s", "ns/needle",
              "matches");
   volatile uint64_t sink = 0;
-  for (const auto &a : kAlgos) {
+  for (const Algo *a : algos) {
     // Validate match count against the reference before timing.
     size_t total = 0;
     for (size_t id = 0; id < needles.size(); ++id)
-      total += count_all(a, am, id, hay, needles[id]);
+      total += count_all(*a, am, id, hay, needles[id]);
     if (total != ref_total) {
-      std::cerr << "Error: ashvardanian match-count mismatch in " << a.name
+      std::cerr << "Error: ashvardanian match-count mismatch in " << a->name
                 << " (" << total << " vs " << ref_total << ")\n";
       exit(1);
     }
@@ -393,7 +443,7 @@ void ashvardanian_benchmark(const std::string &hay) {
         const auto &nd = needles[id];
         size_t pos = 0, m = nd.size();
         while (pos + m <= hay.size()) {
-          auto [f, idx] = do_find(a, am, id, hay.data() + pos,
+          auto [f, idx] = do_find(*a, am, id, hay.data() + pos,
                                   hay.size() - pos, nd.data(), m);
           if (!f) break;
           pos += idx + m;
@@ -406,35 +456,98 @@ void ashvardanian_benchmark(const std::string &hay) {
     double ns_total = agg.fastest_elapsed_ns();
     double gbps = double(needles.size()) * double(hay.size()) / ns_total;
     double ns_per_needle = ns_total / double(needles.size());
-    std::print("{:<48} {:>10.3f} {:>14.1f} {:>12}\n", a.name, gbps,
+    std::print("{:<48} {:>10.3f} {:>14.1f} {:>12}\n", a->name, gbps,
                ns_per_needle, ref_total);
   }
 }
 
 int main(int argc, char **argv) {
   std::string mode = (argc > 1) ? argv[1] : "";
-  std::string path = (argc > 2) ? argv[2] : "./data/43-0.txt";
 
-  if (mode == "synthetic") {
-    collect_benchmark_results(1024, 100000);
-    return 0;
-  }
-  if (mode == "horspool") {
-    horspool_benchmark(load_file(path));
-    return 0;
-  }
-  if (mode == "ashvardanian") {
-    ashvardanian_benchmark(load_file(path));
+  if (mode == "synthetic" || mode == "horspool" || mode == "ashvardanian") {
+    std::string path = "./data/43-0.txt";
+    bool path_given = false;
+    std::vector<size_t> lengths;       // horspool only
+    std::vector<const Algo *> algos;   // all modes; empty => all
+
+    // Helper: value of an option given either as "--opt val" or "--opt=val".
+    auto take_value = [&](const std::string &arg, int &k) -> std::string {
+      auto eq = arg.find('=');
+      if (eq != std::string::npos) return arg.substr(eq + 1);
+      if (k + 1 < argc) return argv[++k];
+      return "";
+    };
+
+    for (int k = 2; k < argc; ++k) {
+      std::string arg = argv[k];
+      if (arg == "--list") {
+        list_algos();
+        return 0;
+      } else if (arg == "--algos" || arg.rfind("--algos=", 0) == 0) {
+        for (const auto &nm : split_csv(take_value(arg, k))) {
+          const Algo *a = find_algo_by_name(nm);
+          if (!a) {
+            std::cerr << "unknown algorithm: " << nm << " (use '" << mode
+                      << " --list')\n";
+            return 1;
+          }
+          algos.push_back(a);
+        }
+      } else if (arg == "--lengths" || arg.rfind("--lengths=", 0) == 0) {
+        for (const auto &t : split_csv(take_value(arg, k)))
+          lengths.push_back(std::stoul(t));
+      } else if (arg.rfind("--", 0) == 0) {
+        std::cerr << "unknown option: " << arg << "\n";
+        return 1;
+      } else {
+        path = arg;  // positional datafile (horspool & ashvardanian)
+        path_given = true;
+      }
+    }
+
+    if (algos.empty())
+      for (const auto &a : kAlgos) algos.push_back(&a);
+    if (!lengths.empty() && mode != "horspool")
+      std::print(stderr, "ignoring --lengths (only applies to horspool, not {})\n",
+                 mode);
+
+    if (mode == "synthetic") {
+      collect_benchmark_results(1024, 100000, algos);
+    } else if (mode == "horspool") {
+      if (lengths.empty())
+        for (size_t L = 2; L <= 20; ++L) lengths.push_back(L);
+      if (path_given) {
+        horspool_benchmark(load_file(path), path, lengths, algos);
+      } else {
+        // No source file given: generate a random text big enough for the
+        // longest requested pattern (and a reasonable haystack to scan).
+        size_t max_len = 0;
+        for (size_t L : lengths) max_len = std::max(max_len, L);
+        size_t gen_size = std::max<size_t>(1u << 17, max_len * 2 + 64);
+        horspool_benchmark(generate_random_string(gen_size),
+                           std::format("random ({} bytes)", gen_size), lengths,
+                           algos);
+      }
+    } else {  // ashvardanian
+      ashvardanian_benchmark(load_file(path), algos);
+    }
     return 0;
   }
 
-  std::print("usage: {} <mode> [datafile]\n", argv[0]);
+  std::print("usage: {} <mode> [datafile] [options]\n", argv[0]);
   std::print("  modes:\n");
   std::print("    synthetic     random 1KB text, 100k short needles (original)\n");
-  std::print("    horspool      random substrings of datafile, length 2..20, "
+  std::print("    horspool      random substrings of a source text, "
              "first-occurrence ns matrix\n");
   std::print("    ashvardanian  StringWars-style forward find-all over the "
              "whole datafile, GB/s\n");
-  std::print("  datafile defaults to ./data/43-0.txt (horspool & ashvardanian)\n");
+  std::print("  datafile is optional for horspool (random text if omitted); "
+             "ashvardanian defaults to ./data/43-0.txt\n");
+  std::print("\n  options (all modes):\n");
+  std::print("    --algos x,y       algorithms to test (default all), by name\n");
+  std::print("    --list            list available algorithm names and exit\n");
+  std::print("\n  horspool only:\n");
+  std::print("    --lengths a,b,c   pattern lengths to test (default 2..20), "
+             "e.g. --lengths 20,1000\n");
   return 1;
 }
