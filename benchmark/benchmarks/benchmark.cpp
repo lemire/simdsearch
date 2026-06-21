@@ -13,7 +13,19 @@
 #include <vector>
 
 #include "counters/bench.h"
-#include "neonsearch.h"
+
+// Pick the SIMD backend for the host architecture. Each header is
+// self-contained (it also provides the portable scalar/library searchers), so
+// exactly one is included per build.
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+  #include "avx512search.h"
+  #define SIMDSEARCH_AVX512 1
+#elif defined(__aarch64__) || defined(__ARM_NEON)
+  #include "neonsearch.h"
+  #define SIMDSEARCH_NEON 1
+#else
+  #error "No supported SIMD backend (need AVX-512 BW or ARM NEON)"
+#endif
 
 double pretty_print(const std::string &name, size_t num_values,
                     counters::event_aggregate agg) {
@@ -113,9 +125,15 @@ struct Algo {
 // the algorithm set and the labels are identical across all benchmarks.
 static const std::vector<Algo> kAlgos = {
     {"find_classic", Kind::Stateless, classic_find},
+#if defined(SIMDSEARCH_AVX512)
+    {"find_avx512", Kind::Stateless, avx512_naive_search},
+    {"find_avx512_256", Kind::Stateless, avx512_naive_search256},
+    {"find_avx512_stringzilla", Kind::Stateless, avx512_stringzilla_find},
+#elif defined(SIMDSEARCH_NEON)
     {"find_neon", Kind::Stateless, neon_naive_search},
     {"find_neon64", Kind::Stateless, neon_naive_search64},
     {"find_neon_stringzilla", Kind::Stateless, neon_stringzilla_find},
+#endif
     {"find_bmh", Kind::Stateless, bmh_search},
     {"find_bmh16", Kind::Stateless, bmh_search16},
     {"find_strstr", Kind::Stateless, strstr_search},
