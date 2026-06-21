@@ -259,25 +259,69 @@ std::pair<bool, size_t> neon_naive_search64(const char* text, size_t n, const ch
 }
 
 
-// Returns {found, index} of first occurrence (matches neon_naive_search interface).
+// Pick three needle offsets to anchor the SIMD pre-filter on, faithfully
+// porting StringZilla's sz_locate_needle_anomalies_. Start with first / middle
+// / last; if any of the three bytes collide, walk the middle and last offsets
+// inward so the trio stays distinct (a stronger filter). For needles longer
+// than 8 bytes, prefer "vibrant" bytes < 191 — values >= 192 are UTF-8
+// continuation bytes that recur in text, so anchoring on them is weak.
+static inline void sz_locate_needle_anomalies(const char* start, size_t length,
+                                              size_t& first, size_t& second,
+                                              size_t& third) {
+    const unsigned char* s = (const unsigned char*)start;
+    first = 0;
+    second = length / 2;
+    third = length - 1;
+
+    bool has_duplicates = s[first] == s[second] || s[first] == s[third] ||
+                          s[second] == s[third];
+    if (length > 3 && has_duplicates) {
+        while (s[second] == s[first] && second + 1 < third) ++second;
+        while ((s[third] == s[second] || s[third] == s[first]) &&
+               third > second + 1)
+            --third;
+    }
+
+    if (length > 8) {
+        size_t vfirst = first, vsecond = second, vthird = third;
+        while ((s[vsecond] > 191 || s[vsecond] == s[vthird]) &&
+               (vsecond + 1 < vthird))
+            ++vsecond;
+        if (s[vsecond] < 191) second = vsecond;
+        else vsecond = second;
+        while ((s[vfirst] > 191 || s[vfirst] == s[vsecond] ||
+                s[vfirst] == s[vthird]) &&
+               (vfirst + 1 < vsecond))
+            ++vfirst;
+        if (s[vfirst] < 191) first = vfirst;
+    }
+}
+
+// Returns {found, index} of first occurrence (matches neon_naive_search
+// interface). Faithful port of StringZilla's sz_find_neon. Three needle bytes
+// (first/middle/last, chosen by sz_locate_needle_anomalies) are broadcast and
+// compared against 16-byte haystack windows; ANDing the three masks leaves
+// only candidates matching at all three anchors, which a memcmp then verifies
+// in full. The 16-lane match vector is narrowed to a 64-bit value (4 bits per
+// lane) via shrn #4 so the matches can be iterated with a trailing-zero count,
+// exactly as StringZilla does. NEON has no masked loads, so a serial scalar
+// tail covers positions the 16-byte window cannot reach.
 std::pair<bool, size_t> neon_stringzilla_find(const char* haystack, size_t h_len,
                                               const char* needle, size_t n_len)
 {
     if (n_len == 0) return {true, 0};
     if (h_len < n_len) return {false, 0};
 
-    // Special case for single-byte needles
+    // Single-byte needle: one broadcast compare per 16-byte window.
     if (n_len == 1) {
         uint8x16_t n_vec = vdupq_n_u8((uint8_t)needle[0]);
         size_t i = 0;
         for (; i + 16 <= h_len; i += 16) {
-            uint8x16_t h_vec = vld1q_u8((const uint8_t*)(haystack + i));
-            uint8x16_t eq = vceqq_u8(h_vec, n_vec);
+            uint8x16_t eq = vceqq_u8(vld1q_u8((const uint8_t*)(haystack + i)), n_vec);
             if (vmaxvq_u8(eq) != 0) {
-                uint8_t mask[16];
-                vst1q_u8(mask, eq);
-                for (int k = 0; k < 16; ++k)
-                    if (mask[k]) return {true, i + k};
+                uint8x8_t nm = vshrn_n_u16(vreinterpretq_u16_u8(eq), 4);
+                uint64_t mask = vget_lane_u64(vreinterpret_u64_u8(nm), 0);
+                return {true, i + ((size_t)__builtin_ctzll(mask) >> 2)};
             }
         }
         for (; i < h_len; ++i)
@@ -285,39 +329,33 @@ std::pair<bool, size_t> neon_stringzilla_find(const char* haystack, size_t h_len
         return {false, 0};
     }
 
-    // Fallback for needles too short for the 4-byte prefix heuristic
-    if (n_len < 4) {
-        for (size_t i = 0; i + n_len <= h_len; ++i) {
-            if (std::memcmp(haystack + i, needle, n_len) == 0)
-                return {true, i};
-        }
-        return {false, 0};
-    }
-
-    uint32_t prefix;
-    std::memcpy(&prefix, needle, 4);
-    uint32x4_t pref_vec = vdupq_n_u32(prefix);
+    size_t off_first, off_mid, off_last;
+    sz_locate_needle_anomalies(needle, n_len, off_first, off_mid, off_last);
+    uint8x16_t vfirst = vdupq_n_u8((uint8_t)needle[off_first]);
+    uint8x16_t vmid = vdupq_n_u8((uint8_t)needle[off_mid]);
+    uint8x16_t vlast = vdupq_n_u8((uint8_t)needle[off_last]);
 
     size_t i = 0;
-    // SIMD reads 16 bytes at haystack + i + {0,1,2,3}; require i + 19 <= h_len.
-    for (; i + 19 <= h_len; i += 16) {
-        uint32x4_t m0 = vceqq_u32(vld1q_u32((const uint32_t*)(haystack + i + 0)), pref_vec);
-        uint32x4_t m1 = vceqq_u32(vld1q_u32((const uint32_t*)(haystack + i + 1)), pref_vec);
-        uint32x4_t m2 = vceqq_u32(vld1q_u32((const uint32_t*)(haystack + i + 2)), pref_vec);
-        uint32x4_t m3 = vceqq_u32(vld1q_u32((const uint32_t*)(haystack + i + 3)), pref_vec);
-
-        uint32x4_t any_match = vorrq_u32(vorrq_u32(m0, m1), vorrq_u32(m2, m3));
-        uint64x2_t any64 = vreinterpretq_u64_u32(any_match);
-        if (vgetq_lane_u64(any64, 0) | vgetq_lane_u64(any64, 1)) {
-            for (int offset = 0; offset < 16; ++offset) {
-                if (i + offset + n_len > h_len) break;
-                if (std::memcmp(haystack + i + offset, needle, n_len) == 0)
-                    return {true, i + offset};
-            }
+    // Loads reach haystack[i + off_last + 15]; off_last <= n_len-1, so the
+    // window is in bounds while i + n_len + 15 <= h_len.
+    for (; i + n_len + 15 <= h_len; i += 16) {
+        uint8x16_t hf = vld1q_u8((const uint8_t*)(haystack + i + off_first));
+        uint8x16_t hm = vld1q_u8((const uint8_t*)(haystack + i + off_mid));
+        uint8x16_t hl = vld1q_u8((const uint8_t*)(haystack + i + off_last));
+        uint8x16_t matches = vandq_u8(
+            vandq_u8(vceqq_u8(hf, vfirst), vceqq_u8(hm, vmid)),
+            vceqq_u8(hl, vlast));
+        uint8x8_t nm = vshrn_n_u16(vreinterpretq_u16_u8(matches), 4);
+        uint64_t mask = vget_lane_u64(vreinterpret_u64_u8(nm), 0);
+        while (mask != 0) {
+            size_t b = (size_t)__builtin_ctzll(mask) >> 2;  // lane index
+            if (std::memcmp(haystack + i + b, needle, n_len) == 0)
+                return {true, i + b};
+            mask &= ~((uint64_t)0xF << (b * 4));  // clear this lane's nibble
         }
     }
 
-    // Scalar tail for positions the SIMD loop could not safely cover.
+    // Scalar tail (StringZilla falls back to sz_find_serial here).
     for (; i + n_len <= h_len; ++i) {
         if (std::memcmp(haystack + i, needle, n_len) == 0)
             return {true, i};

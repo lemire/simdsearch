@@ -190,48 +190,78 @@ std::pair<bool, size_t> avx512_naive_search256(const char* text, size_t n, const
 
     size_t i = 0;
     // SIMD reads bytes [i, i + 255 + (m - 1)], so require i + m + 255 <= n.
-    if (m >= 4 && n >= m + 255) {
-        for (; i + m + 255 <= n; i += 256) {
-            __m512i p0 = _mm512_set1_epi8((char)pattern[0]);
-            __mmask64 fA = _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(text + i +   0)), p0);
-            __mmask64 fB = _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(text + i +  64)), p0);
-            __mmask64 fC = _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(text + i + 128)), p0);
-            __mmask64 fD = _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(text + i + 192)), p0);
+    if (n >= m + 255) {
+        if (m >= 4) {
+            for (; i + m + 255 <= n; i += 256) {
+                __m512i p0 = _mm512_set1_epi8((char)pattern[0]);
+                __mmask64 fA = _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(text + i +   0)), p0);
+                __mmask64 fB = _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(text + i +  64)), p0);
+                __mmask64 fC = _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(text + i + 128)), p0);
+                __mmask64 fD = _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(text + i + 192)), p0);
 
-            __m512i p1 = _mm512_set1_epi8((char)pattern[1]);
-            fA = _mm512_mask_cmpeq_epi8_mask(fA, _mm512_loadu_si512((const void*)(text + i +   1)), p1);
-            fB = _mm512_mask_cmpeq_epi8_mask(fB, _mm512_loadu_si512((const void*)(text + i +  65)), p1);
-            fC = _mm512_mask_cmpeq_epi8_mask(fC, _mm512_loadu_si512((const void*)(text + i + 129)), p1);
-            fD = _mm512_mask_cmpeq_epi8_mask(fD, _mm512_loadu_si512((const void*)(text + i + 193)), p1);
+                __m512i p1 = _mm512_set1_epi8((char)pattern[1]);
+                fA = _mm512_mask_cmpeq_epi8_mask(fA, _mm512_loadu_si512((const void*)(text + i +   1)), p1);
+                fB = _mm512_mask_cmpeq_epi8_mask(fB, _mm512_loadu_si512((const void*)(text + i +  65)), p1);
+                fC = _mm512_mask_cmpeq_epi8_mask(fC, _mm512_loadu_si512((const void*)(text + i + 129)), p1);
+                fD = _mm512_mask_cmpeq_epi8_mask(fD, _mm512_loadu_si512((const void*)(text + i + 193)), p1);
 
-            __m512i p2 = _mm512_set1_epi8((char)pattern[2]);
-            fA = _mm512_mask_cmpeq_epi8_mask(fA, _mm512_loadu_si512((const void*)(text + i +   2)), p2);
-            fB = _mm512_mask_cmpeq_epi8_mask(fB, _mm512_loadu_si512((const void*)(text + i +  66)), p2);
-            fC = _mm512_mask_cmpeq_epi8_mask(fC, _mm512_loadu_si512((const void*)(text + i + 130)), p2);
-            fD = _mm512_mask_cmpeq_epi8_mask(fD, _mm512_loadu_si512((const void*)(text + i + 194)), p2);
+                __m512i p2 = _mm512_set1_epi8((char)pattern[2]);
+                fA = _mm512_mask_cmpeq_epi8_mask(fA, _mm512_loadu_si512((const void*)(text + i +   2)), p2);
+                fB = _mm512_mask_cmpeq_epi8_mask(fB, _mm512_loadu_si512((const void*)(text + i +  66)), p2);
+                fC = _mm512_mask_cmpeq_epi8_mask(fC, _mm512_loadu_si512((const void*)(text + i + 130)), p2);
+                fD = _mm512_mask_cmpeq_epi8_mask(fD, _mm512_loadu_si512((const void*)(text + i + 194)), p2);
 
-            __m512i p3 = _mm512_set1_epi8((char)pattern[3]);
-            fA = _mm512_mask_cmpeq_epi8_mask(fA, _mm512_loadu_si512((const void*)(text + i +   3)), p3);
-            fB = _mm512_mask_cmpeq_epi8_mask(fB, _mm512_loadu_si512((const void*)(text + i +  67)), p3);
-            fC = _mm512_mask_cmpeq_epi8_mask(fC, _mm512_loadu_si512((const void*)(text + i + 131)), p3);
-            fD = _mm512_mask_cmpeq_epi8_mask(fD, _mm512_loadu_si512((const void*)(text + i + 195)), p3);
+                __m512i p3 = _mm512_set1_epi8((char)pattern[3]);
+                fA = _mm512_mask_cmpeq_epi8_mask(fA, _mm512_loadu_si512((const void*)(text + i +   3)), p3);
+                fB = _mm512_mask_cmpeq_epi8_mask(fB, _mm512_loadu_si512((const void*)(text + i +  67)), p3);
+                fC = _mm512_mask_cmpeq_epi8_mask(fC, _mm512_loadu_si512((const void*)(text + i + 131)), p3);
+                fD = _mm512_mask_cmpeq_epi8_mask(fD, _mm512_loadu_si512((const void*)(text + i + 195)), p3);
 
-            for (size_t j = 4; j < m; ++j) {
-                if ((fA | fB | fC | fD) == 0) break;
-                __m512i pj = _mm512_set1_epi8((char)pattern[j]);
-                fA = _mm512_mask_cmpeq_epi8_mask(fA, _mm512_loadu_si512((const void*)(text + i + j +   0)), pj);
-                fB = _mm512_mask_cmpeq_epi8_mask(fB, _mm512_loadu_si512((const void*)(text + i + j +  64)), pj);
-                fC = _mm512_mask_cmpeq_epi8_mask(fC, _mm512_loadu_si512((const void*)(text + i + j + 128)), pj);
-                fD = _mm512_mask_cmpeq_epi8_mask(fD, _mm512_loadu_si512((const void*)(text + i + j + 192)), pj);
+                for (size_t j = 4; j < m; ++j) {
+                    if ((fA | fB | fC | fD) == 0) break;
+                    __m512i pj = _mm512_set1_epi8((char)pattern[j]);
+                    fA = _mm512_mask_cmpeq_epi8_mask(fA, _mm512_loadu_si512((const void*)(text + i + j +   0)), pj);
+                    fB = _mm512_mask_cmpeq_epi8_mask(fB, _mm512_loadu_si512((const void*)(text + i + j +  64)), pj);
+                    fC = _mm512_mask_cmpeq_epi8_mask(fC, _mm512_loadu_si512((const void*)(text + i + j + 128)), pj);
+                    fD = _mm512_mask_cmpeq_epi8_mask(fD, _mm512_loadu_si512((const void*)(text + i + j + 192)), pj);
+                }
+
+                if ((fA | fB | fC | fD) == 0) continue;
+
+                // Walk chunks in order so we return the lowest-index match.
+                if (fA != 0) return {true, i +   0 + (size_t)__builtin_ctzll(fA)};
+                if (fB != 0) return {true, i +  64 + (size_t)__builtin_ctzll(fB)};
+                if (fC != 0) return {true, i + 128 + (size_t)__builtin_ctzll(fC)};
+                return {true, i + 192 + (size_t)__builtin_ctzll(fD)};
             }
+        } else {
+            // Short needles (m = 1, 2, 3): keep the 256-byte stride but build
+            // the four accumulators with a generic loop from byte 0, so short
+            // patterns stay on the SIMD path instead of dropping to the scalar
+            // tail over the whole haystack.
+            for (; i + m + 255 <= n; i += 256) {
+                __m512i p0 = _mm512_set1_epi8((char)pattern[0]);
+                __mmask64 fA = _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(text + i +   0)), p0);
+                __mmask64 fB = _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(text + i +  64)), p0);
+                __mmask64 fC = _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(text + i + 128)), p0);
+                __mmask64 fD = _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(text + i + 192)), p0);
 
-            if ((fA | fB | fC | fD) == 0) continue;
+                for (size_t j = 1; j < m; ++j) {
+                    __m512i pj = _mm512_set1_epi8((char)pattern[j]);
+                    fA = _mm512_mask_cmpeq_epi8_mask(fA, _mm512_loadu_si512((const void*)(text + i + j +   0)), pj);
+                    fB = _mm512_mask_cmpeq_epi8_mask(fB, _mm512_loadu_si512((const void*)(text + i + j +  64)), pj);
+                    fC = _mm512_mask_cmpeq_epi8_mask(fC, _mm512_loadu_si512((const void*)(text + i + j + 128)), pj);
+                    fD = _mm512_mask_cmpeq_epi8_mask(fD, _mm512_loadu_si512((const void*)(text + i + j + 192)), pj);
+                }
 
-            // Walk chunks in order so we return the lowest-index match.
-            if (fA != 0) return {true, i +   0 + (size_t)__builtin_ctzll(fA)};
-            if (fB != 0) return {true, i +  64 + (size_t)__builtin_ctzll(fB)};
-            if (fC != 0) return {true, i + 128 + (size_t)__builtin_ctzll(fC)};
-            return {true, i + 192 + (size_t)__builtin_ctzll(fD)};
+                if ((fA | fB | fC | fD) == 0) continue;
+
+                // Walk chunks in order so we return the lowest-index match.
+                if (fA != 0) return {true, i +   0 + (size_t)__builtin_ctzll(fA)};
+                if (fB != 0) return {true, i +  64 + (size_t)__builtin_ctzll(fB)};
+                if (fC != 0) return {true, i + 128 + (size_t)__builtin_ctzll(fC)};
+                return {true, i + 192 + (size_t)__builtin_ctzll(fD)};
+            }
         }
     }
 
@@ -246,62 +276,98 @@ std::pair<bool, size_t> avx512_naive_search256(const char* text, size_t n, const
 }
 
 
+// Pick three needle offsets to anchor the SIMD pre-filter on, faithfully
+// porting StringZilla's sz_locate_needle_anomalies_. Start with first / middle
+// / last; if any of the three bytes collide, walk the middle and last offsets
+// inward so the trio stays distinct (a stronger filter). For needles longer
+// than 8 bytes, prefer "vibrant" bytes < 191 — values >= 192 are UTF-8
+// continuation bytes that recur in text, so anchoring on them is weak.
+static inline void sz_locate_needle_anomalies(const char* start, size_t length,
+                                              size_t& first, size_t& second,
+                                              size_t& third) {
+    const unsigned char* s = (const unsigned char*)start;
+    first = 0;
+    second = length / 2;
+    third = length - 1;
+
+    bool has_duplicates = s[first] == s[second] || s[first] == s[third] ||
+                          s[second] == s[third];
+    if (length > 3 && has_duplicates) {
+        while (s[second] == s[first] && second + 1 < third) ++second;
+        while ((s[third] == s[second] || s[third] == s[first]) &&
+               third > second + 1)
+            --third;
+    }
+
+    if (length > 8) {
+        size_t vfirst = first, vsecond = second, vthird = third;
+        while ((s[vsecond] > 191 || s[vsecond] == s[vthird]) &&
+               (vsecond + 1 < vthird))
+            ++vsecond;
+        if (s[vsecond] < 191) second = vsecond;
+        else vsecond = second;
+        while ((s[vfirst] > 191 || s[vfirst] == s[vsecond] ||
+                s[vfirst] == s[vthird]) &&
+               (vfirst + 1 < vsecond))
+            ++vfirst;
+        if (s[vfirst] < 191) first = vfirst;
+    }
+}
+
 // Returns {found, index} of first occurrence (matches avx512_naive_search
-// interface). AVX-512 port of the NEON StringZilla-style filter, using the
-// canonical x86 "first + last byte" anchoring (Muła/StringZilla). For each
-// 64-byte window we form two masks — text bytes equal to needle[0] and text
-// bytes (shifted by m-1) equal to needle[m-1] — and AND them. Surviving
-// candidates already match at both ends, so verification only memcmp's the
-// m-2 interior bytes. Anchoring on both ends instead of a 4-byte prefix keeps
-// the filter strong even when the needle's first bytes are common.
+// interface). Faithful port of StringZilla's sz_find_skylake. Three needle
+// bytes (first/middle/last, chosen by sz_locate_needle_anomalies) are
+// broadcast and compared against the haystack; ANDing the three masks leaves
+// only candidates that match at all three anchors, which a memcmp then
+// verifies in full. Every load is a predicated _mm512_maskz_loadu_epi8, so a
+// single masked loop covers the body, the tail, and haystacks shorter than one
+// 64-byte window with no scalar fallback (masked-off lanes are never touched,
+// so the loads stay in bounds at the end of the haystack).
 std::pair<bool, size_t> avx512_stringzilla_find(const char* haystack, size_t h_len,
                                                 const char* needle, size_t n_len)
 {
     if (n_len == 0) return {true, 0};
     if (h_len < n_len) return {false, 0};
 
-    // Single-byte needle: one broadcast compare per 64-byte window.
+    // Single-byte needle: one masked broadcast compare per 64-byte window.
     if (n_len == 1) {
         __m512i n_vec = _mm512_set1_epi8((char)needle[0]);
-        size_t i = 0;
-        for (; i + 64 <= h_len; i += 64) {
-            __mmask64 eq = _mm512_cmpeq_epi8_mask(
-                _mm512_loadu_si512((const void*)(haystack + i)), n_vec);
+        for (size_t i = 0; i < h_len; i += 64) {
+            size_t cand = h_len - i;  // bytes (= candidate positions) remaining
+            __mmask64 active = (cand >= 64) ? ~(__mmask64)0
+                                            : (((__mmask64)1 << cand) - 1);
+            __mmask64 eq = _mm512_mask_cmpeq_epi8_mask(
+                active, _mm512_maskz_loadu_epi8(active, haystack + i), n_vec);
             if (eq != 0) return {true, i + (size_t)__builtin_ctzll(eq)};
         }
-        for (; i < h_len; ++i)
-            if (haystack[i] == needle[0]) return {true, i};
         return {false, 0};
     }
 
-    __m512i first = _mm512_set1_epi8((char)needle[0]);
-    __m512i last = _mm512_set1_epi8((char)needle[n_len - 1]);
-    const size_t last_off = n_len - 1;
-    const size_t mid = n_len - 2;  // interior bytes still to verify
+    size_t off_first, off_mid, off_last;
+    sz_locate_needle_anomalies(needle, n_len, off_first, off_mid, off_last);
+    __m512i first = _mm512_set1_epi8((char)needle[off_first]);
+    __m512i mid = _mm512_set1_epi8((char)needle[off_mid]);
+    __m512i last = _mm512_set1_epi8((char)needle[off_last]);
 
-    size_t i = 0;
-    // The two loads cover bytes [i, i+63] and [i+last_off, i+last_off+63];
-    // require i + last_off + 64 <= h_len, i.e. i + n_len + 63 <= h_len.
-    for (; i + n_len + 63 <= h_len; i += 64) {
-        __mmask64 eq_first = _mm512_cmpeq_epi8_mask(
-            _mm512_loadu_si512((const void*)(haystack + i)), first);
-        __mmask64 eq_last = _mm512_cmpeq_epi8_mask(
-            _mm512_loadu_si512((const void*)(haystack + i + last_off)), last);
-        __mmask64 mask = eq_first & eq_last;
+    // Each iteration handles up to 64 candidate start positions [i, i+63].
+    // active masks to the candidates that actually exist; off_last <= n_len-1,
+    // so the masked-off lanes are exactly the ones that would read past h_len.
+    for (size_t i = 0; i + n_len <= h_len; i += 64) {
+        size_t cand = h_len - n_len + 1 - i;  // candidate positions remaining
+        __mmask64 active = (cand >= 64) ? ~(__mmask64)0
+                                        : (((__mmask64)1 << cand) - 1);
+        __mmask64 mask = _mm512_mask_cmpeq_epi8_mask(
+            active, _mm512_maskz_loadu_epi8(active, haystack + i + off_first), first);
+        mask = _mm512_mask_cmpeq_epi8_mask(
+            mask, _mm512_maskz_loadu_epi8(mask, haystack + i + off_mid), mid);
+        mask = _mm512_mask_cmpeq_epi8_mask(
+            mask, _mm512_maskz_loadu_epi8(mask, haystack + i + off_last), last);
         while (mask != 0) {
             size_t b = (size_t)__builtin_ctzll(mask);
-            // First and last bytes already match; check the interior only.
-            if (mid == 0 ||
-                std::memcmp(haystack + i + b + 1, needle + 1, mid) == 0)
+            if (std::memcmp(haystack + i + b, needle, n_len) == 0)
                 return {true, i + b};
             mask &= mask - 1;  // clear the lowest set bit and continue
         }
-    }
-
-    // Scalar tail for positions the SIMD loop could not safely cover.
-    for (; i + n_len <= h_len; ++i) {
-        if (std::memcmp(haystack + i, needle, n_len) == 0)
-            return {true, i};
     }
 
     return {false, 0};
