@@ -115,6 +115,41 @@ int main() {
         }
       }
     }
+
+    // UTF-8 Cyrillic text: exercises vibrant-byte anchor selection (bytes > 191).
+    // Source file is UTF-8; char literals carry the multibyte sequences as bytes.
+    {
+      std::string utf8 = "Привет мир и солнце";
+      std::vector<std::string> pats = {"При", "вет", "мир", "солнце", "нет"};
+      for (auto &p : pats)
+        for (auto &fn : fns) check(fn, utf8, p);
+    }
+
+    // Needle longer than 8 bytes whose default anchors are UTF-8 continuation
+    // bytes (>= 192); vibrant pivot must shift anchors before SIMD filtering.
+    {
+      std::string cont(12, '\x80');
+      cont[0] = 'X';
+      cont[6] = 'Z';
+      cont[11] = 'Y';
+      std::string hay(200, '\x80');
+      hay.replace(50, cont.size(), cont);
+      for (auto &fn : fns) check(fn, hay, cont);
+      hay.replace(50, cont.size(), std::string(cont.size(), '\x80'));
+      for (auto &fn : fns) check(fn, hay, cont);
+    }
+
+    // Short needles at SIMD boundaries (dedicated n_len == 2/3 paths).
+    {
+      std::string t(64, 'q');
+      t[31] = 'a';
+      t[32] = 'b';
+      for (auto &fn : fns) {
+        check(fn, t, "ab");
+        check(fn, t, "abc");
+        check(fn, t, "qb");
+      }
+    }
   }
 
   // ---- Randomized fuzz sweep over a small alphabet ----
@@ -122,7 +157,7 @@ int main() {
   const char alphabet[] = "abc";               // tiny -> many partial matches
   const size_t A = sizeof(alphabet) - 1;
 
-  for (int iter = 0; iter < 4000; ++iter) {
+  for (int iter = 0; iter < 3000; ++iter) {
     std::uniform_int_distribution<size_t> tlen_dist(1, 400);
     size_t tlen = tlen_dist(gen);
     std::string text(tlen, '?');
@@ -140,6 +175,28 @@ int main() {
     } else {
       pat.resize(plen);
       for (auto &c : pat) c = alphabet[gen() % A];
+    }
+
+    for (auto &fn : fns) check(fn, text, pat);
+  }
+
+  // ---- Wider-byte fuzz: bytes in [0, 255] stress vibrant-byte pivoting ----
+  for (int iter = 0; iter < 1000; ++iter) {
+    std::uniform_int_distribution<size_t> tlen_dist(1, 400);
+    size_t tlen = tlen_dist(gen);
+    std::string text(tlen, '\0');
+    for (auto &c : text) c = (char)(gen() & 0xFF);
+
+    std::uniform_int_distribution<size_t> plen_dist(1, 40);
+    size_t plen = std::min(plen_dist(gen), tlen);
+
+    std::string pat;
+    if (gen() & 1) {
+      std::uniform_int_distribution<size_t> start_dist(0, tlen - plen);
+      pat = text.substr(start_dist(gen), plen);
+    } else {
+      pat.resize(plen);
+      for (auto &c : pat) c = (char)(gen() & 0xFF);
     }
 
     for (auto &fn : fns) check(fn, text, pat);

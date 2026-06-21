@@ -6,6 +6,8 @@
 #include <functional>
 #include <utility>
 
+#include "sz_needle_anomalies.h"
+
 
 // C library strstr. Requires NUL-terminated text and pattern (the benchmark
 // inputs are std::string data, which is NUL-terminated and contains no NUL
@@ -123,7 +125,8 @@ std::pair<bool, size_t> bmh_search16(const char* text, size_t n, const char* pat
 // AND"). When every candidate has died the inner loop bails early; a surviving
 // mask gives the answer via the lowest set bit.
 std::pair<bool, size_t> avx512_naive_search(const char* text, size_t n, const char* pattern, size_t m) {
-    if (m == 0 || n < m) return {false, 0};
+    if (m == 0) return {true, 0};
+    if (n < m) return {false, 0};
     const size_t step = 64;
 
     size_t i = 0;
@@ -186,7 +189,8 @@ std::pair<bool, size_t> avx512_naive_search(const char* text, size_t n, const ch
 // mirrors the NEON neon_naive_search64 four-chunk unrolling, scaled from 16- to
 // 64-byte lanes.
 std::pair<bool, size_t> avx512_naive_search256(const char* text, size_t n, const char* pattern, size_t m) {
-    if (m == 0 || n < m) return {false, 0};
+    if (m == 0) return {true, 0};
+    if (n < m) return {false, 0};
 
     size_t i = 0;
     // SIMD reads bytes [i, i + 255 + (m - 1)], so require i + m + 255 <= n.
@@ -275,44 +279,6 @@ std::pair<bool, size_t> avx512_naive_search256(const char* text, size_t n, const
     return {false, 0};
 }
 
-
-// Pick three needle offsets to anchor the SIMD pre-filter on, faithfully
-// porting StringZilla's sz_locate_needle_anomalies_. Start with first / middle
-// / last; if any of the three bytes collide, walk the middle and last offsets
-// inward so the trio stays distinct (a stronger filter). For needles longer
-// than 8 bytes, prefer "vibrant" bytes < 191 — values >= 192 are UTF-8
-// continuation bytes that recur in text, so anchoring on them is weak.
-static inline void sz_locate_needle_anomalies(const char* start, size_t length,
-                                              size_t& first, size_t& second,
-                                              size_t& third) {
-    const unsigned char* s = (const unsigned char*)start;
-    first = 0;
-    second = length / 2;
-    third = length - 1;
-
-    bool has_duplicates = s[first] == s[second] || s[first] == s[third] ||
-                          s[second] == s[third];
-    if (length > 3 && has_duplicates) {
-        while (s[second] == s[first] && second + 1 < third) ++second;
-        while ((s[third] == s[second] || s[third] == s[first]) &&
-               third > second + 1)
-            --third;
-    }
-
-    if (length > 8) {
-        size_t vfirst = first, vsecond = second, vthird = third;
-        while ((s[vsecond] > 191 || s[vsecond] == s[vthird]) &&
-               (vsecond + 1 < vthird))
-            ++vsecond;
-        if (s[vsecond] < 191) second = vsecond;
-        else vsecond = second;
-        while ((s[vfirst] > 191 || s[vfirst] == s[vsecond] ||
-                s[vfirst] == s[vthird]) &&
-               (vfirst + 1 < vsecond))
-            ++vfirst;
-        if (s[vfirst] < 191) first = vfirst;
-    }
-}
 
 // Returns {found, index} of first occurrence (matches avx512_naive_search
 // interface). Faithful port of StringZilla's sz_find_skylake. Three needle
