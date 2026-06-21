@@ -6,6 +6,8 @@
 #include <functional>
 #include <utility>
 
+#include "sz_needle_anomalies.h"
+
 
 // C library strstr. Requires NUL-terminated text and pattern (the benchmark
 // inputs are std::string data, which is NUL-terminated and contains no NUL
@@ -259,73 +261,81 @@ std::pair<bool, size_t> neon_naive_search64(const char* text, size_t n, const ch
 }
 
 
-// Pick three needle offsets to anchor the SIMD pre-filter on, faithfully
-// porting StringZilla's sz_locate_needle_anomalies_. Start with first / middle
-// / last; if any of the three bytes collide, walk the middle and last offsets
-// inward so the trio stays distinct (a stronger filter). For needles longer
-// than 8 bytes, prefer "vibrant" bytes < 191 — values >= 192 are UTF-8
-// continuation bytes that recur in text, so anchoring on them is weak.
-static inline void sz_locate_needle_anomalies(const char* start, size_t length,
-                                              size_t& first, size_t& second,
-                                              size_t& third) {
-    const unsigned char* s = (const unsigned char*)start;
-    first = 0;
-    second = length / 2;
-    third = length - 1;
+// Port of StringZilla's sz_find_vreinterpretq_u8_u4_: shrn #4 movemask, keeping
+// one bit per lane so ctz/4 indexes candidates and "mask &= mask - 1" advances.
+static inline uint64_t neon_match_mask_from_eq(uint8x16_t vec) {
+    return vget_lane_u64(
+               vreinterpret_u64_u8(
+                   vshrn_n_u16(vreinterpretq_u16_u8(vec), 4)),
+               0) &
+           0x8888888888888888ull;
+}
 
-    bool has_duplicates = s[first] == s[second] || s[first] == s[third] ||
-                          s[second] == s[third];
-    if (length > 3 && has_duplicates) {
-        while (s[second] == s[first] && second + 1 < third) ++second;
-        while ((s[third] == s[second] || s[third] == s[first]) &&
-               third > second + 1)
-            --third;
-    }
-
-    if (length > 8) {
-        size_t vfirst = first, vsecond = second, vthird = third;
-        while ((s[vsecond] > 191 || s[vsecond] == s[vthird]) &&
-               (vsecond + 1 < vthird))
-            ++vsecond;
-        if (s[vsecond] < 191) second = vsecond;
-        else vsecond = second;
-        while ((s[vfirst] > 191 || s[vfirst] == s[vsecond] ||
-                s[vfirst] == s[vthird]) &&
-               (vfirst + 1 < vsecond))
-            ++vfirst;
-        if (s[vfirst] < 191) first = vfirst;
-    }
+static inline size_t neon_first_match_lane(uint64_t mask) {
+    return (size_t)__builtin_ctzll(mask) / 4;
 }
 
 // Returns {found, index} of first occurrence (matches neon_naive_search
-// interface). Faithful port of StringZilla's sz_find_neon. Three needle bytes
-// (first/middle/last, chosen by sz_locate_needle_anomalies) are broadcast and
-// compared against 16-byte haystack windows; ANDing the three masks leaves
-// only candidates matching at all three anchors, which a memcmp then verifies
-// in full. The 16-lane match vector is narrowed to a 64-bit value (4 bits per
-// lane) via shrn #4 so the matches can be iterated with a trailing-zero count,
-// exactly as StringZilla does. NEON has no masked loads, so a serial scalar
-// tail covers positions the 16-byte window cannot reach.
+// interface). Faithful port of StringZilla's sz_find_neon. n_len == 2 and
+// n_len == 3 use dedicated SIMD paths (as upstream does); longer needles pick
+// three anchor bytes via sz_locate_needle_anomalies, AND three compare masks,
+// verify survivors with memcmp. NEON has no masked loads, so a scalar tail
+// covers positions the 16-byte window cannot reach.
 std::pair<bool, size_t> neon_stringzilla_find(const char* haystack, size_t h_len,
                                               const char* needle, size_t n_len)
 {
     if (n_len == 0) return {true, 0};
     if (h_len < n_len) return {false, 0};
 
-    // Single-byte needle: one broadcast compare per 16-byte window.
     if (n_len == 1) {
         uint8x16_t n_vec = vdupq_n_u8((uint8_t)needle[0]);
         size_t i = 0;
         for (; i + 16 <= h_len; i += 16) {
-            uint8x16_t eq = vceqq_u8(vld1q_u8((const uint8_t*)(haystack + i)), n_vec);
-            if (vmaxvq_u8(eq) != 0) {
-                uint8x8_t nm = vshrn_n_u16(vreinterpretq_u16_u8(eq), 4);
-                uint64_t mask = vget_lane_u64(vreinterpret_u64_u8(nm), 0);
-                return {true, i + ((size_t)__builtin_ctzll(mask) >> 2)};
-            }
+            uint64_t matches = neon_match_mask_from_eq(
+                vceqq_u8(vld1q_u8((const uint8_t*)(haystack + i)), n_vec));
+            if (matches) return {true, i + neon_first_match_lane(matches)};
         }
         for (; i < h_len; ++i)
             if (haystack[i] == needle[0]) return {true, i};
+        return {false, 0};
+    }
+
+    if (n_len == 2) {
+        uint8x16_t n0 = vdupq_n_u8((uint8_t)needle[0]);
+        uint8x16_t n1 = vdupq_n_u8((uint8_t)needle[1]);
+        size_t i = 0;
+        for (; i + 17 <= h_len; i += 16) {
+            uint8x16_t matches_vec = vandq_u8(
+                vceqq_u8(vld1q_u8((const uint8_t*)(haystack + i + 0)), n0),
+                vceqq_u8(vld1q_u8((const uint8_t*)(haystack + i + 1)), n1));
+            uint64_t matches = neon_match_mask_from_eq(matches_vec);
+            if (matches) return {true, i + neon_first_match_lane(matches)};
+        }
+        for (; i + n_len <= h_len; ++i) {
+            if (std::memcmp(haystack + i, needle, n_len) == 0)
+                return {true, i};
+        }
+        return {false, 0};
+    }
+
+    if (n_len == 3) {
+        uint8x16_t n0 = vdupq_n_u8((uint8_t)needle[0]);
+        uint8x16_t n1 = vdupq_n_u8((uint8_t)needle[1]);
+        uint8x16_t n2 = vdupq_n_u8((uint8_t)needle[2]);
+        size_t i = 0;
+        for (; i + 18 <= h_len; i += 16) {
+            uint8x16_t matches_vec = vandq_u8(
+                vandq_u8(
+                    vceqq_u8(vld1q_u8((const uint8_t*)(haystack + i + 0)), n0),
+                    vceqq_u8(vld1q_u8((const uint8_t*)(haystack + i + 1)), n1)),
+                vceqq_u8(vld1q_u8((const uint8_t*)(haystack + i + 2)), n2));
+            uint64_t matches = neon_match_mask_from_eq(matches_vec);
+            if (matches) return {true, i + neon_first_match_lane(matches)};
+        }
+        for (; i + n_len <= h_len; ++i) {
+            if (std::memcmp(haystack + i, needle, n_len) == 0)
+                return {true, i};
+        }
         return {false, 0};
     }
 
@@ -342,16 +352,15 @@ std::pair<bool, size_t> neon_stringzilla_find(const char* haystack, size_t h_len
         uint8x16_t hf = vld1q_u8((const uint8_t*)(haystack + i + off_first));
         uint8x16_t hm = vld1q_u8((const uint8_t*)(haystack + i + off_mid));
         uint8x16_t hl = vld1q_u8((const uint8_t*)(haystack + i + off_last));
-        uint8x16_t matches = vandq_u8(
+        uint8x16_t matches_vec = vandq_u8(
             vandq_u8(vceqq_u8(hf, vfirst), vceqq_u8(hm, vmid)),
             vceqq_u8(hl, vlast));
-        uint8x8_t nm = vshrn_n_u16(vreinterpretq_u16_u8(matches), 4);
-        uint64_t mask = vget_lane_u64(vreinterpret_u64_u8(nm), 0);
-        while (mask != 0) {
-            size_t b = (size_t)__builtin_ctzll(mask) >> 2;  // lane index
+        uint64_t matches = neon_match_mask_from_eq(matches_vec);
+        while (matches) {
+            size_t b = neon_first_match_lane(matches);
             if (std::memcmp(haystack + i + b, needle, n_len) == 0)
                 return {true, i + b};
-            mask &= ~((uint64_t)0xF << (b * 4));  // clear this lane's nibble
+            matches &= matches - 1;
         }
     }
 
