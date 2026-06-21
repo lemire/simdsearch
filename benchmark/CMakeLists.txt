@@ -10,6 +10,18 @@ add_executable(benchmark benchmarks/benchmark.cpp)
 target_include_directories(benchmark PRIVATE benchmarks include)
 CPMAddPackage("gh:lemire/counters#v3.1.0")
 target_link_libraries(benchmark PRIVATE counters)
+
+# Glob ("stringmatchlen") pattern-matching benchmark: Redis baseline vs barch's
+# memchr/memmem-accelerated matcher.
+add_executable(glob_benchmark benchmarks/glob_benchmark.cpp)
+target_include_directories(glob_benchmark PRIVATE benchmarks include)
+target_link_libraries(glob_benchmark PRIVATE counters)
+
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
+
+enable_testing()
+add_executable(test_glob tests/test_glob.cpp)
+target_include_directories(test_glob PRIVATE include)
+add_test(NAME test_glob COMMAND test_glob)
