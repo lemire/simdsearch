@@ -6,21 +6,9 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 include(cmake/CPM.cmake)
 
-add_executable(benchmark benchmarks/benchmark.cpp)
-target_include_directories(benchmark PRIVATE benchmarks include)
-CPMAddPackage("gh:lemire/counters#v3.1.0")
-target_link_libraries(benchmark PRIVATE counters)
-
-# Glob ("stringmatchlen") pattern-matching benchmark: Redis baseline vs barch's
-# memchr/memmem-accelerated matcher.
-add_executable(glob_benchmark benchmarks/glob_benchmark.cpp)
-target_include_directories(glob_benchmark PRIVATE benchmarks include)
-target_link_libraries(glob_benchmark PRIVATE counters)
-
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
-
 
 # Per-architecture SIMD flags. On x86-64 enable the AVX-512 subsets the
 # avx512search.h backend uses (F + BW for masked byte compares, plus VL/DQ).
@@ -43,6 +31,12 @@ add_executable(benchmark benchmarks/benchmark.cpp)
 target_include_directories(benchmark PRIVATE benchmarks include)
 target_compile_options(benchmark PRIVATE ${SIMDSEARCH_ARCH_FLAGS})
 target_link_libraries(benchmark PRIVATE counters)
+
+# Glob ("stringmatchlen") pattern-matching benchmark: Redis baseline vs barch's
+# memchr/memmem-accelerated matcher.
+add_executable(glob_benchmark benchmarks/glob_benchmark.cpp)
+target_include_directories(glob_benchmark PRIVATE benchmarks include)
+target_link_libraries(glob_benchmark PRIVATE counters)
 
 enable_testing()
 add_executable(test_search tests/test_search.cpp)
