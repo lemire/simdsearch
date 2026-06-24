@@ -479,14 +479,192 @@ void ashvardanian_benchmark(const std::string &hay,
   }
 }
 
+// Build the worst-case needle of length L for a given shape, over a haystack of
+// all 'a'. Every shape contains exactly one byte that is absent from the
+// haystack, so the needle never matches and the search always runs to
+// completion. What differs is WHERE that byte sits, which decides which filters
+// it defeats:
+//   tail : (L-1)*'a' + 'b'          — odd byte last; beats prefix/first-byte
+//                                      filters but StringZilla anchors on it.
+//   aba  : (L-2)*'a' + 'b' + 'a'    — odd byte at L-2; beats a first+last
+//                                      (2-anchor) filter, but StringZilla's
+//                                      middle anchor + anomaly search finds it.
+//   mid  : 'a'*L with [L/2] = 'b'   — odd byte mid; StringZilla anchors on it.
+//   high : 'a'*L with [L/2] = 0xFF  — odd byte is >= 191, which the anomaly
+//                                      selector tries to avoid; in practice it
+//                                      still anchors on it, so StringZilla
+//                                      survives. (Kept to show that even a high
+//                                      byte does not hide from the selector.)
+//   ab   : alternating 'abab...' with the middle byte flipped into a 3-run.
+//                                      Paired with an 'abab...' haystack: every
+//                                      byte value ('a','b') is common, so NO
+//                                      anchor is selective. Each anchor matches
+//                                      ~half the positions, so the filter can
+//                                      no longer reject in bulk and StringZilla
+//                                      itself is forced into O(n*m). This is the
+//                                      shape that actually defeats StringZilla.
+static std::string make_worstcase_needle(const std::string &shape, size_t L) {
+  std::string nd(L, 'a');
+  if (shape == "tail") nd[L - 1] = 'b';
+  else if (shape == "aba") nd[L - 2] = 'b';
+  else if (shape == "mid") nd[L / 2] = 'b';
+  else if (shape == "high") nd[L / 2] = (char)0xFF;
+  else if (shape == "ab") {
+    for (size_t i = 0; i < L; ++i) nd[i] = (i % 2 == 0) ? 'a' : 'b';
+    // Flip the middle byte to its neighbours' value: that makes a 3-byte run,
+    // so the needle is non-alternating and never occurs in 'abab...'.
+    nd[L / 2] = (L / 2 % 2 == 0) ? 'b' : 'a';
+  }
+  else if (shape == "block") { /* all 'a' — no distinctive byte at all */ }
+  else { std::cerr << "unknown --needle shape: " << shape << "\n"; exit(1); }
+  return nd;
+}
+
+// The haystack for a given (shape, needle length L):
+//   ab    : 'abab...'  — periodic two-symbol text.
+//   block : 'a'*(L-1) + 'b' repeated — runs of 'a' are only L-1 long, so the
+//           all-'a' needle of length L never completes. Crucially the needle
+//           has NO distinctive byte, so StringZilla's anchors are all 'a' (all
+//           common here): the filter passes nearly everywhere and each
+//           candidate is verified ~L/2 bytes deep before hitting a 'b'. This is
+//           what forces StringZilla itself into O(n*L).
+//   others: all 'a'.
+static std::string make_worstcase_haystack(const std::string &shape, size_t n,
+                                            size_t L) {
+  std::string hay(n, 'a');
+  if (shape == "ab")
+    for (size_t i = 0; i < n; ++i) hay[i] = (i % 2 == 0) ? 'a' : 'b';
+  else if (shape == "block")
+    for (size_t i = 0; i < n; ++i) hay[i] = (i % L == L - 1) ? 'b' : 'a';
+  return hay;
+}
+
+// Worst-case mode: the haystack is N copies of 'a' and each needle (see
+// make_worstcase_needle) shares that all-'a' content except for a single odd
+// byte, so the search runs to completion without matching. Depending on where
+// the odd byte sits, the all-'a' prefix forces prefix/first-byte filters (the
+// naive AVX-512 kernels, find_classic) and Boyer-Moore-Horspool (whose only
+// bad-character shift here is 1) into O(n*m) verification. StringZilla survives
+// every shape whose odd byte its anomaly selector can anchor on; the "high"
+// shape is the one that evades it. One full-haystack search is timed per cell.
+void worstcase_benchmark(size_t haystack_size, const std::string &needle_shape,
+                         const std::vector<size_t> &requested_lengths,
+                         const std::vector<const Algo *> &algos) {
+  volatile uint64_t sink = 0;
+
+  size_t min_len = (needle_shape == "tail") ? 2 : 3;
+  std::vector<size_t> lengths;
+  for (size_t L : requested_lengths) {
+    if (L < min_len) {
+      std::print(stderr, "worstcase: skipping length {} (shape '{}' needs >= "
+                 "{})\n", L, needle_shape, min_len);
+    } else if (L > haystack_size) {
+      std::print(stderr, "worstcase: skipping length {} (> haystack {})\n", L,
+                 haystack_size);
+    } else {
+      lengths.push_back(L);
+    }
+  }
+  if (lengths.empty()) {
+    std::cerr << "worstcase: no usable lengths\n";
+    exit(1);
+  }
+
+  // Needle and haystack are both built per length (the 'block' haystack depends
+  // on L; the rest ignore it).
+  std::vector<std::string> needles, haystacks;
+  needles.reserve(lengths.size());
+  haystacks.reserve(lengths.size());
+  for (size_t L : lengths) {
+    needles.push_back(make_worstcase_needle(needle_shape, L));
+    haystacks.push_back(make_worstcase_haystack(needle_shape, haystack_size, L));
+  }
+
+  // Show which three bytes StringZilla's anomaly selector anchors on for each
+  // length: if any anchor is the odd byte, the filter rejects and SZ survives;
+  // if all three are 'a', the filter passes everywhere and SZ is defeated.
+  for (size_t li = 0; li < lengths.size(); ++li) {
+    size_t a1, a2, a3;
+    sz_locate_needle_anomalies(needles[li].data(), needles[li].size(), a1, a2,
+                               a3);
+    auto pb = [&](size_t off) {
+      unsigned c = (unsigned char)needles[li][off];
+      return std::format("{}:{:#x}", off, c);
+    };
+    std::print(stderr, "worstcase[{}] L={} SZ anchors = {} {} {}\n",
+               needle_shape, lengths[li], pb(a1), pb(a2), pb(a3));
+  }
+
+  AmortState am;
+  if (needs_amort(algos)) am.prepare(needles);
+
+  // The needle must be absent: every algorithm must report not-found.
+  for (size_t li = 0; li < lengths.size(); ++li) {
+    const std::string &hay = haystacks[li];
+    if (hay.find(needles[li]) != std::string::npos) {
+      std::cerr << "worstcase: needle unexpectedly present\n";
+      exit(1);
+    }
+    for (const Algo *a : algos) {
+      auto [f, idx] = do_find(*a, am, li, hay.data(), hay.size(),
+                              needles[li].data(), needles[li].size());
+      if (f) {
+        std::cerr << "Error: worstcase false match in " << a->name
+                  << " at length " << lengths[li] << "\n";
+        exit(1);
+      }
+    }
+  }
+
+  // ns[algo_index][length_index] — nanoseconds for one full-haystack search.
+  std::vector<std::vector<double>> ns(
+      algos.size(), std::vector<double>(lengths.size(), 0.0));
+  for (size_t li = 0; li < lengths.size(); ++li) {
+    const std::string &hay = haystacks[li];
+    for (size_t ai = 0; ai < algos.size(); ++ai) {
+      const Algo &a = *algos[ai];
+      auto run = [&]() {
+        auto [f, idx] = do_find(a, am, li, hay.data(), hay.size(),
+                                needles[li].data(), needles[li].size());
+        sink += f ? idx : needles[li].size();
+      };
+      ns[ai][li] = counters::bench(run).fastest_elapsed_ns();
+    }
+    std::print(stderr, "worstcase: length {} done\n", lengths[li]);
+  }
+
+  const char *hay_desc = needle_shape == "ab"      ? "'abab...'"
+                         : needle_shape == "block" ? "'a'*(L-1)+'b' repeated"
+                                                   : "all 'a'";
+  std::print("# worstcase mode\n");
+  std::print("haystack: {} bytes ({}); needle shape '{}' (never matches)\n",
+             haystack_size, hay_desc, needle_shape);
+  std::print("values are ns per full-haystack search (lower is better); "
+             "GB/s = {} / ns\n", haystack_size);
+  std::print("rows = algorithm, columns = needle length L\n\n");
+
+  std::print("{:<48}", "algo");
+  for (size_t L : lengths) std::print(" {:>12}", L);
+  std::print("\n");
+  for (size_t ai = 0; ai < algos.size(); ++ai) {
+    std::print("{:<48}", algos[ai]->name);
+    for (size_t li = 0; li < lengths.size(); ++li)
+      std::print(" {:>12.1f}", ns[ai][li]);
+    std::print("\n");
+  }
+}
+
 int main(int argc, char **argv) {
   std::string mode = (argc > 1) ? argv[1] : "";
 
-  if (mode == "synthetic" || mode == "horspool" || mode == "ashvardanian") {
+  if (mode == "synthetic" || mode == "horspool" || mode == "ashvardanian" ||
+      mode == "worstcase") {
     std::string path = "./data/43-0.txt";
     bool path_given = false;
-    std::vector<size_t> lengths;       // horspool only
+    std::vector<size_t> lengths;       // horspool / worstcase only
     std::vector<const Algo *> algos;   // all modes; empty => all
+    size_t worstcase_size = 1u << 16;  // worstcase only: haystack bytes
+    std::string needle_shape = "tail"; // worstcase only: tail|aba|mid|high
 
     // Helper: value of an option given either as "--opt val" or "--opt=val".
     auto take_value = [&](const std::string &arg, int &k) -> std::string {
@@ -514,6 +692,10 @@ int main(int argc, char **argv) {
       } else if (arg == "--lengths" || arg.rfind("--lengths=", 0) == 0) {
         for (const auto &t : split_csv(take_value(arg, k)))
           lengths.push_back(std::stoul(t));
+      } else if (arg == "--size" || arg.rfind("--size=", 0) == 0) {
+        worstcase_size = std::stoul(take_value(arg, k));
+      } else if (arg == "--needle" || arg.rfind("--needle=", 0) == 0) {
+        needle_shape = take_value(arg, k);
       } else if (arg.rfind("--", 0) == 0) {
         std::cerr << "unknown option: " << arg << "\n";
         return 1;
@@ -525,8 +707,10 @@ int main(int argc, char **argv) {
 
     if (algos.empty())
       for (const auto &a : kAlgos) algos.push_back(&a);
-    if (!lengths.empty() && mode != "horspool")
-      std::print(stderr, "ignoring --lengths (only applies to horspool, not {})\n",
+    if (!lengths.empty() && mode != "horspool" && mode != "worstcase")
+      std::print(stderr,
+                 "ignoring --lengths (only applies to horspool/worstcase, "
+                 "not {})\n",
                  mode);
 
     if (mode == "synthetic") {
@@ -546,8 +730,13 @@ int main(int argc, char **argv) {
                            std::format("random ({} bytes)", gen_size), lengths,
                            algos);
       }
-    } else {  // ashvardanian
+    } else if (mode == "ashvardanian") {
       ashvardanian_benchmark(load_file(path), algos);
+    } else {  // worstcase
+      if (lengths.empty())
+        for (size_t L : {4u, 8u, 16u, 32u, 64u, 128u, 256u, 512u})
+          lengths.push_back(L);
+      worstcase_benchmark(worstcase_size, needle_shape, lengths, algos);
     }
     return 0;
   }
@@ -559,13 +748,19 @@ int main(int argc, char **argv) {
              "first-occurrence ns matrix\n");
   std::print("    ashvardanian  StringWars-style forward find-all over the "
              "whole datafile, GB/s\n");
+  std::print("    worstcase     haystack 'aaaa...', needle 'aa...ab' "
+             "(never matches), ns-per-search matrix\n");
   std::print("  datafile is optional for horspool (random text if omitted); "
              "ashvardanian defaults to ./data/43-0.txt\n");
   std::print("\n  options (all modes):\n");
   std::print("    --algos x,y       algorithms to test (default all), by name\n");
   std::print("    --list            list available algorithm names and exit\n");
-  std::print("\n  horspool only:\n");
-  std::print("    --lengths a,b,c   pattern lengths to test (default 2..20), "
-             "e.g. --lengths 20,1000\n");
+  std::print("\n  horspool / worstcase:\n");
+  std::print("    --lengths a,b,c   pattern lengths to test "
+             "(horspool default 2..20, worstcase 2..512)\n");
+  std::print("\n  worstcase only:\n");
+  std::print("    --size N          haystack size in bytes (default 65536)\n");
+  std::print("    --needle shape    tail|aba|mid|high|ab|block (default tail); "
+             "'block' (all-'a' needle) defeats StringZilla too\n");
   return 1;
 }
