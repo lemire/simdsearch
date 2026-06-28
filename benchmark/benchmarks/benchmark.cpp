@@ -20,9 +20,13 @@
 #if defined(__AVX512F__) && defined(__AVX512BW__)
   #include "avx512search.h"
   #define SIMDSEARCH_AVX512 1
+  #define SIMD_NAIVE_SEARCH avx512_naive_search
+  #define SIMD_NAIVE_SEARCH_ALL avx512_naive_search_all
 #elif defined(__aarch64__) || defined(__ARM_NEON)
   #include "neonsearch.h"
   #define SIMDSEARCH_NEON 1
+  #define SIMD_NAIVE_SEARCH neon_naive_search
+  #define SIMD_NAIVE_SEARCH_ALL neon_naive_search_all
 #else
   #error "No supported SIMD backend (need AVX-512 BW or ARM NEON)"
 #endif
@@ -654,11 +658,119 @@ void worstcase_benchmark(size_t haystack_size, const std::string &needle_shape,
   }
 }
 
+// Random text over a small alphabet ('A'..'A'+alphabet-1), so short needles
+// occur densely (the regime where enumerating matches per block can pay off).
+static std::string generate_small_alphabet_string(size_t size, size_t alphabet) {
+  static std::mt19937 gen(0x5A1FE5EDull);  // fixed seed: reproducible
+  std::uniform_int_distribution<int> dist(0, (int)alphabet - 1);
+  std::string r(size, 'A');
+  for (auto &c : r) c = (char)('A' + dist(gen));
+  return r;
+}
+
+// Enumerate every (overlapping) occurrence by calling the first-match kernel in
+// a loop, advancing one byte past each match. This is the baseline: it pays the
+// kernel's per-call setup once per match found. Uses whichever naive kernel the
+// active backend provides (AVX-512 or NEON).
+static size_t findall_loop_count(const char *t, size_t n, const char *p,
+                                 size_t m) {
+  size_t pos = 0, cnt = 0;
+  while (pos + m <= n) {
+    auto [f, idx] = SIMD_NAIVE_SEARCH(t + pos, n - pos, p, m);
+    if (!f) break;
+    ++cnt;
+    pos += idx + 1;
+  }
+  return cnt;
+}
+
+// Enumerate every occurrence with the block-enumerating variant: one scan, all
+// matches per block visited before moving on.
+static size_t findall_block_count(const char *t, size_t n, const char *p,
+                                  size_t m) {
+  size_t cnt = 0;
+  SIMD_NAIVE_SEARCH_ALL(t, n, p, m, [&](size_t) { ++cnt; });
+  return cnt;
+}
+
+// findall mode: for each needle length, enumerate ALL (overlapping) occurrences
+// of needles drawn from the text, two ways -- the first-match kernel in a loop
+// vs. the block-enumerating avx512_naive_search_all -- and compare. Reports the
+// average match count (density) and ns per full-text find-all for each, so the
+// crossover with match density is visible.
+void findall_benchmark(const std::string &text, const std::string &source_desc,
+                       const std::vector<size_t> &requested_lengths) {
+  static std::mt19937 gen(0xF1A11A11ull);  // fixed seed: reproducible needles
+  const size_t needles_per_len = 100;
+  volatile uint64_t sink = 0;
+
+  std::vector<size_t> lengths;
+  for (size_t L : requested_lengths) {
+    if (L >= 1 && L <= text.size()) lengths.push_back(L);
+    else std::print(stderr, "findall: skipping length {}\n", L);
+  }
+  if (lengths.empty()) { std::cerr << "findall: no usable lengths\n"; exit(1); }
+
+  std::print("# findall mode (enumerate ALL occurrences, overlapping)\n");
+  std::print("source: {}\n", source_desc);
+  std::print("text size: {} bytes, {} needles per length\n", text.size(),
+             needles_per_len);
+  std::print("loop  = avx512_naive_search called in a loop (restart per match)\n");
+  std::print("block = avx512_naive_search_all (enumerate matches per block)\n\n");
+  std::print("{:>6} {:>13} {:>13} {:>13} {:>9}\n", "len", "avg_matches",
+             "loop_ns", "block_ns", "speedup");
+
+  for (size_t L : lengths) {
+    std::vector<std::string> pats;
+    pats.reserve(needles_per_len);
+    std::uniform_int_distribution<size_t> start_dist(0, text.size() - L);
+    for (size_t i = 0; i < needles_per_len; ++i)
+      pats.push_back(text.substr(start_dist(gen), L));
+
+    // Validate both strategies against a std::string::find reference.
+    size_t total_matches = 0;
+    for (const auto &p : pats) {
+      size_t cl = findall_loop_count(text.data(), text.size(), p.data(), p.size());
+      size_t cb = findall_block_count(text.data(), text.size(), p.data(), p.size());
+      size_t cr = 0;
+      for (size_t pos = text.find(p, 0); pos != std::string::npos;
+           pos = text.find(p, pos + 1))
+        ++cr;
+      if (cl != cr || cb != cr) {
+        std::cerr << "findall mismatch at len " << L << ": loop=" << cl
+                  << " block=" << cb << " ref=" << cr << "\n";
+        exit(1);
+      }
+      total_matches += cr;
+    }
+
+    auto run_loop = [&]() {
+      size_t c = 0;
+      for (const auto &p : pats)
+        c += findall_loop_count(text.data(), text.size(), p.data(), p.size());
+      sink += c;
+    };
+    auto run_block = [&]() {
+      size_t c = 0;
+      for (const auto &p : pats)
+        c += findall_block_count(text.data(), text.size(), p.data(), p.size());
+      sink += c;
+    };
+    double loop_ns =
+        counters::bench(run_loop).fastest_elapsed_ns() / double(needles_per_len);
+    double block_ns =
+        counters::bench(run_block).fastest_elapsed_ns() / double(needles_per_len);
+    std::print("{:>6} {:>13.1f} {:>13.1f} {:>13.1f} {:>8.2f}x\n", L,
+               double(total_matches) / double(needles_per_len), loop_ns,
+               block_ns, loop_ns / block_ns);
+  }
+}
+
 int main(int argc, char **argv) {
   std::string mode = (argc > 1) ? argv[1] : "";
 
   if (mode == "synthetic" || mode == "horspool" || mode == "ashvardanian" ||
-      mode == "worstcase") {
+      mode == "worstcase" || mode == "findall") {
     std::string path = "./data/43-0.txt";
     bool path_given = false;
     std::vector<size_t> lengths;       // horspool / worstcase only
@@ -707,10 +819,11 @@ int main(int argc, char **argv) {
 
     if (algos.empty())
       for (const auto &a : kAlgos) algos.push_back(&a);
-    if (!lengths.empty() && mode != "horspool" && mode != "worstcase")
+    if (!lengths.empty() && mode != "horspool" && mode != "worstcase" &&
+        mode != "findall")
       std::print(stderr,
-                 "ignoring --lengths (only applies to horspool/worstcase, "
-                 "not {})\n",
+                 "ignoring --lengths (only applies to horspool/worstcase/"
+                 "findall, not {})\n",
                  mode);
 
     if (mode == "synthetic") {
@@ -732,11 +845,20 @@ int main(int argc, char **argv) {
       }
     } else if (mode == "ashvardanian") {
       ashvardanian_benchmark(load_file(path), algos);
-    } else {  // worstcase
+    } else if (mode == "worstcase") {
       if (lengths.empty())
         for (size_t L : {4u, 8u, 16u, 32u, 64u, 128u, 256u, 512u})
           lengths.push_back(L);
       worstcase_benchmark(worstcase_size, needle_shape, lengths, algos);
+    } else {  // findall
+      if (lengths.empty())
+        for (size_t L : {1u, 2u, 3u, 4u, 6u, 8u, 12u, 16u}) lengths.push_back(L);
+      if (path_given)
+        findall_benchmark(load_file(path), path, lengths);
+      else
+        findall_benchmark(
+            generate_small_alphabet_string(worstcase_size, 4),
+            std::format("random 4-symbol ({} bytes)", worstcase_size), lengths);
     }
     return 0;
   }
@@ -750,6 +872,8 @@ int main(int argc, char **argv) {
              "whole datafile, GB/s\n");
   std::print("    worstcase     haystack 'aaaa...', needle 'aa...ab' "
              "(never matches), ns-per-search matrix\n");
+  std::print("    findall       enumerate ALL matches: first-match-in-a-loop "
+             "vs block-enumerate\n");
   std::print("  datafile is optional for horspool (random text if omitted); "
              "ashvardanian defaults to ./data/43-0.txt\n");
   std::print("\n  options (all modes):\n");
