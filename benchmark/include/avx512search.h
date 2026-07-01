@@ -183,6 +183,74 @@ std::pair<bool, size_t> avx512_naive_search(const char* text, size_t n, const ch
 }
 
 
+// Find-all variant of avx512_naive_search. Instead of returning at the first
+// match and discarding the rest of the mask, each 64-byte block builds the same
+// per-position match mask and then enumerates EVERY set bit -- calling
+// callback(index) for each occurrence -- before advancing to the next block.
+// This pays the pattern-byte broadcasts and the block scan once per block
+// regardless of how many matches it holds, instead of re-entering a first-match
+// search (with its own setup) once per match. Occurrences are reported in
+// increasing index order and include overlapping ones. callback must be a
+// callable taking a single size_t index.
+template <typename F>
+void avx512_naive_search_all(const char* text, size_t n, const char* pattern,
+                             size_t m, F callback) {
+    if (m == 0 || n < m) return;
+
+    size_t i = 0;
+    // SIMD chunk reads bytes [i, i + 63 + (m - 1)], so require i + m + 63 <= n.
+    if (n >= m + 63) {
+        if (m >= 4) {
+            // Broadcasts of the first four pattern bytes are loop-invariant, so
+            // hoist them out of the block loop (amortized across all blocks).
+            const __m512i p0 = _mm512_set1_epi8((char)pattern[0]);
+            const __m512i p1 = _mm512_set1_epi8((char)pattern[1]);
+            const __m512i p2 = _mm512_set1_epi8((char)pattern[2]);
+            const __m512i p3 = _mm512_set1_epi8((char)pattern[3]);
+            for (; i + m + 63 <= n; i += 64) {
+                __mmask64 found = _mm512_cmpeq_epi8_mask(
+                    _mm512_loadu_si512((const void*)(text + i)), p0);
+                found = _mm512_mask_cmpeq_epi8_mask(
+                    found, _mm512_loadu_si512((const void*)(text + i + 1)), p1);
+                found = _mm512_mask_cmpeq_epi8_mask(
+                    found, _mm512_loadu_si512((const void*)(text + i + 2)), p2);
+                found = _mm512_mask_cmpeq_epi8_mask(
+                    found, _mm512_loadu_si512((const void*)(text + i + 3)), p3);
+                for (size_t j = 4; j < m && found; ++j) {
+                    __m512i pj = _mm512_set1_epi8((char)pattern[j]);
+                    found = _mm512_mask_cmpeq_epi8_mask(
+                        found, _mm512_loadu_si512((const void*)(text + i + j)), pj);
+                }
+                // Enumerate every match in this block, lowest index first.
+                while (found) {
+                    callback(i + (size_t)__builtin_ctzll(found));
+                    found &= found - 1;  // clear the lowest set bit
+                }
+            }
+        } else {
+            const __m512i p0 = _mm512_set1_epi8((char)pattern[0]);
+            for (; i + m + 63 <= n; i += 64) {
+                __mmask64 found = _mm512_cmpeq_epi8_mask(
+                    _mm512_loadu_si512((const void*)(text + i)), p0);
+                for (size_t j = 1; j < m && found; ++j) {
+                    __m512i pj = _mm512_set1_epi8((char)pattern[j]);
+                    found = _mm512_mask_cmpeq_epi8_mask(
+                        found, _mm512_loadu_si512((const void*)(text + i + j)), pj);
+                }
+                while (found) {
+                    callback(i + (size_t)__builtin_ctzll(found));
+                    found &= found - 1;
+                }
+            }
+        }
+    }
+
+    // Scalar tail for positions the SIMD loop could not safely cover.
+    for (; i + m <= n; ++i)
+        if (std::memcmp(text + i, pattern, m) == 0) callback(i);
+}
+
+
 // Same as avx512_naive_search but with a 256-byte stride: each iteration loads
 // four 64-byte chunks (A/B/C/D), so each _mm512_set1_epi8 broadcast of a
 // pattern byte is reused across four match accumulators instead of one. This

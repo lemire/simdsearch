@@ -181,6 +181,73 @@ std::pair<bool, size_t> neon_naive_search(const char* text, size_t n, const char
 }
 
 
+// Find-all variant of neon_naive_search (NEON parity for avx512_naive_search_all).
+// Instead of returning at the first match and discarding the rest of the mask,
+// each 16-byte block builds the same per-position match vector and then
+// enumerates EVERY match -- calling callback(index) for each occurrence -- via
+// the shrn #4 trick (4 bits per lane) before advancing to the next block. This
+// pays the pattern-byte broadcasts and the block scan once per block instead of
+// re-entering a first-match search once per match. Occurrences are reported in
+// increasing index order and include overlapping ones. callback must be a
+// callable taking a single size_t index.
+template <typename F>
+void neon_naive_search_all(const char* text, size_t n, const char* pattern,
+                           size_t m, F callback) {
+    if (m == 0 || n < m) return;
+    const size_t step = 16;
+
+    // Visit every set lane in a match vector, lowest index first. The shrn #4
+    // narrowing puts 4 bits per byte lane into a 64-bit value; ctz/4 is the lane.
+    auto emit = [&](uint8x16_t found, size_t base) {
+        uint8x8_t nibble = vshrn_n_u16(vreinterpretq_u16_u8(found), 4);
+        uint64_t mask = vget_lane_u64(vreinterpret_u64_u8(nibble), 0);
+        while (mask) {
+            size_t b = (size_t)__builtin_ctzll(mask) >> 2;  // lane index
+            callback(base + b);
+            mask &= ~((uint64_t)0xF << (b * 4));  // clear this lane's nibble
+        }
+    };
+
+    size_t i = 0;
+    // SIMD chunk reads bytes [i, i + 15 + (m - 1)], so require i + m + 15 <= n.
+    if (n >= m + 15) {
+        if (m >= 4) {
+            const uint8x16_t p0 = vdupq_n_u8((uint8_t)pattern[0]);
+            const uint8x16_t p1 = vdupq_n_u8((uint8_t)pattern[1]);
+            const uint8x16_t p2 = vdupq_n_u8((uint8_t)pattern[2]);
+            const uint8x16_t p3 = vdupq_n_u8((uint8_t)pattern[3]);
+            for (; i + m + 15 <= n; i += step) {
+                uint8x16_t found = vceqq_u8(vld1q_u8((const uint8_t*)(text + i)), p0);
+                found = vandq_u8(found, vceqq_u8(vld1q_u8((const uint8_t*)(text + i + 1)), p1));
+                found = vandq_u8(found, vceqq_u8(vld1q_u8((const uint8_t*)(text + i + 2)), p2));
+                found = vandq_u8(found, vceqq_u8(vld1q_u8((const uint8_t*)(text + i + 3)), p3));
+                for (size_t j = 4; j < m; ++j) {
+                    if (vmaxvq_u8(found) == 0) break;
+                    uint8x16_t pj = vdupq_n_u8((uint8_t)pattern[j]);
+                    found = vandq_u8(found, vceqq_u8(vld1q_u8((const uint8_t*)(text + i + j)), pj));
+                }
+                if (vmaxvq_u8(found) != 0) emit(found, i);
+            }
+        } else {
+            const uint8x16_t p0 = vdupq_n_u8((uint8_t)pattern[0]);
+            for (; i + m + 15 <= n; i += step) {
+                uint8x16_t found = vceqq_u8(vld1q_u8((const uint8_t*)(text + i)), p0);
+                for (size_t j = 1; j < m; ++j) {
+                    if (vmaxvq_u8(found) == 0) break;
+                    uint8x16_t pj = vdupq_n_u8((uint8_t)pattern[j]);
+                    found = vandq_u8(found, vceqq_u8(vld1q_u8((const uint8_t*)(text + i + j)), pj));
+                }
+                if (vmaxvq_u8(found) != 0) emit(found, i);
+            }
+        }
+    }
+
+    // Scalar tail for positions the SIMD loop could not safely cover.
+    for (; i + m <= n; ++i)
+        if (std::memcmp(text + i, pattern, m) == 0) callback(i);
+}
+
+
 // Same as neon_naive_search but with a 64-byte stride: each iteration loads
 // four 16-byte chunks (A/B/C/D), so each vdupq_n_u8 broadcast of a pattern
 // byte is reused across four match accumulators instead of one.
