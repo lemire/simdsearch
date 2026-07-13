@@ -69,6 +69,9 @@ int main() {
   std::vector<NamedFn> fns = {
       {"bmh_search", bmh_search},
       {"bmh_search16", bmh_search16},
+      {"kmp_search", kmp_search},
+      {"twoway_search", twoway_search},
+      {"twoway_bc_search", twoway_bc_search},
 #if defined(SIMDSEARCH_AVX512)
       {"avx512_naive_search", avx512_naive_search},
       {"avx512_naive_search256", avx512_naive_search256},

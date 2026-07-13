@@ -113,10 +113,19 @@ static std::pair<bool, size_t> classic_find(const char *text, size_t n,
 using search_fn = std::pair<bool, size_t> (*)(const char *, size_t,
                                               const char *, size_t);
 
-// The three std searchers come in a non-amortized form (rebuilt on every call,
-// done via the plain function pointer) and an amortized form (one searcher
-// pre-built per needle and reused). The amortized kinds index into AmortState.
-enum class Kind { Stateless, AmortDef, AmortBM, AmortBMH };
+// The std searchers, KMP and two-way all come in a non-amortized form (the
+// preprocessing is rebuilt on every call, done via the plain function pointer)
+// and an amortized form (preprocessing done once per needle and reused). The
+// amortized kinds index into AmortState.
+enum class Kind {
+  Stateless,
+  AmortDef,
+  AmortBM,
+  AmortBMH,
+  AmortKMP,
+  AmortTwoWay,
+  AmortTwoWayBC
+};
 
 struct Algo {
   const char *name;
@@ -140,6 +149,12 @@ static const std::vector<Algo> kAlgos = {
 #endif
     {"find_bmh", Kind::Stateless, bmh_search},
     {"find_bmh16", Kind::Stateless, bmh_search16},
+    {"find_kmp", Kind::Stateless, kmp_search},
+    {"find_twoway", Kind::Stateless, twoway_search},
+    {"find_twoway_bc", Kind::Stateless, twoway_bc_search},
+    {"find_kmp_amortized", Kind::AmortKMP, nullptr},
+    {"find_twoway_amortized", Kind::AmortTwoWay, nullptr},
+    {"find_twoway_bc_amortized", Kind::AmortTwoWayBC, nullptr},
     {"find_strstr", Kind::Stateless, strstr_search},
     {"find_std_default_searcher", Kind::Stateless, std_default_searcher},
     {"find_std_boyer_moore_searcher", Kind::Stateless, std_boyer_moore_searcher},
@@ -157,21 +172,57 @@ struct AmortState {
   std::vector<std::default_searcher<const char *>> def;
   std::vector<std::boyer_moore_searcher<const char *>> bm;
   std::vector<std::boyer_moore_horspool_searcher<const char *>> bmh;
+  std::vector<kmp_prep> kmp;
+  std::vector<twoway_prep> tw;
+  std::vector<twoway_bc_prep> twbc;
 
   void prepare(const std::vector<std::string> &needles) {
     def.clear();
     bm.clear();
     bmh.clear();
+    kmp.clear();
+    tw.clear();
+    twbc.clear();
     def.reserve(needles.size());
     bm.reserve(needles.size());
     bmh.reserve(needles.size());
-    for (const auto &s : needles) {
+    kmp.resize(needles.size());
+    tw.resize(needles.size());
+    twbc.resize(needles.size());
+    for (size_t i = 0; i < needles.size(); ++i) {
+      const auto &s = needles[i];
       def.emplace_back(s.data(), s.data() + s.size());
       bm.emplace_back(s.data(), s.data() + s.size());
       bmh.emplace_back(s.data(), s.data() + s.size());
+      kmp[i].build(s.data(), s.size());
+      tw[i].build(s.data(), s.size());
+      twbc[i].build(s.data(), s.size());
     }
   }
 };
+
+// The prepared KMP / two-way scans, kept out of line. The stateless variants
+// reach their scan through a function pointer, so they are compiled as
+// standalone functions; letting these get inlined into the timing loop instead
+// gives measurably worse code for the very same scan, which would show up as a
+// bogus "amortizing makes it slower". noinline puts both on equal footing --
+// one call per search, negligible against a full-haystack scan.
+[[gnu::noinline]] static std::pair<bool, size_t> kmp_amortized(
+    const kmp_prep &kp, const char *text, size_t n, const char *pat, size_t m) {
+  return kp.find(text, n, pat, m);
+}
+
+[[gnu::noinline]] static std::pair<bool, size_t> twoway_amortized(
+    const twoway_prep &tw, const char *text, size_t n, const char *pat,
+    size_t m) {
+  return twoway_search_with(tw, text, n, pat, m);
+}
+
+[[gnu::noinline]] static std::pair<bool, size_t> twoway_bc_amortized(
+    const twoway_bc_prep &tb, const char *text, size_t n, const char *pat,
+    size_t m) {
+  return twoway_bc_search_with(tb, text, n, pat, m);
+}
 
 // First-occurrence search of needle #id within [text, text+n) for any algorithm.
 // Stateless kinds go through the function pointer (rebuilding any preprocessing
@@ -201,6 +252,12 @@ static inline std::pair<bool, size_t> do_find(const Algo &a,
       return it == e ? std::pair<bool, size_t>{false, 0}
                      : std::pair<bool, size_t>{true, (size_t)(it - text)};
     }
+    case Kind::AmortKMP:
+      return kmp_amortized(am.kmp[id], text, n, pat, m);
+    case Kind::AmortTwoWay:
+      return twoway_amortized(am.tw[id], text, n, pat, m);
+    case Kind::AmortTwoWayBC:
+      return twoway_bc_amortized(am.twbc[id], text, n, pat, m);
   }
   return {false, 0};
 }

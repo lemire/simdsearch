@@ -10,8 +10,45 @@ from the host architecture:
   (`find_neon`, `find_neon64`, `find_neon_stringzilla`)
 
 Both headers also provide the portable scalar/library searchers (`strstr`,
-`std::search` variants, Boyer–Moore–Horspool), so the table is identical across
-architectures apart from the SIMD rows.
+`std::search` variants, Boyer–Moore–Horspool, and the linear-time searchers in
+`include/kmp_twoway.h`), so the table is identical across architectures apart
+from the SIMD rows.
+
+## Linear-time searchers (`include/kmp_twoway.h`)
+
+- `find_kmp` — Knuth–Morris–Pratt, with the "strong" failure links from the
+  original paper (a text byte is never compared against a pattern byte already
+  known to differ). O(m) preprocessing, at most 2n comparisons, never skips
+  ahead — so it is slow on ordinary text and only pays off against adversarial
+  input.
+- `find_twoway` — the Crochemore–Perrin two-way algorithm: an O(m) critical
+  factorization of the needle, then O(1) extra space and at most 2n comparisons.
+- `find_twoway_bc` — two-way plus a 256-entry bad-character skip table, i.e. the
+  variant glibc's `memmem`/`strstr` runs for needles longer than 32 bytes.
+  Sublinear in practice, still linear in the worst case.
+
+Each also has an `_amortized` row, where the preprocessing is built once per
+needle and reused (the same split the `std::search` searchers already get).
+
+The point of these three is the `worstcase` mode, where the filter-based and
+naive searchers degrade to O(n·m) but the linear-time ones do not. Needle `'a'*L`
+against a haystack of `('a'*(L-1) + 'b')` repeated, 64 KB, ns per full-haystack
+search (Apple M-series, clang):
+
+```
+algo                        L=8      L=32     L=128     L=512
+find_classic             335291    364834    399792    510500
+find_neon                  6779     27500    139875    515250
+find_neon_stringzilla     58125     76250    141666    371500
+find_strstr              114333    222417    320167    511500
+find_kmp                  30833     29916     32166     30000
+find_twoway               16358     20662     18570     18416
+find_twoway_bc             2412       703       482      1236
+```
+
+KMP and two-way are flat in `L` — that is the guarantee they buy. On ordinary
+text (`horspool`, `ashvardanian` modes) they are several times slower than the
+SIMD kernels, which is the trade.
 
 ## Build and run
 

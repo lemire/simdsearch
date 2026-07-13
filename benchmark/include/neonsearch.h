@@ -6,6 +6,7 @@
 #include <functional>
 #include <utility>
 
+#include "kmp_twoway.h"
 #include "sz_needle_anomalies.h"
 
 
