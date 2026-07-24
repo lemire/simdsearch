@@ -1,1 +1,4 @@
 # simdsearch
+
+
+Benchmarksfor string search.
