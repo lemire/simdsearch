@@ -407,3 +407,130 @@ std::pair<bool, size_t> avx512_stringzilla_find(const char* haystack, size_t h_l
 
     return {false, 0};
 }
+
+
+// Length-dispatched hybrid: the 256-byte-stride naive kernel for needles up to
+// Threshold bytes, the StringZilla 3-anchor kernel above it.
+//
+// The two kernels fail in opposite directions. avx512_naive_search256 spends
+// O(m) broadcast+compare rounds per 256-byte block whenever the needle's first
+// four bytes keep candidates alive, so its cost grows with the needle length;
+// but when the prefix filter bites (ordinary text) it is the fastest kernel
+// here, because each pattern-byte broadcast is amortized over four 64-byte
+// chunks. avx512_stringzilla_find is O(1) filter rounds per window no matter
+// how long the needle is -- three anchors, chosen away from repeats -- but pays
+// a per-window setup and a memcmp per surviving candidate, which the naive
+// kernel's mask narrowing avoids on short needles.
+//
+// So: cheap-and-length-sensitive below the threshold, length-insensitive above.
+//
+// Short-haystack guard. The 256-byte kernel cannot report a match until it has
+// finished the entire block the match sits in -- it builds four chunk masks and
+// only then scans them -- whereas the 64-byte kernel returns as soon as its one
+// chunk has a hit. On a small haystack the match tends to arrive early relative
+// to 256 bytes, so that block granularity costs up to 4x the compare work for
+// nothing. Below kMinWide the 64-byte kernel is therefore the better lower half.
+// Measured on a 1 KB haystack (synthetic mode): 133-159 ns without the guard
+// versus 43-54 ns with it, matching find_avx512. A 8192-byte cutoff measures the
+// same, so take the smaller.
+//
+// The second condition is the narrower structural one: the wide loop only runs
+// while i + m + 255 <= n, and anything it cannot cover drops to a scalar memcmp
+// loop. It matters only for needles too long for kMinWide to already catch.
+template <size_t Threshold>
+static inline std::pair<bool, size_t> avx512_hybrid_find_t(const char* text, size_t n,
+                                                           const char* pattern, size_t m) {
+    constexpr size_t kMinWide = 2048;
+    if (m > Threshold) return avx512_stringzilla_find(text, n, pattern, m);
+    if (n < kMinWide || n < m + 255) return avx512_naive_search(text, n, pattern, m);
+    return avx512_naive_search256(text, n, pattern, m);
+}
+
+// The scheme itself, switching at 512 bytes of needle.
+std::pair<bool, size_t> avx512_hybrid256_sz(const char* text, size_t n,
+                                            const char* pattern, size_t m) {
+    return avx512_hybrid_find_t<512>(text, n, pattern, m);
+}
+
+// Same scheme at other switch points, so the crossover can be located
+// empirically rather than assumed.
+std::pair<bool, size_t> avx512_hybrid256_sz16(const char* t, size_t n, const char* p, size_t m)
+    { return avx512_hybrid_find_t<16>(t, n, p, m); }
+std::pair<bool, size_t> avx512_hybrid256_sz32(const char* t, size_t n, const char* p, size_t m)
+    { return avx512_hybrid_find_t<32>(t, n, p, m); }
+std::pair<bool, size_t> avx512_hybrid256_sz64(const char* t, size_t n, const char* p, size_t m)
+    { return avx512_hybrid_find_t<64>(t, n, p, m); }
+std::pair<bool, size_t> avx512_hybrid256_sz128(const char* t, size_t n, const char* p, size_t m)
+    { return avx512_hybrid_find_t<128>(t, n, p, m); }
+std::pair<bool, size_t> avx512_hybrid256_sz256(const char* t, size_t n, const char* p, size_t m)
+    { return avx512_hybrid_find_t<256>(t, n, p, m); }
+
+
+// A second way to combine the two ideas, for reference: keep StringZilla's
+// three-anchor filter but run it with the 256-byte stride of the naive kernel,
+// so each anchor broadcast is reused across four 64-byte chunks and the
+// per-window mask bookkeeping is paid once per 256 bytes instead of once per
+// 64. Unlike the length-dispatched hybrid above there is no threshold -- the
+// filter cost is already independent of m -- so this is length-insensitive
+// everywhere, not just above a cutoff.
+//
+// The main loop needs i + m + 255 <= n (the last anchor of the last chunk reads
+// text[i + 192 + 63 + off_last], and off_last <= m - 1). Whatever it cannot
+// cover is handed to avx512_stringzilla_find, whose masked loads already handle
+// short haystacks with no scalar fallback.
+std::pair<bool, size_t> avx512_stringzilla256_find(const char* text, size_t n,
+                                                   const char* pattern, size_t m) {
+    if (m == 0) return {true, 0};
+    if (n < m) return {false, 0};
+    // One-byte needles have no three distinct anchors; the 64-byte kernel
+    // already handles them with a single broadcast compare per window.
+    if (m == 1 || n < m + 255) return avx512_stringzilla_find(text, n, pattern, m);
+
+    size_t off_first, off_mid, off_last;
+    sz_locate_needle_anomalies(pattern, m, off_first, off_mid, off_last);
+    const __m512i first = _mm512_set1_epi8((char)pattern[off_first]);
+    const __m512i mid = _mm512_set1_epi8((char)pattern[off_mid]);
+    const __m512i last = _mm512_set1_epi8((char)pattern[off_last]);
+
+    size_t i = 0;
+    for (; i + m + 255 <= n; i += 256) {
+        const char* a = text + i + off_first;
+        __mmask64 fA = _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(a +   0)), first);
+        __mmask64 fB = _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(a +  64)), first);
+        __mmask64 fC = _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(a + 128)), first);
+        __mmask64 fD = _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(a + 192)), first);
+        if ((fA | fB | fC | fD) == 0) continue;
+
+        const char* b = text + i + off_mid;
+        fA = _mm512_mask_cmpeq_epi8_mask(fA, _mm512_loadu_si512((const void*)(b +   0)), mid);
+        fB = _mm512_mask_cmpeq_epi8_mask(fB, _mm512_loadu_si512((const void*)(b +  64)), mid);
+        fC = _mm512_mask_cmpeq_epi8_mask(fC, _mm512_loadu_si512((const void*)(b + 128)), mid);
+        fD = _mm512_mask_cmpeq_epi8_mask(fD, _mm512_loadu_si512((const void*)(b + 192)), mid);
+        if ((fA | fB | fC | fD) == 0) continue;
+
+        const char* c = text + i + off_last;
+        fA = _mm512_mask_cmpeq_epi8_mask(fA, _mm512_loadu_si512((const void*)(c +   0)), last);
+        fB = _mm512_mask_cmpeq_epi8_mask(fB, _mm512_loadu_si512((const void*)(c +  64)), last);
+        fC = _mm512_mask_cmpeq_epi8_mask(fC, _mm512_loadu_si512((const void*)(c + 128)), last);
+        fD = _mm512_mask_cmpeq_epi8_mask(fD, _mm512_loadu_si512((const void*)(c + 192)), last);
+        if ((fA | fB | fC | fD) == 0) continue;
+
+        // Verify survivors in increasing index order: chunk by chunk, and
+        // within a chunk lowest set bit first, so the first memcmp that
+        // succeeds is the leftmost occurrence.
+        const __mmask64 masks[4] = {fA, fB, fC, fD};
+        for (size_t k = 0; k < 4; ++k) {
+            __mmask64 mk = masks[k];
+            while (mk != 0) {
+                size_t off = i + 64 * k + (size_t)__builtin_ctzll(mk);
+                if (std::memcmp(text + off, pattern, m) == 0) return {true, off};
+                mk &= mk - 1;
+            }
+        }
+    }
+
+    // Remainder: hand the uncovered suffix to the 64-byte masked kernel.
+    auto [f, idx] = avx512_stringzilla_find(text + i, n - i, pattern, m);
+    if (!f) return {false, 0};
+    return {true, i + idx};
+}

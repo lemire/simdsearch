@@ -5,7 +5,8 @@ SIMD substring search benchmarks. The SIMD backend is selected at compile time
 from the host architecture:
 
 - **x86-64 with AVX-512** (F + BW): `include/avx512search.h`
-  (`find_avx512`, `find_avx512_256`, `find_avx512_stringzilla`)
+  (`find_avx512`, `find_avx512_256`, `find_avx512_stringzilla`,
+  `find_avx512_hybrid`, `find_avx512_stringzilla_256`)
 - **ARM / AArch64 NEON**: `include/neonsearch.h`
   (`find_neon`, `find_neon64`, `find_neon_stringzilla`)
 
@@ -90,6 +91,79 @@ find_strstr                   7.632 GB/s
 find_bmh                      0.833 GB/s
 ```
 
+## Hybrid: 256-byte stride below a needle-length threshold, anchored above
+
+`find_avx512_hybrid` runs `avx512_naive_search256` for needles up to 512 bytes
+and `avx512_stringzilla_find` above that. The two kernels fail in opposite
+directions, and the threshold picks whichever failure is cheaper:
+
+- the naive 256-byte kernel filters on the needle's **first four bytes** and
+  narrows a match mask byte by byte, so its per-block cost grows with the needle
+  length whenever those four bytes fail to reject — but when they do reject
+  (ordinary text) it is the fastest kernel here, because each pattern-byte
+  broadcast is amortized over four 64-byte chunks;
+- the StringZilla kernel filters on **three anomaly-chosen anchors**, a fixed
+  three compares per window regardless of needle length, then verifies survivors
+  with `memcmp`.
+
+`find_avx512_hybrid16/32/64/128/256` are the same scheme at other switch points,
+so the crossover can be measured instead of assumed.
+
+On ordinary text (`horspool` mode over the 141 KB `data/43-0.txt`, ns per
+first-occurrence search, lower is better) the hybrid tracks the lower envelope of
+its two parents at every length, and 512 is close to the true crossover — the
+parents cross between 512 and 640:
+
+```
+algo                          8     32    128    256    512    640   1024   2048   4096
+find_avx512                2560   3491   3571   3578   3823   4089   4370   5190   7007
+find_avx512_256            1933   2670   2816   2970   3339   3679   4238   5814   9026
+find_avx512_stringzilla    3163   3991   3758   3600   3520   3645   3643   3581   3700
+find_avx512_hybrid         1935   2674   2823   2970   3336   3646   3649   3587   3701
+find_avx512_hybrid64       1939   2673   3762   3601   3518   3643   3641   3585   3698
+find_avx512_stringzilla_256 2231  2756   2741   2721   2668   2752   2773   2789   2826
+find_strstr                4554   6012   6073   6007   5953   6363   6390   6636   7338
+```
+
+Switching earlier is worse: `find_avx512_hybrid64` gives up 33% at length 128
+(3762 vs 2820) for no gain. In `ashvardanian` mode every needle is a short word,
+so the length switch never fires; the hybrid leads anyway (11.20 vs 11.11 GB/s
+for `find_avx512_256`) on the strength of the short-haystack guard below.
+
+The hybrid carries a **short-haystack guard** (`n < 2048` → the 64-byte
+`avx512_naive_search`). Without it the scheme lost 3× on small inputs: the
+256-byte kernel builds four chunk masks and only then scans them, so it cannot
+report a match until it has finished the whole block the match sits in, while
+the 64-byte kernel returns as soon as its single chunk has a hit. On a small
+haystack the match arrives early relative to 256 bytes, so that granularity is
+paid for nothing. In `synthetic` mode (1 KB text) the guard takes the hybrid from
+133–159 ns/search to 43–54 ns, level with `find_avx512`. It also helps
+`ashvardanian`, whose find-all loop searches a shrinking suffix and so keeps
+entering the small-haystack regime: 9.91 → 11.11 GB/s in the same run. It is
+free everywhere else — `horspool` (141 KB) and `worstcase` (64 KB) never trigger
+it. A 8192-byte cutoff measures the same as 2048.
+
+Note that the narrower structural condition (`n < m + 255`, i.e. too short for
+even one wide block) is *not* what mattered here: in `synthetic`, n = 1024 and
+m ≤ 20, so `n >= m + 255` always holds and that guard alone never fires.
+
+The threshold does **not** rescue the adversarial `worstcase` inputs, because
+needle length is only a proxy for the thing that matters — whether the filter's
+chosen bytes are selective in this haystack — and the proxy breaks both ways.
+Below the threshold the hybrid still inherits the naive kernel's O(n·m) collapse
+(`tail`, L=512: 205817 ns vs StringZilla's 3920, 52× worse), and in the `block`
+shape StringZilla is the *slower* parent, so switching to it above 512 costs
+~1.9× (L=1024: 532420 vs 256614 ns). Fixing the adversarial case needs a better
+filter, not a better threshold.
+
+`find_avx512_stringzilla_256` is that filter: StringZilla's three anchors run at
+the naive kernel's 256-byte stride, so each anchor broadcast is reused across
+four 64-byte chunks and the mask bookkeeping is paid once per 256 bytes instead
+of once per 64. It needs no threshold — the anchor cost is already independent of
+m — and it is the fastest kernel in `horspool` from length 32 up and in every
+`worstcase` shape except `block`, where no anchor is selective by construction
+and only the linear-time `find_twoway_bc` does well.
+
 ## Glob pattern-matching benchmark
 
 `glob_benchmark` compares glob ("stringmatchlen") matchers: the recursive Redis
@@ -126,8 +200,10 @@ cross-checks every matcher against an independent oracle and the Redis baseline.
 ```
 ctest --test-dir build --output-on-failure   # or: ./build/test_glob
 ```
-The AVX-512 routines lead the field; `find_avx512_stringzilla` (first+last byte
-anchoring) is fastest. `find_avx512_256` uses a 256-byte stride and only helps
-when matches are rare and the scan streams through long non-matching runs (e.g.
-`horspool` mode at pattern length ≥ 4); for short or frequently-found needles
-prefer `find_avx512` or `find_avx512_stringzilla`.
+The AVX-512 routines lead the field. Which one is fastest depends on the needle
+length and on whether the filter's chosen bytes are selective in the haystack:
+`find_avx512_256` wins on short needles, `find_avx512_hybrid` extends that win to
+long needles on ordinary text, and `find_avx512_stringzilla_256` is fastest from
+length ~32 up and is the only kernel that stays flat under the adversarial
+`worstcase` shapes (except `block`). See the hybrid section above for the
+measurements.

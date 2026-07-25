@@ -76,6 +76,13 @@ int main() {
       {"avx512_naive_search", avx512_naive_search},
       {"avx512_naive_search256", avx512_naive_search256},
       {"avx512_stringzilla_find", avx512_stringzilla_find},
+      {"avx512_hybrid256_sz", avx512_hybrid256_sz},
+      {"avx512_hybrid256_sz16", avx512_hybrid256_sz16},
+      {"avx512_hybrid256_sz32", avx512_hybrid256_sz32},
+      {"avx512_hybrid256_sz64", avx512_hybrid256_sz64},
+      {"avx512_hybrid256_sz128", avx512_hybrid256_sz128},
+      {"avx512_hybrid256_sz256", avx512_hybrid256_sz256},
+      {"avx512_stringzilla256_find", avx512_stringzilla256_find},
 #elif defined(SIMDSEARCH_NEON)
       {"neon_naive_search", neon_naive_search},
       {"neon_naive_search64", neon_naive_search64},
@@ -203,6 +210,40 @@ int main() {
     }
 
     for (auto &fn : fns) check(fn, text, pat);
+  }
+
+  // ---- Long-needle fuzz: needle lengths straddle the hybrid's 512-byte switch
+  // point, and the haystack is long enough (>= m + 255) that the 256-byte-
+  // stride kernels run their main loop rather than falling straight through to
+  // the remainder path. Without this the hybrid's above-threshold branch and
+  // avx512_stringzilla256_find's block loop are never taken.
+  for (size_t plen : {size_t{200}, size_t{255}, size_t{256}, size_t{257},
+                      size_t{511}, size_t{512}, size_t{513}, size_t{600},
+                      size_t{1024}, size_t{1500}}) {
+    for (int iter = 0; iter < 30; ++iter) {
+      // Haystack sizes around the m + 255 boundary that gates the wide stride.
+      for (size_t tlen : {plen, plen + 1, plen + 254, plen + 255, plen + 256,
+                          plen + 700, 4 * plen + 300}) {
+        std::string text(tlen, '?');
+        for (auto &c : text) c = alphabet[gen() % A];
+
+        std::string pat;
+        int kind = (int)(gen() % 3);
+        if (kind == 0) {  // cut from the text: guaranteed present
+          std::uniform_int_distribution<size_t> start_dist(0, tlen - plen);
+          pat = text.substr(start_dist(gen), plen);
+        } else if (kind == 1) {  // random: over "abc" it is effectively absent
+          pat.resize(plen);
+          for (auto &c : pat) c = alphabet[gen() % A];
+        } else {  // present-but-for-one-byte: forces deep verification
+          std::uniform_int_distribution<size_t> start_dist(0, tlen - plen);
+          pat = text.substr(start_dist(gen), plen);
+          pat[gen() % plen] = 'z';  // 'z' is outside the alphabet
+        }
+
+        for (auto &fn : fns) check(fn, text, pat);
+      }
+    }
   }
 
   std::printf("ran %zu checks, %zu failures\n", g_checks, g_failures);
