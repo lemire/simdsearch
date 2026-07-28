@@ -142,15 +142,32 @@ static const std::vector<Algo> kAlgos = {
     {"find_avx512", Kind::Stateless, avx512_naive_search},
     {"find_avx512_256", Kind::Stateless, avx512_naive_search256},
     {"find_avx512_stringzilla", Kind::Stateless, avx512_stringzilla_find},
-    // The hybrid scheme: 256-byte-stride naive kernel up to a needle-length
+    // The needle-hammer scheme: 256-byte-stride naive kernel up to a needle-length
     // threshold, StringZilla's anchored kernel above it.
-    {"find_avx512_hybrid", Kind::Stateless, avx512_hybrid256_sz},
-    {"find_avx512_hybrid16", Kind::Stateless, avx512_hybrid256_sz16},
-    {"find_avx512_hybrid32", Kind::Stateless, avx512_hybrid256_sz32},
-    {"find_avx512_hybrid64", Kind::Stateless, avx512_hybrid256_sz64},
-    {"find_avx512_hybrid128", Kind::Stateless, avx512_hybrid256_sz128},
-    {"find_avx512_hybrid256", Kind::Stateless, avx512_hybrid256_sz256},
+    {"find_avx512_needle_hammer", Kind::Stateless, avx512_needle_hammer},
+    {"find_avx512_needle_hammer16", Kind::Stateless, avx512_needle_hammer16},
+    {"find_avx512_needle_hammer32", Kind::Stateless, avx512_needle_hammer32},
+    {"find_avx512_needle_hammer64", Kind::Stateless, avx512_needle_hammer64},
+    {"find_avx512_needle_hammer128", Kind::Stateless, avx512_needle_hammer128},
+    {"find_avx512_needle_hammer256", Kind::Stateless, avx512_needle_hammer256},
     {"find_avx512_stringzilla_256", Kind::Stateless, avx512_stringzilla256_find},
+    // The same needle-hammer scheme at 256-bit (AVX2) and 128-bit (SSE2)
+    // register width, each with its own three component kernels so the scheme
+    // can be read against its own parents at that width.
+    {"find_avx256", Kind::Stateless, avx256_naive_search},
+    {"find_avx256_128", Kind::Stateless, avx256_naive_search128},
+    {"find_avx256_stringzilla", Kind::Stateless, avx256_stringzilla_find},
+    {"find_avx256_needle_hammer", Kind::Stateless, avx256_needle_hammer},
+    {"find_avx256_needle_hammer64", Kind::Stateless, avx256_needle_hammer64},
+    {"find_avx256_needle_hammer512", Kind::Stateless, avx256_needle_hammer512},
+    {"find_avx256_needle_hammer8192", Kind::Stateless, avx256_needle_hammer8192},
+    {"find_avx128", Kind::Stateless, avx128_naive_search},
+    {"find_avx128_64", Kind::Stateless, avx128_naive_search64},
+    {"find_avx128_stringzilla", Kind::Stateless, avx128_stringzilla_find},
+    {"find_avx128_needle_hammer", Kind::Stateless, avx128_needle_hammer},
+    {"find_avx128_needle_hammer64", Kind::Stateless, avx128_needle_hammer64},
+    {"find_avx128_needle_hammer512", Kind::Stateless, avx128_needle_hammer512},
+    {"find_avx128_needle_hammer8192", Kind::Stateless, avx128_needle_hammer8192},
 #elif defined(SIMDSEARCH_NEON)
     {"find_neon", Kind::Stateless, neon_naive_search},
     {"find_neon64", Kind::Stateless, neon_naive_search64},
@@ -165,6 +182,7 @@ static const std::vector<Algo> kAlgos = {
     {"find_twoway_amortized", Kind::AmortTwoWay, nullptr},
     {"find_twoway_bc_amortized", Kind::AmortTwoWayBC, nullptr},
     {"find_strstr", Kind::Stateless, strstr_search},
+    {"find_memmem", Kind::Stateless, memmem_search},
     {"find_std_default_searcher", Kind::Stateless, std_default_searcher},
     {"find_std_boyer_moore_searcher", Kind::Stateless, std_boyer_moore_searcher},
     {"find_std_boyer_moore_horspool_searcher", Kind::Stateless,

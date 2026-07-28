@@ -21,6 +21,17 @@ std::pair<bool, size_t> strstr_search(const char* text, size_t n, const char* pa
     return {true, (size_t)(hit - text)};
 }
 
+// C library memmem (POSIX 2024; long-standing extension on glibc/BSD/macOS).
+// Unlike strstr it is length-delimited, so it needs no NUL terminator and is
+// safe on inputs containing NUL bytes.
+std::pair<bool, size_t> memmem_search(const char* text, size_t n, const char* pattern, size_t m) {
+    if (m == 0) return {true, 0};
+    if (n < m) return {false, 0};
+    const char* hit = (const char*)::memmem(text, n, pattern, m);
+    if (hit == nullptr) return {false, 0};
+    return {true, (size_t)(hit - text)};
+}
+
 // std::search with std::default_searcher (C++17). The searcher is rebuilt per
 // call to match the interface of the other functions here (which also do not
 // amortize per-pattern preprocessing across calls).
@@ -409,7 +420,7 @@ std::pair<bool, size_t> avx512_stringzilla_find(const char* haystack, size_t h_l
 }
 
 
-// Length-dispatched hybrid: the 256-byte-stride naive kernel for needles up to
+// Length-dispatched needle-hammer: the 256-byte-stride naive kernel for needles up to
 // Threshold bytes, the StringZilla 3-anchor kernel above it.
 //
 // The two kernels fail in opposite directions. avx512_naive_search256 spends
@@ -438,7 +449,7 @@ std::pair<bool, size_t> avx512_stringzilla_find(const char* haystack, size_t h_l
 // while i + m + 255 <= n, and anything it cannot cover drops to a scalar memcmp
 // loop. It matters only for needles too long for kMinWide to already catch.
 template <size_t Threshold>
-static inline std::pair<bool, size_t> avx512_hybrid_find_t(const char* text, size_t n,
+static inline std::pair<bool, size_t> avx512_needle_hammer_t(const char* text, size_t n,
                                                            const char* pattern, size_t m) {
     constexpr size_t kMinWide = 2048;
     if (m > Threshold) return avx512_stringzilla_find(text, n, pattern, m);
@@ -447,30 +458,30 @@ static inline std::pair<bool, size_t> avx512_hybrid_find_t(const char* text, siz
 }
 
 // The scheme itself, switching at 512 bytes of needle.
-std::pair<bool, size_t> avx512_hybrid256_sz(const char* text, size_t n,
+std::pair<bool, size_t> avx512_needle_hammer(const char* text, size_t n,
                                             const char* pattern, size_t m) {
-    return avx512_hybrid_find_t<512>(text, n, pattern, m);
+    return avx512_needle_hammer_t<512>(text, n, pattern, m);
 }
 
 // Same scheme at other switch points, so the crossover can be located
 // empirically rather than assumed.
-std::pair<bool, size_t> avx512_hybrid256_sz16(const char* t, size_t n, const char* p, size_t m)
-    { return avx512_hybrid_find_t<16>(t, n, p, m); }
-std::pair<bool, size_t> avx512_hybrid256_sz32(const char* t, size_t n, const char* p, size_t m)
-    { return avx512_hybrid_find_t<32>(t, n, p, m); }
-std::pair<bool, size_t> avx512_hybrid256_sz64(const char* t, size_t n, const char* p, size_t m)
-    { return avx512_hybrid_find_t<64>(t, n, p, m); }
-std::pair<bool, size_t> avx512_hybrid256_sz128(const char* t, size_t n, const char* p, size_t m)
-    { return avx512_hybrid_find_t<128>(t, n, p, m); }
-std::pair<bool, size_t> avx512_hybrid256_sz256(const char* t, size_t n, const char* p, size_t m)
-    { return avx512_hybrid_find_t<256>(t, n, p, m); }
+std::pair<bool, size_t> avx512_needle_hammer16(const char* t, size_t n, const char* p, size_t m)
+    { return avx512_needle_hammer_t<16>(t, n, p, m); }
+std::pair<bool, size_t> avx512_needle_hammer32(const char* t, size_t n, const char* p, size_t m)
+    { return avx512_needle_hammer_t<32>(t, n, p, m); }
+std::pair<bool, size_t> avx512_needle_hammer64(const char* t, size_t n, const char* p, size_t m)
+    { return avx512_needle_hammer_t<64>(t, n, p, m); }
+std::pair<bool, size_t> avx512_needle_hammer128(const char* t, size_t n, const char* p, size_t m)
+    { return avx512_needle_hammer_t<128>(t, n, p, m); }
+std::pair<bool, size_t> avx512_needle_hammer256(const char* t, size_t n, const char* p, size_t m)
+    { return avx512_needle_hammer_t<256>(t, n, p, m); }
 
 
 // A second way to combine the two ideas, for reference: keep StringZilla's
 // three-anchor filter but run it with the 256-byte stride of the naive kernel,
 // so each anchor broadcast is reused across four 64-byte chunks and the
 // per-window mask bookkeeping is paid once per 256 bytes instead of once per
-// 64. Unlike the length-dispatched hybrid above there is no threshold -- the
+// 64. Unlike the length-dispatched needle-hammer above there is no threshold -- the
 // filter cost is already independent of m -- so this is length-insensitive
 // everywhere, not just above a cutoff.
 //
@@ -534,3 +545,333 @@ std::pair<bool, size_t> avx512_stringzilla256_find(const char* text, size_t n,
     if (!f) return {false, 0};
     return {true, i + idx};
 }
+
+
+// ===========================================================================
+// Needle-hammer at 256-bit (AVX2) and 128-bit (SSE2) register width
+// ===========================================================================
+//
+// The same three kernels and the same length dispatch as the AVX-512 version
+// above, rebuilt on narrower vectors, so the scheme can be measured against
+// its own register width instead of only against other algorithms. Everything
+// below is width-generic: an Ops traits struct supplies the vector type, the
+// window width W, and the three primitives (broadcast, unaligned load, compare
+// -> bitmap), and one templated body serves both widths.
+//
+// The one structural difference from AVX-512 is where the match state lives.
+// AVX-512 keeps it in a dedicated __mmask64 and folds "compare only where a
+// candidate is still alive, then AND" into a single instruction
+// (_mm512_mask_cmpeq_epi8_mask). AVX2 and SSE2 have no mask registers, so the
+// state is a plain integer bitmap produced by cmpeq + movemask and narrowed
+// with &= -- one extra instruction per pattern-byte round, and the compare is
+// done for every lane whether or not it is still alive. The algorithm is
+// otherwise identical.
+//
+// The other difference is the tail. AVX-512's anchored kernel uses predicated
+// loads, so a single masked loop covers the body, the tail and haystacks
+// shorter than one window with no scalar fallback. Neither narrower ISA has
+// byte-granular masked loads, so all three kernels here stop the vector loop
+// while a full window is in bounds and finish with a scalar memcmp loop -- the
+// same shape avx512_naive_search256 already uses.
+
+// 256-bit lanes (AVX2). The bitmap is 32 bits, one per candidate position.
+struct x86_ops256 {
+    using vec_t = __m256i;
+    static constexpr size_t kWidth = 32;
+    static inline vec_t broadcast(char c) { return _mm256_set1_epi8(c); }
+    static inline vec_t load(const char* p) {
+        return _mm256_loadu_si256((const __m256i*)p);
+    }
+    static inline uint32_t eq_mask(vec_t a, vec_t b) {
+        return (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b));
+    }
+};
+
+// 128-bit lanes (SSE2, baseline on x86-64). The bitmap uses the low 16 bits of
+// the same uint32_t; the upper half stays zero, so ctz and the &= narrowing
+// need no separate handling.
+struct x86_ops128 {
+    using vec_t = __m128i;
+    static constexpr size_t kWidth = 16;
+    static inline vec_t broadcast(char c) { return _mm_set1_epi8(c); }
+    static inline vec_t load(const char* p) {
+        return _mm_loadu_si128((const __m128i*)p);
+    }
+    static inline uint32_t eq_mask(vec_t a, vec_t b) {
+        return (uint32_t)_mm_movemask_epi8(_mm_cmpeq_epi8(a, b));
+    }
+};
+
+
+// Naive prefix-filter search over one W-byte window per step: the width-generic
+// form of avx512_naive_search. Pattern byte j is broadcast and compared against
+// text[i+j .. i+j+W-1]; the bitmap of surviving candidate positions is narrowed
+// byte by byte and the lowest surviving bit is the answer.
+//
+// The first four bytes are compared unconditionally (no early-out test between
+// them) because on ordinary text they are what kills essentially every
+// candidate -- the branch would cost more than the compare. Needles shorter
+// than four bytes take the generic loop from byte 0 so they stay on the vector
+// path rather than dropping to the scalar tail for the whole haystack.
+template <class Ops>
+static inline std::pair<bool, size_t> x86_naive_search_t(const char* text, size_t n,
+                                                         const char* pattern, size_t m) {
+    constexpr size_t W = Ops::kWidth;
+    if (m == 0) return {true, 0};
+    if (n < m) return {false, 0};
+
+    size_t i = 0;
+    // A window reads bytes [i, i + W - 1 + (m - 1)], so require i + m + W - 1 <= n.
+    if (m >= 4) {
+        for (; i + m + W - 1 <= n; i += W) {
+            uint32_t found = Ops::eq_mask(Ops::load(text + i + 0), Ops::broadcast(pattern[0]));
+            found &= Ops::eq_mask(Ops::load(text + i + 1), Ops::broadcast(pattern[1]));
+            found &= Ops::eq_mask(Ops::load(text + i + 2), Ops::broadcast(pattern[2]));
+            found &= Ops::eq_mask(Ops::load(text + i + 3), Ops::broadcast(pattern[3]));
+            for (size_t j = 4; j < m; ++j) {
+                if (found == 0) break;
+                found &= Ops::eq_mask(Ops::load(text + i + j), Ops::broadcast(pattern[j]));
+            }
+            if (found == 0) continue;
+            return {true, i + (size_t)__builtin_ctz(found)};
+        }
+    } else {
+        for (; i + m + W - 1 <= n; i += W) {
+            uint32_t found = Ops::eq_mask(Ops::load(text + i), Ops::broadcast(pattern[0]));
+            for (size_t j = 1; j < m; ++j) {
+                if (found == 0) break;
+                found &= Ops::eq_mask(Ops::load(text + i + j), Ops::broadcast(pattern[j]));
+            }
+            if (found == 0) continue;
+            return {true, i + (size_t)__builtin_ctz(found)};
+        }
+    }
+
+    // Scalar tail for the positions the vector loop could not safely cover.
+    for (; i + m <= n; ++i) {
+        if (std::memcmp(text + i, pattern, m) == 0) return {true, i};
+    }
+    return {false, 0};
+}
+
+
+// The same filter over a block of four W-byte chunks (4W bytes per step): the
+// width-generic form of avx512_naive_search256. Each pattern-byte broadcast is
+// built once and reused across all four chunks, which is where the win over the
+// single-window kernel comes from; the price is that a match cannot be reported
+// until the whole block is filtered, so the chunks are scanned in index order
+// to keep the leftmost-match guarantee.
+template <class Ops>
+static inline std::pair<bool, size_t> x86_naive_search_wide_t(const char* text, size_t n,
+                                                              const char* pattern, size_t m) {
+    constexpr size_t W = Ops::kWidth;
+    constexpr size_t B = 4 * W;  // bytes of candidate positions per block
+    if (m == 0) return {true, 0};
+    if (n < m) return {false, 0};
+
+    size_t i = 0;
+    // A block reads bytes [i, i + B - 1 + (m - 1)], so require i + m + B - 1 <= n.
+    if (m >= 4) {
+        for (; i + m + B - 1 <= n; i += B) {
+            typename Ops::vec_t p = Ops::broadcast(pattern[0]);
+            uint32_t fA = Ops::eq_mask(Ops::load(text + i + 0 * W), p);
+            uint32_t fB = Ops::eq_mask(Ops::load(text + i + 1 * W), p);
+            uint32_t fC = Ops::eq_mask(Ops::load(text + i + 2 * W), p);
+            uint32_t fD = Ops::eq_mask(Ops::load(text + i + 3 * W), p);
+
+            for (size_t j = 1; j < 4; ++j) {
+                p = Ops::broadcast(pattern[j]);
+                fA &= Ops::eq_mask(Ops::load(text + i + j + 0 * W), p);
+                fB &= Ops::eq_mask(Ops::load(text + i + j + 1 * W), p);
+                fC &= Ops::eq_mask(Ops::load(text + i + j + 2 * W), p);
+                fD &= Ops::eq_mask(Ops::load(text + i + j + 3 * W), p);
+            }
+
+            for (size_t j = 4; j < m; ++j) {
+                if ((fA | fB | fC | fD) == 0) break;
+                p = Ops::broadcast(pattern[j]);
+                fA &= Ops::eq_mask(Ops::load(text + i + j + 0 * W), p);
+                fB &= Ops::eq_mask(Ops::load(text + i + j + 1 * W), p);
+                fC &= Ops::eq_mask(Ops::load(text + i + j + 2 * W), p);
+                fD &= Ops::eq_mask(Ops::load(text + i + j + 3 * W), p);
+            }
+
+            if ((fA | fB | fC | fD) == 0) continue;
+            // Walk chunks in order so we return the lowest-index match.
+            if (fA != 0) return {true, i + 0 * W + (size_t)__builtin_ctz(fA)};
+            if (fB != 0) return {true, i + 1 * W + (size_t)__builtin_ctz(fB)};
+            if (fC != 0) return {true, i + 2 * W + (size_t)__builtin_ctz(fC)};
+            return {true, i + 3 * W + (size_t)__builtin_ctz(fD)};
+        }
+    } else {
+        for (; i + m + B - 1 <= n; i += B) {
+            typename Ops::vec_t p = Ops::broadcast(pattern[0]);
+            uint32_t fA = Ops::eq_mask(Ops::load(text + i + 0 * W), p);
+            uint32_t fB = Ops::eq_mask(Ops::load(text + i + 1 * W), p);
+            uint32_t fC = Ops::eq_mask(Ops::load(text + i + 2 * W), p);
+            uint32_t fD = Ops::eq_mask(Ops::load(text + i + 3 * W), p);
+
+            for (size_t j = 1; j < m; ++j) {
+                p = Ops::broadcast(pattern[j]);
+                fA &= Ops::eq_mask(Ops::load(text + i + j + 0 * W), p);
+                fB &= Ops::eq_mask(Ops::load(text + i + j + 1 * W), p);
+                fC &= Ops::eq_mask(Ops::load(text + i + j + 2 * W), p);
+                fD &= Ops::eq_mask(Ops::load(text + i + j + 3 * W), p);
+            }
+
+            if ((fA | fB | fC | fD) == 0) continue;
+            if (fA != 0) return {true, i + 0 * W + (size_t)__builtin_ctz(fA)};
+            if (fB != 0) return {true, i + 1 * W + (size_t)__builtin_ctz(fB)};
+            if (fC != 0) return {true, i + 2 * W + (size_t)__builtin_ctz(fC)};
+            return {true, i + 3 * W + (size_t)__builtin_ctz(fD)};
+        }
+    }
+
+    for (; i + m <= n; ++i) {
+        if (std::memcmp(text + i, pattern, m) == 0) return {true, i};
+    }
+    return {false, 0};
+}
+
+
+// StringZilla's three-anchor filter at width W: the width-generic form of
+// avx512_stringzilla_find. Three needle offsets chosen by
+// sz_locate_needle_anomalies are broadcast and compared against the haystack;
+// a candidate must match at all three before a memcmp verifies it in full. The
+// filter is three compares per window regardless of the needle length, which is
+// what makes it the better half of the scheme for long needles.
+template <class Ops>
+static inline std::pair<bool, size_t> x86_stringzilla_find_t(const char* text, size_t n,
+                                                             const char* pattern, size_t m) {
+    constexpr size_t W = Ops::kWidth;
+    if (m == 0) return {true, 0};
+    if (n < m) return {false, 0};
+
+    // A single-byte needle has no three distinct anchors: one broadcast compare
+    // per window is already the whole search.
+    if (m == 1) {
+        const typename Ops::vec_t nv = Ops::broadcast(pattern[0]);
+        size_t i = 0;
+        for (; i + W <= n; i += W) {
+            uint32_t eq = Ops::eq_mask(Ops::load(text + i), nv);
+            if (eq != 0) return {true, i + (size_t)__builtin_ctz(eq)};
+        }
+        for (; i < n; ++i)
+            if (text[i] == pattern[0]) return {true, i};
+        return {false, 0};
+    }
+
+    size_t off_first, off_mid, off_last;
+    sz_locate_needle_anomalies(pattern, m, off_first, off_mid, off_last);
+    const typename Ops::vec_t first = Ops::broadcast(pattern[off_first]);
+    const typename Ops::vec_t mid = Ops::broadcast(pattern[off_mid]);
+    const typename Ops::vec_t last = Ops::broadcast(pattern[off_last]);
+
+    size_t i = 0;
+    // Each step covers candidate positions [i, i + W - 1]. The last anchor of
+    // the last candidate reads text[i + W - 1 + off_last] and off_last <= m - 1,
+    // so i + m + W - 1 <= n keeps every load in bounds.
+    for (; i + m + W - 1 <= n; i += W) {
+        uint32_t mask = Ops::eq_mask(Ops::load(text + i + off_first), first);
+        if (mask == 0) continue;
+        mask &= Ops::eq_mask(Ops::load(text + i + off_mid), mid);
+        if (mask == 0) continue;
+        mask &= Ops::eq_mask(Ops::load(text + i + off_last), last);
+        while (mask != 0) {
+            size_t b = (size_t)__builtin_ctz(mask);
+            if (std::memcmp(text + i + b, pattern, m) == 0) return {true, i + b};
+            mask &= mask - 1;  // clear the lowest set bit and continue
+        }
+    }
+
+    for (; i + m <= n; ++i) {
+        if (std::memcmp(text + i, pattern, m) == 0) return {true, i};
+    }
+    return {false, 0};
+}
+
+
+// Needle-hammer at width W. Identical dispatch to avx512_needle_hammer_t, with
+// both cutoffs scaled to the register width:
+//
+//   m > Threshold                  -> the anchored kernel (length-insensitive)
+//   n < MinWide or too short for
+//   one wide block                 -> the single-window naive kernel
+//   otherwise                      -> the four-chunk naive kernel
+//
+// MinWide is the short-haystack guard: the wide kernel cannot report a match
+// until it has filtered the entire 4W-byte block the match sits in, while the
+// single-window kernel returns as soon as its one chunk has a hit, so on a
+// small haystack the block granularity is paid for nothing.
+//
+// It is an absolute byte count, not a multiple of the block size. Scaling it
+// per width (8 blocks: 2048 / 1024 / 512) was the obvious guess and it measured
+// wrong -- on the 1 KB haystack of `synthetic` the wide kernel loses at every
+// width (AVX2: 74 ns vs 49 ns for the single-window kernel; SSE2: 79 vs 65),
+// so the cutoff has to sit above 1024 everywhere. The scaled rule put it at
+// 1024 and 512, i.e. exactly below the haystack, and both narrow hammers took
+// the wide path and lost. 2048 is the value measured for AVX-512 and it is the
+// right side of that boundary for all three widths.
+template <class Ops, size_t Threshold, size_t MinWide = 2048>
+static inline std::pair<bool, size_t> x86_needle_hammer_t(const char* text, size_t n,
+                                                          const char* pattern, size_t m) {
+    constexpr size_t B = 4 * Ops::kWidth;
+    if (m > Threshold) return x86_stringzilla_find_t<Ops>(text, n, pattern, m);
+    if (n < MinWide || n < m + B - 1) return x86_naive_search_t<Ops>(text, n, pattern, m);
+    return x86_naive_search_wide_t<Ops>(text, n, pattern, m);
+}
+
+
+// --- AVX2 (256-bit) exports ---
+std::pair<bool, size_t> avx256_naive_search(const char* t, size_t n, const char* p, size_t m)
+    { return x86_naive_search_t<x86_ops256>(t, n, p, m); }
+std::pair<bool, size_t> avx256_naive_search128(const char* t, size_t n, const char* p, size_t m)
+    { return x86_naive_search_wide_t<x86_ops256>(t, n, p, m); }
+std::pair<bool, size_t> avx256_stringzilla_find(const char* t, size_t n, const char* p, size_t m)
+    { return x86_stringzilla_find_t<x86_ops256>(t, n, p, m); }
+// Switching at 2048, not at AVX-512's 512: the threshold belongs to the width,
+// not to the scheme. See the note above the SSE2 export for the measurements.
+std::pair<bool, size_t> avx256_needle_hammer(const char* t, size_t n, const char* p, size_t m)
+    { return x86_needle_hammer_t<x86_ops256, 2048>(t, n, p, m); }
+// Other switch points, so the crossover stays measurable at this width too.
+std::pair<bool, size_t> avx256_needle_hammer64(const char* t, size_t n, const char* p, size_t m)
+    { return x86_needle_hammer_t<x86_ops256, 64>(t, n, p, m); }
+std::pair<bool, size_t> avx256_needle_hammer512(const char* t, size_t n, const char* p, size_t m)
+    { return x86_needle_hammer_t<x86_ops256, 512>(t, n, p, m); }
+std::pair<bool, size_t> avx256_needle_hammer8192(const char* t, size_t n, const char* p, size_t m)
+    { return x86_needle_hammer_t<x86_ops256, 8192>(t, n, p, m); }
+
+// --- SSE2 (128-bit) exports ---
+std::pair<bool, size_t> avx128_naive_search(const char* t, size_t n, const char* p, size_t m)
+    { return x86_naive_search_t<x86_ops128>(t, n, p, m); }
+std::pair<bool, size_t> avx128_naive_search64(const char* t, size_t n, const char* p, size_t m)
+    { return x86_naive_search_wide_t<x86_ops128>(t, n, p, m); }
+std::pair<bool, size_t> avx128_stringzilla_find(const char* t, size_t n, const char* p, size_t m)
+    { return x86_stringzilla_find_t<x86_ops128>(t, n, p, m); }
+// Switching at 8192. The crossover moves out sharply as the register narrows --
+// 512 bytes at 512-bit, 2048 at 256-bit, ~8192 at 128-bit -- because the
+// anchored kernel's per-window overhead (three loads, three movemask
+// round-trips through a GPR, two early-out branches) is amortized over only W
+// candidate positions, so it grows as the width shrinks, while the naive wide
+// kernel pays no such fixed cost. horspool ns per search, this machine:
+//
+//   width  kernel            512   1024   2048   4096   8192
+//   256b   naive wide       4657   5507   7201  10404  16902
+//   256b   anchored         9406   9137   9526   9375   9091   -> crosses ~2.5K
+//   128b   naive wide       6468   7149   8525  10957  15975
+//   128b   anchored        17185  16885  17635  17144  16841   -> crosses ~8K
+//
+// Consequence worth stating: a later switch means the adversarial worstcase
+// shapes stay on the naive kernel for longer, so the O(n*m) collapse is not
+// cut off until the (now much higher) threshold. That is the same trade the
+// AVX-512 version already documents -- needle length is a proxy for anchor
+// selectivity, and fixing the adversarial case needs a better filter, not a
+// better threshold.
+std::pair<bool, size_t> avx128_needle_hammer(const char* t, size_t n, const char* p, size_t m)
+    { return x86_needle_hammer_t<x86_ops128, 8192>(t, n, p, m); }
+std::pair<bool, size_t> avx128_needle_hammer64(const char* t, size_t n, const char* p, size_t m)
+    { return x86_needle_hammer_t<x86_ops128, 64>(t, n, p, m); }
+std::pair<bool, size_t> avx128_needle_hammer512(const char* t, size_t n, const char* p, size_t m)
+    { return x86_needle_hammer_t<x86_ops128, 512>(t, n, p, m); }
+std::pair<bool, size_t> avx128_needle_hammer8192(const char* t, size_t n, const char* p, size_t m)
+    { return x86_needle_hammer_t<x86_ops128, 8192>(t, n, p, m); }
