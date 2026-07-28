@@ -20,7 +20,10 @@ if(SIMDSEARCH_ARCH_FLAGS STREQUAL "")
         if(MSVC)
             set(SIMDSEARCH_ARCH_FLAGS "/arch:AVX512")
         else()
-            set(SIMDSEARCH_ARCH_FLAGS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq")
+            # -mavx2/-msse2 are implied by the AVX-512 subsets, but the 256-bit
+            # and 128-bit needle-hammer kernels depend on them directly, so name
+            # them rather than rely on the implication.
+            set(SIMDSEARCH_ARCH_FLAGS "-mavx512f;-mavx512bw;-mavx512vl;-mavx512dq;-mavx2;-msse2")
         endif()
     endif()
 endif()

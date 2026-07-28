@@ -21,6 +21,17 @@ std::pair<bool, size_t> strstr_search(const char* text, size_t n, const char* pa
     return {true, (size_t)(hit - text)};
 }
 
+// C library memmem (POSIX 2024; long-standing extension on glibc/BSD/macOS).
+// Unlike strstr it is length-delimited, so it needs no NUL terminator and is
+// safe on inputs containing NUL bytes.
+std::pair<bool, size_t> memmem_search(const char* text, size_t n, const char* pattern, size_t m) {
+    if (m == 0) return {true, 0};
+    if (n < m) return {false, 0};
+    const char* hit = (const char*)::memmem(text, n, pattern, m);
+    if (hit == nullptr) return {false, 0};
+    return {true, (size_t)(hit - text)};
+}
+
 // std::search with std::default_searcher (C++17). The searcher is rebuilt per
 // call to match the interface of the other functions here (which also do not
 // amortize per-pattern preprocessing across calls).

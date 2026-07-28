@@ -142,6 +142,32 @@ static const std::vector<Algo> kAlgos = {
     {"find_avx512", Kind::Stateless, avx512_naive_search},
     {"find_avx512_256", Kind::Stateless, avx512_naive_search256},
     {"find_avx512_stringzilla", Kind::Stateless, avx512_stringzilla_find},
+    // The needle-hammer scheme: 256-byte-stride naive kernel up to a needle-length
+    // threshold, StringZilla's anchored kernel above it.
+    {"find_avx512_needle_hammer", Kind::Stateless, avx512_needle_hammer},
+    {"find_avx512_needle_hammer16", Kind::Stateless, avx512_needle_hammer16},
+    {"find_avx512_needle_hammer32", Kind::Stateless, avx512_needle_hammer32},
+    {"find_avx512_needle_hammer64", Kind::Stateless, avx512_needle_hammer64},
+    {"find_avx512_needle_hammer128", Kind::Stateless, avx512_needle_hammer128},
+    {"find_avx512_needle_hammer256", Kind::Stateless, avx512_needle_hammer256},
+    {"find_avx512_stringzilla_256", Kind::Stateless, avx512_stringzilla256_find},
+    // The same needle-hammer scheme at 256-bit (AVX2) and 128-bit (SSE2)
+    // register width, each with its own three component kernels so the scheme
+    // can be read against its own parents at that width.
+    {"find_avx256", Kind::Stateless, avx256_naive_search},
+    {"find_avx256_128", Kind::Stateless, avx256_naive_search128},
+    {"find_avx256_stringzilla", Kind::Stateless, avx256_stringzilla_find},
+    {"find_avx256_needle_hammer", Kind::Stateless, avx256_needle_hammer},
+    {"find_avx256_needle_hammer64", Kind::Stateless, avx256_needle_hammer64},
+    {"find_avx256_needle_hammer512", Kind::Stateless, avx256_needle_hammer512},
+    {"find_avx256_needle_hammer8192", Kind::Stateless, avx256_needle_hammer8192},
+    {"find_avx128", Kind::Stateless, avx128_naive_search},
+    {"find_avx128_64", Kind::Stateless, avx128_naive_search64},
+    {"find_avx128_stringzilla", Kind::Stateless, avx128_stringzilla_find},
+    {"find_avx128_needle_hammer", Kind::Stateless, avx128_needle_hammer},
+    {"find_avx128_needle_hammer64", Kind::Stateless, avx128_needle_hammer64},
+    {"find_avx128_needle_hammer512", Kind::Stateless, avx128_needle_hammer512},
+    {"find_avx128_needle_hammer8192", Kind::Stateless, avx128_needle_hammer8192},
 #elif defined(SIMDSEARCH_NEON)
     {"find_neon", Kind::Stateless, neon_naive_search},
     {"find_neon64", Kind::Stateless, neon_naive_search64},
@@ -156,6 +182,7 @@ static const std::vector<Algo> kAlgos = {
     {"find_twoway_amortized", Kind::AmortTwoWay, nullptr},
     {"find_twoway_bc_amortized", Kind::AmortTwoWayBC, nullptr},
     {"find_strstr", Kind::Stateless, strstr_search},
+    {"find_memmem", Kind::Stateless, memmem_search},
     {"find_std_default_searcher", Kind::Stateless, std_default_searcher},
     {"find_std_boyer_moore_searcher", Kind::Stateless, std_boyer_moore_searcher},
     {"find_std_boyer_moore_horspool_searcher", Kind::Stateless,
@@ -556,14 +583,27 @@ void ashvardanian_benchmark(const std::string &hay,
 //                                      still anchors on it, so StringZilla
 //                                      survives. (Kept to show that even a high
 //                                      byte does not hide from the selector.)
-//   ab   : alternating 'abab...' with the middle byte flipped into a 3-run.
-//                                      Paired with an 'abab...' haystack: every
-//                                      byte value ('a','b') is common, so NO
-//                                      anchor is selective. Each anchor matches
-//                                      ~half the positions, so the filter can
-//                                      no longer reject in bulk and StringZilla
-//                                      itself is forced into O(n*m). This is the
-//                                      shape that actually defeats StringZilla.
+//   ab   : alternating 'abab...' with the middle byte flipped into a 3-run,
+//                                      paired with an 'abab...' haystack. The
+//                                      intent was that both byte values are
+//                                      equally common, so no single anchor is
+//                                      selective — but it does not defeat
+//                                      StringZilla. With only two distinct
+//                                      values the anomaly selector cannot make
+//                                      three anchors distinct, so it walks
+//                                      'third' down until third == second + 1
+//                                      and settles on offsets 0, L/2, L/2+1.
+//                                      Those last two are ADJACENT and land on
+//                                      the 3-run, i.e. they read two equal
+//                                      neighbouring bytes — which never occurs
+//                                      in 'abab...'. So the pair rejects every
+//                                      position and the shape hands StringZilla
+//                                      exactly the 2-gram that distinguishes
+//                                      needle from haystack. Measured flat at
+//                                      ~3.5-4.1 us for L=8..4096 (64 KB
+//                                      haystack), second only to the anchored
+//                                      256-byte kernel. Use 'block' to defeat
+//                                      StringZilla.
 static std::string make_worstcase_needle(const std::string &shape, size_t L) {
   std::string nd(L, 'a');
   if (shape == "tail") nd[L - 1] = 'b';
@@ -606,8 +646,12 @@ static std::string make_worstcase_haystack(const std::string &shape, size_t n,
 // the odd byte sits, the all-'a' prefix forces prefix/first-byte filters (the
 // naive AVX-512 kernels, find_classic) and Boyer-Moore-Horspool (whose only
 // bad-character shift here is 1) into O(n*m) verification. StringZilla survives
-// every shape whose odd byte its anomaly selector can anchor on; the "high"
-// shape is the one that evades it. One full-haystack search is timed per cell.
+// every shape whose odd byte its anomaly selector can anchor on, which is every
+// shape that HAS one -- including "high", whose 0xFF byte the selector picks up
+// despite preferring bytes < 191. Only "block" defeats it: an all-'a' needle has
+// no odd byte, so all three anchors are 'a', the filter passes nearly everywhere
+// and each candidate is verified deep into the run. One full-haystack search is
+// timed per cell.
 void worstcase_benchmark(size_t haystack_size, const std::string &needle_shape,
                          const std::vector<size_t> &requested_lengths,
                          const std::vector<const Algo *> &algos) {
@@ -942,6 +986,7 @@ int main(int argc, char **argv) {
   std::print("\n  worstcase only:\n");
   std::print("    --size N          haystack size in bytes (default 65536)\n");
   std::print("    --needle shape    tail|aba|mid|high|ab|block (default tail); "
-             "'block' (all-'a' needle) defeats StringZilla too\n");
+             "'block' (all-'a' needle) is the only shape that defeats "
+             "StringZilla\n");
   return 1;
 }
