@@ -233,6 +233,133 @@ Width buys close to what you would expect on ordinary text — roughly 1.5× fro
 widens with needle length, because the anchored kernel that carries the long-needle
 end is precisely the one that degrades most as the register narrows.
 
+## Bounding the worst case: `find_avx512_needle_hammer_guarded`
+
+Needle-hammer is fast on real data and degrades to O(n*m) on inputs chosen to
+defeat its filter. The usual remedy is a needle-length rule, but needle length
+is only a proxy -- what decides is whether the filter's chosen bytes are
+selective *in this haystack*, and that is observable at run time.
+
+So each kernel counts the work a *failing* filter causes and hands the rest of
+the haystack to Crochemore-Perrin once that count exceeds a budget proportional
+to `n`. The wide kernel counts narrowing rounds past the four unrolled ones; the
+anchored kernel counts bytes examined by a verifying `memcmp`. Both are ~0 on
+ordinary text, so the budget is a bound on pathology rather than a throttle.
+Two-way resumes at the give-up point, not at zero -- the kernel has already
+proved there is no match below it.
+
+`find_avx512_needle_hammer_guarded` ships the same 128-byte switch point as the
+unguarded scheme, with a budget of `n/8` narrowing rounds and `16n` verification
+bytes; `_tight` (`n/32`) and `_loose` (`n/2`) exist so the constant can be
+measured rather than asserted.
+
+Needles of at most 36 bytes skip the guard entirely: the narrowing loop runs at
+most `m-4` times per 256-byte block, so `(n/256)(m-4)` rounds already fits the
+budget whenever `m - 4 <= 256/8`. That bound is a compile-time constant, which is
+why short needles -- the ones real workloads use -- pay nothing at all.
+
+Benign cost, Xeon Gold 6548N / GCC 14.3 over `data/43-0.txt`:
+
+```
+ns per search                8       16       32       64      128      512     2048
+find_avx512_needle_hammer      1887     2653     2617     2605     2480     2251     2279
+..._guarded                    1892     2647     2620     2607     2481     2249     2277
+find-all throughput: 11.07 GB/s unguarded, 10.94 GB/s guarded (-1.2%)
+```
+
+Worst case at the shipped 128-byte threshold (16 KB haystack, ns per search):
+
+```
+needle length                 32       64      128      512     2048
+block  unguarded            3707    46917    54292    87714   205853
+block  guarded              3709    16213    11624     9415    13783
+tail   unguarded            3709      501      577     1024     2608
+tail   guarded              3711      501      578     1026     2618
+two-way (amortized, worst
+  of the three shapes)     13110    13091    13036    12500    11314
+```
+
+The guard is free on `tail`, where the anchored kernel already copes, and buys a
+15x bound on `block`, where it does not. Taking each searcher's worst shape at
+each length, the guarded scheme stays within about 1.25x of two-way everywhere,
+which the unguarded scheme does not do at any threshold. Residual growth in `m`
+is two-way's own O(m) preprocessing under a stateless API, not the guard:
+non-amortized `find_twoway` grows the same way on its own.
+
+### One body, one instantiation
+
+`avx512_stringzilla_body` is shared by `avx512_stringzilla_find` (which passes an
+unreachable budget) and `avx512_stringzilla_guarded`. That is not tidiness. An
+earlier version kept two copies, and a later one templated the body on whether
+the counter was compiled in; both produced two machine-code bodies, and GCC
+generated markedly better code for the guarded one -- 2251 ns against 3621 ns at
+`m = 2048` for identical work, with budgets set so that neither could bail.
+
+Collapsing to a single instantiation makes guarded and unguarded comparable by
+construction, and incidentally hands the anchored kernel the faster code path:
+`find_avx512_stringzilla` went from 3624 ns to 2223 ns at `m = 2048`.
+
+**That fix moved the switch point, and the default is now 128 rather than 512.**
+With the anchored kernel no longer paying the penalty it becomes the cheaper
+parent from about `m = 24`:
+
+```
+ns per search              16       24       32       40       64       96      256      512
+find_avx512_256          2615     2592     2620     2657     2697     2739     3015     3445
+find_avx512_stringzilla  2611     2552     2606     2611     2577     2307     2367     2241
+```
+
+The two parents are within 1% of each other over a wide band, so the exact value
+matters little on benign data -- the benign optimum is around 8.
+
+**But 8 is not what ships, and the reason is the next section.** At 512-bit the
+switch point does more than pick the faster kernel: it decides which of the two
+an adversary is allowed to attack. 128 is the largest needle length at which the
+wide kernel is still ahead of two-way under its own worst case, so putting the
+threshold there gives away nothing exploitable, at a cost of up to ~25% on benign
+text at intermediate lengths. Measured, a 16-byte threshold would drop the
+adversarial crossover from ~126 bytes to ~28.
+
+### The switch point trades benign speed against robustness
+
+Lowering it hands more needle lengths to the anchored kernel, and the
+all-common-byte `block` adversary defeats exactly that kernel. The two criteria
+therefore disagree, and neither threshold is right for both. Worst case over the
+three adversaries, 16 KB haystack, ns per search:
+
+```
+m                            32      64     128     512    2048
+threshold 128 (shipped)    3707    6989   13177   55444  172580
+threshold 16               3707   46917   54292   87714  205853
+guarded, threshold 128     3707   10327   14370    8486   13386
+two-way (amortized)       13318   13296   13432   13204   11622
+```
+
+On benign data a low threshold is right; on adversarial data a high one is; and
+no threshold is right at large `m`, where both parents collapse. The guarded
+searcher is what actually resolves this -- it bounds both kernels instead of
+hoping the threshold avoids them, and it stays within about 1.25x of two-way's
+own worst case at every length while keeping the benign optimum. **If the
+worst-case behaviour matters at all, prefer
+`find_avx512_needle_hammer_guarded` over tuning the threshold.**
+
+## Capping the needle count: `--needles`
+
+`ashvardanian` mode scans the whole haystack once per needle and repeats each
+timed pass at least ten times, so a cell costs `needles * n * repeats`. At 256 MB
+that is ~2.5 TB of scanning per cell -- minutes for the vector kernels, hours for
+the classical ones -- which is what kept the haystack sweep inside the last-level
+cache.
+
+```
+./build/benchmark ashvardanian data/43-0.txt --needles 50
+```
+
+Lower caps make large haystacks tractable, but they change the *workload* as well
+as its cost: the cap keeps the first N word tokens, which are shorter and commoner
+than the tail of the list. Compare across algorithms at one setting, never across
+settings.
+
 ## Glob pattern-matching benchmark
 
 `glob_benchmark` compares glob ("stringmatchlen") matchers: the recursive Redis

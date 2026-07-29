@@ -369,13 +369,71 @@ std::pair<bool, size_t> avx512_naive_search256(const char* text, size_t n, const
 // single masked loop covers the body, the tail, and haystacks shorter than one
 // 64-byte window with no scalar fallback (masked-off lanes are never touched,
 // so the loads stay in bounds at the end of the haystack).
-std::pair<bool, size_t> avx512_stringzilla_find(const char* haystack, size_t h_len,
-                                                const char* needle, size_t n_len)
-{
-    if (n_len == 0) return {true, 0};
-    if (h_len < n_len) return {false, 0};
+// Result of a kernel that may abandon its scan. `resume` is the first position
+// not yet ruled out, so the fallback searcher need not rescan the prefix.
+struct avx512_guarded_result {
+    bool found;
+    size_t index;
+    bool gave_up;    // budget exhausted; caller must fall back
+    size_t resume;   // first position not yet ruled out, when gave_up
+};
 
-    // Single-byte needle: one masked broadcast compare per 64-byte window.
+// Vectorised equality, porting StringZilla's sz_equal_skylake. Used to confirm a
+// surviving candidate when the needle is too long to sit in one register.
+// Deliberately not std::memcmp: the library call costs about ten cycles of
+// call and setup per candidate, and on an input where the filter stops
+// discriminating that fixed cost is paid once per haystack position.
+static inline bool sz_equal_avx512(const char* a, const char* b, size_t length) {
+    while (length >= 64) {
+        if (_mm512_cmpneq_epi8_mask(_mm512_loadu_si512((const void*)a),
+                                    _mm512_loadu_si512((const void*)b)) != 0)
+            return false;
+        a += 64; b += 64; length -= 64;
+    }
+    if (length) {
+        const __mmask64 m = (length >= 64) ? ~(__mmask64)0
+                                           : (((__mmask64)1 << length) - 1);
+        return _mm512_mask_cmpneq_epi8_mask(m, _mm512_maskz_loadu_epi8(m, a),
+                                            _mm512_maskz_loadu_epi8(m, b)) == 0;
+    }
+    return true;
+}
+
+// The anchored kernel, once, with a verification budget in bytes. Both entry
+// points below call this same function, so they run the same instructions and
+// differ only in the budget they pass -- which is what makes the guarded and
+// unguarded searchers comparable.
+//
+// The budget is not a template parameter, and deliberately so. An earlier
+// version templated the body on whether the counter was compiled in; that
+// produced two machine-code bodies and GCC generated markedly better code for
+// the guarded one. With budgets set so that neither could bail, the guarded
+// instantiation measured 2251 ns against 3621 ns for identical work at
+// m = 2048. One body removes the discrepancy instead of explaining it.
+//
+// Unguarded callers pass SIZE_MAX. The counter cannot reach it: doing so would
+// need ~2^64 bytes of verification, which no reachable input supplies.
+//
+// Verification follows StringZilla's three length-specialised paths, which an
+// earlier version of this port collapsed into a single std::memcmp call. That
+// collapse was expensive exactly where it is least affordable: on an input that
+// defeats the filter, every haystack position becomes a candidate, so the
+// per-candidate constant is multiplied by n. The three paths are
+//
+//   m <= 3   no verification at all. The anchors are 0, m/2 and m-1, which for
+//            m <= 3 covers every byte of the needle, so a surviving mask bit is
+//            already a confirmed match.
+//   m < 64   the whole needle is preloaded into one register once, outside the
+//            loop; each candidate costs a masked load and a masked compare.
+//   m >= 64  sz_equal_avx512, 64 bytes per iteration.
+static inline avx512_guarded_result avx512_stringzilla_body(
+    const char* haystack, size_t h_len, const char* needle, size_t n_len,
+    size_t budget_bytes) {
+    if (n_len == 0) return {true, 0, false, 0};
+    if (h_len < n_len) return {false, 0, false, 0};
+
+    // Single-byte needle: one masked broadcast compare per 64-byte window. It
+    // verifies nothing, so it cannot exhaust a budget and needs no guard.
     if (n_len == 1) {
         __m512i n_vec = _mm512_set1_epi8((char)needle[0]);
         for (size_t i = 0; i < h_len; i += 64) {
@@ -384,9 +442,9 @@ std::pair<bool, size_t> avx512_stringzilla_find(const char* haystack, size_t h_l
                                             : (((__mmask64)1 << cand) - 1);
             __mmask64 eq = _mm512_mask_cmpeq_epi8_mask(
                 active, _mm512_maskz_loadu_epi8(active, haystack + i), n_vec);
-            if (eq != 0) return {true, i + (size_t)__builtin_ctzll(eq)};
+            if (eq != 0) return {true, i + (size_t)__builtin_ctzll(eq), false, 0};
         }
-        return {false, 0};
+        return {false, 0, false, 0};
     }
 
     size_t off_first, off_mid, off_last;
@@ -395,9 +453,19 @@ std::pair<bool, size_t> avx512_stringzilla_find(const char* haystack, size_t h_l
     __m512i mid = _mm512_set1_epi8((char)needle[off_mid]);
     __m512i last = _mm512_set1_epi8((char)needle[off_last]);
 
+    // Needles that fit in one register are loaded once, here, not per candidate.
+    const bool anchors_cover_needle = (n_len <= 3);
+    const bool needle_fits_register = (n_len < 64);
+    const __mmask64 needle_mask =
+        needle_fits_register ? (((__mmask64)1 << n_len) - 1) : (__mmask64)0;
+    const __m512i needle_vec =
+        needle_fits_register ? _mm512_maskz_loadu_epi8(needle_mask, needle)
+                             : _mm512_setzero_si512();
+
     // Each iteration handles up to 64 candidate start positions [i, i+63].
     // active masks to the candidates that actually exist; off_last <= n_len-1,
     // so the masked-off lanes are exactly the ones that would read past h_len.
+    size_t verified = 0;
     for (size_t i = 0; i + n_len <= h_len; i += 64) {
         size_t cand = h_len - n_len + 1 - i;  // candidate positions remaining
         __mmask64 active = (cand >= 64) ? ~(__mmask64)0
@@ -408,15 +476,43 @@ std::pair<bool, size_t> avx512_stringzilla_find(const char* haystack, size_t h_l
             mask, _mm512_maskz_loadu_epi8(mask, haystack + i + off_mid), mid);
         mask = _mm512_mask_cmpeq_epi8_mask(
             mask, _mm512_maskz_loadu_epi8(mask, haystack + i + off_last), last);
+
+        // The anchors already tested every byte; no verification to do.
+        if (anchors_cover_needle) {
+            if (mask != 0)
+                return {true, i + (size_t)__builtin_ctzll(mask), false, 0};
+            continue;
+        }
+
         while (mask != 0) {
             size_t b = (size_t)__builtin_ctzll(mask);
-            if (std::memcmp(haystack + i + b, needle, n_len) == 0)
-                return {true, i + b};
+            verified += n_len;
+            if (verified > budget_bytes) return {false, 0, true, i};
+            bool equal;
+            if (needle_fits_register) {
+                equal = _mm512_mask_cmpneq_epi8_mask(
+                            needle_mask,
+                            _mm512_maskz_loadu_epi8(needle_mask, haystack + i + b),
+                            needle_vec) == 0;
+            } else {
+                equal = sz_equal_avx512(haystack + i + b, needle, n_len);
+            }
+            if (equal) return {true, i + b, false, 0};
             mask &= mask - 1;  // clear the lowest set bit and continue
         }
     }
 
-    return {false, 0};
+    return {false, 0, false, 0};
+}
+
+// The kernel as the algorithm table sees it: the shared body with a budget it
+// can never exhaust, so this is the original algorithm with no guard behaviour.
+std::pair<bool, size_t> avx512_stringzilla_find(const char* haystack, size_t h_len,
+                                                const char* needle, size_t n_len)
+{
+    auto r = avx512_stringzilla_body(haystack, h_len, needle, n_len,
+                                     ~(size_t)0);  // unreachable budget
+    return {r.found, r.index};
 }
 
 
@@ -457,10 +553,21 @@ static inline std::pair<bool, size_t> avx512_needle_hammer_t(const char* text, s
     return avx512_naive_search256(text, n, pattern, m);
 }
 
-// The scheme itself, switching at 512 bytes of needle.
+// The scheme itself, switching at 128 bytes of needle.
+//
+// This was 512 while the anchored kernel was paying a 1.6x code-generation
+// penalty (see avx512_stringzilla_body). With that removed the anchored kernel
+// is the cheaper parent from about m = 24, so the crossover moved in by more
+// than an order of magnitude and the old threshold gave up 53% at m = 512.
+//
+// Note that the switch point trades benign speed against adversarial
+// robustness, and the two disagree: a lower threshold hands more lengths to the
+// anchored kernel, which the all-common-byte adversary defeats. 32 is the
+// benign optimum. For a worst-case bound use avx512_needle_hammer_guarded,
+// which bounds both kernels rather than hoping the threshold avoids them.
 std::pair<bool, size_t> avx512_needle_hammer(const char* text, size_t n,
                                             const char* pattern, size_t m) {
-    return avx512_needle_hammer_t<512>(text, n, pattern, m);
+    return avx512_needle_hammer_t<128>(text, n, pattern, m);
 }
 
 // Same scheme at other switch points, so the crossover can be located
@@ -475,6 +582,220 @@ std::pair<bool, size_t> avx512_needle_hammer128(const char* t, size_t n, const c
     { return avx512_needle_hammer_t<128>(t, n, p, m); }
 std::pair<bool, size_t> avx512_needle_hammer256(const char* t, size_t n, const char* p, size_t m)
     { return avx512_needle_hammer_t<256>(t, n, p, m); }
+// 512 was the default before the anchored kernel's code-generation penalty was
+// removed; kept so the sweep still brackets the old choice.
+std::pair<bool, size_t> avx512_needle_hammer512(const char* t, size_t n, const char* p, size_t m)
+    { return avx512_needle_hammer_t<512>(t, n, p, m); }
+
+// ===========================================================================
+// Work-counter guarded needle-hammer
+// ===========================================================================
+//
+// Needle-hammer is fast on real data and degrades to O(n*m) on inputs chosen to
+// defeat its filter. The classical answer -- pair the filter with a linear-time
+// searcher -- is usually stated as a needle-length rule, but needle length is
+// only a proxy: it is the *selectivity of the filter on this haystack* that
+// decides, and that is observable at run time. So observe it.
+//
+// Each kernel below counts the work its verification path actually does and
+// abandons the scan for twoway_bc_search once that count exceeds a budget
+// proportional to n. Because the budget is proportional to n and two-way is
+// linear, the guarded searcher is O(n) on every input, including the ones that
+// drive the unguarded kernels quadratic -- while on benign text the counter
+// never approaches the budget and the fast path is untouched.
+//
+// Choosing the unit matters more than choosing the constant. We count only work
+// that a *failing* filter causes, not the fixed cost of filtering:
+//
+//   wide kernel      one "narrowing round" = one broadcast plus four masked
+//                    compares over a 256-byte block, counted only for rounds
+//                    past the four unrolled ones. On ordinary text the mask is
+//                    empty by round four and this loop does not execute at all,
+//                    so the benign count is ~0 rather than merely small.
+//
+//   anchored kernel  bytes examined by a verifying memcmp (m per surviving
+//                    candidate). On ordinary text three anchors admit almost no
+//                    candidates, so again ~0.
+//
+// The budgets are set from the instruction model of the paper. Two-way retires
+// about 14 instructions per haystack byte; a narrowing round is about 13
+// instructions per 256 bytes covered. Allowing n rounds therefore spends roughly
+// as many instructions as two-way would, so a guarded search that gives up costs
+// about twice two-way and never less than two-way's guarantee -- and, crucially,
+// a needle short enough that the unguarded kernel would still beat two-way
+// (m <~ 216 bytes by that model) cannot exhaust the budget in the first place,
+// because it cannot execute more than m-4 rounds per block. The guard therefore
+// does not fire in the regime where firing would be a mistake.
+//
+// The anchored budget is 16n bytes of verification, which costs well under one
+// instruction per haystack byte (memcmp is vectorised) and so is nearly free
+// relative to the two-way run that follows it.
+
+// Wide-stride kernel with a bounded narrowing loop. Only the m >= 4 path is
+// instrumented: for m < 4 the narrowing loop cannot run more than twice per
+// block, so its total work is bounded by 2n/256 rounds and no guard is needed.
+static inline avx512_guarded_result avx512_naive_search256_guarded(
+    const char* text, size_t n, const char* pattern, size_t m,
+    size_t budget_rounds) {
+    if (m == 0) return {true, 0, false, 0};
+    if (n < m) return {false, 0, false, 0};
+    if (m < 4 || n < m + 255) {
+        auto [f, idx] = avx512_naive_search256(text, n, pattern, m);
+        return {f, idx, false, 0};
+    }
+
+    size_t rounds = 0;
+    size_t i = 0;
+    for (; i + m + 255 <= n; i += 256) {
+        __m512i p0 = _mm512_set1_epi8((char)pattern[0]);
+        __mmask64 fA = _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(text + i +   0)), p0);
+        __mmask64 fB = _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(text + i +  64)), p0);
+        __mmask64 fC = _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(text + i + 128)), p0);
+        __mmask64 fD = _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(text + i + 192)), p0);
+
+        __m512i p1 = _mm512_set1_epi8((char)pattern[1]);
+        fA = _mm512_mask_cmpeq_epi8_mask(fA, _mm512_loadu_si512((const void*)(text + i +   1)), p1);
+        fB = _mm512_mask_cmpeq_epi8_mask(fB, _mm512_loadu_si512((const void*)(text + i +  65)), p1);
+        fC = _mm512_mask_cmpeq_epi8_mask(fC, _mm512_loadu_si512((const void*)(text + i + 129)), p1);
+        fD = _mm512_mask_cmpeq_epi8_mask(fD, _mm512_loadu_si512((const void*)(text + i + 193)), p1);
+
+        __m512i p2 = _mm512_set1_epi8((char)pattern[2]);
+        fA = _mm512_mask_cmpeq_epi8_mask(fA, _mm512_loadu_si512((const void*)(text + i +   2)), p2);
+        fB = _mm512_mask_cmpeq_epi8_mask(fB, _mm512_loadu_si512((const void*)(text + i +  66)), p2);
+        fC = _mm512_mask_cmpeq_epi8_mask(fC, _mm512_loadu_si512((const void*)(text + i + 130)), p2);
+        fD = _mm512_mask_cmpeq_epi8_mask(fD, _mm512_loadu_si512((const void*)(text + i + 194)), p2);
+
+        __m512i p3 = _mm512_set1_epi8((char)pattern[3]);
+        fA = _mm512_mask_cmpeq_epi8_mask(fA, _mm512_loadu_si512((const void*)(text + i +   3)), p3);
+        fB = _mm512_mask_cmpeq_epi8_mask(fB, _mm512_loadu_si512((const void*)(text + i +  67)), p3);
+        fC = _mm512_mask_cmpeq_epi8_mask(fC, _mm512_loadu_si512((const void*)(text + i + 131)), p3);
+        fD = _mm512_mask_cmpeq_epi8_mask(fD, _mm512_loadu_si512((const void*)(text + i + 195)), p3);
+
+        // The only unbounded loop in this kernel, and so the only one counted.
+        // The budget is tested once per 256-byte block rather than once per
+        // round: keeping the inner loop byte-identical to the unguarded kernel
+        // is what makes the benign overhead vanish (testing per round cost 8% on
+        // the find-all workload). Overshoot is at most m-4 rounds, negligible
+        // against a budget of n/8.
+        size_t j = 4;
+        for (; j < m; ++j) {
+            if ((fA | fB | fC | fD) == 0) break;
+            __m512i pj = _mm512_set1_epi8((char)pattern[j]);
+            fA = _mm512_mask_cmpeq_epi8_mask(fA, _mm512_loadu_si512((const void*)(text + i + j +   0)), pj);
+            fB = _mm512_mask_cmpeq_epi8_mask(fB, _mm512_loadu_si512((const void*)(text + i + j +  64)), pj);
+            fC = _mm512_mask_cmpeq_epi8_mask(fC, _mm512_loadu_si512((const void*)(text + i + j + 128)), pj);
+            fD = _mm512_mask_cmpeq_epi8_mask(fD, _mm512_loadu_si512((const void*)(text + i + j + 192)), pj);
+        }
+        rounds += j - 4;
+        if (rounds > budget_rounds) return {false, 0, true, i};
+
+        if ((fA | fB | fC | fD) == 0) continue;
+        if (fA != 0) return {true, i +   0 + (size_t)__builtin_ctzll(fA), false, 0};
+        if (fB != 0) return {true, i +  64 + (size_t)__builtin_ctzll(fB), false, 0};
+        if (fC != 0) return {true, i + 128 + (size_t)__builtin_ctzll(fC), false, 0};
+        return {true, i + 192 + (size_t)__builtin_ctzll(fD), false, 0};
+    }
+
+    for (; i + m <= n; ++i) {
+        if (std::memcmp(text + i, pattern, m) == 0) return {true, i, false, 0};
+    }
+    return {false, 0, false, 0};
+}
+
+// Anchored kernel with a bounded verification budget, counted in bytes examined
+// by memcmp. Same body as the unguarded kernel above, with the counter compiled
+// in, so any difference between the two is the guard and nothing else.
+static inline avx512_guarded_result avx512_stringzilla_guarded(
+    const char* text, size_t n, const char* pattern, size_t m,
+    size_t budget_bytes) {
+    return avx512_stringzilla_body(text, n, pattern, m, budget_bytes);
+}
+
+// Hand the rest of the haystack to Crochemore-Perrin. The kernel has already
+// proved there is no occurrence starting below `from`, so two-way only has to
+// cover the remainder -- the abandoned prefix is not rescanned. Plain two-way
+// rather than the bad-character variant: on the low-diversity haystacks that
+// trip the guard the skip table buys nothing and measures ~4x slower.
+static inline std::pair<bool, size_t> resume_twoway(const char* text, size_t n,
+                                                    const char* pattern, size_t m,
+                                                    size_t from) {
+    if (from + m > n) return {false, 0};
+    auto [f, idx] = twoway_search(text + from, n - from, pattern, m);
+    if (!f) return {false, 0};
+    return {true, from + idx};
+}
+
+// The guarded scheme. BudgetNum/BudgetDen scales both budgets against n so the
+// constant can be measured rather than asserted:
+//   wide kernel      budget = n * BudgetNum / BudgetDen narrowing rounds
+//   anchored kernel  budget = 16 * that, in bytes of verification
+// The shipped setting is n/8 rounds, measured so that a search that gives up
+// costs about twice two-way rather than several times it.
+template <size_t Threshold, size_t BudgetNum = 1, size_t BudgetDen = 1>
+static inline std::pair<bool, size_t> avx512_needle_hammer_guarded_t(
+    const char* text, size_t n, const char* pattern, size_t m) {
+    constexpr size_t kMinWide = 2048;
+    // Needles this short cannot exhaust the budget however hostile the input:
+    // the narrowing loop runs at most m-4 times per 256-byte block, i.e. about
+    // (n/256)(m-4) rounds, which stays under n/BudgetDen exactly when
+    // m - 4 <= 256/BudgetDen. Below that bound the guard is not merely cheap,
+    // it is absent -- the call goes straight to the unguarded kernel.
+    constexpr size_t kFreeBelow = 4 + (256 * BudgetNum) / BudgetDen;
+
+    if (m > Threshold) {
+        // The anchored budget must scale with the needle as well as the
+        // haystack. Benign verification work is (candidates surviving three
+        // anchors) x m, and on a long needle drawn from ordinary text the
+        // anchors are common letters, so a flat byte budget trips on perfectly
+        // benign input -- measured as a 43% regression at m = 8192 before this
+        // term was added. Allow whichever is larger: 16 bytes per haystack byte,
+        // or 128 full verifications.
+        // Budget the verification in bytes against the HAYSTACK, not the
+        // needle. An earlier version used max(2n, 128m); the 128m floor was
+        // there to stop benign long-needle searches tripping, but it made the
+        // worst case grow linearly in m (38 us at m = 8192 rather than 13 us at
+        // m = 2048). Scaling with n alone fixes both ends: 16n is far above the
+        // benign verification load even for an 8 KB needle drawn from ordinary
+        // text, and it caps adversarial verification independently of m. At
+        // roughly one instruction per 32 bytes compared, 16n bytes is about n/2
+        // instructions -- negligible beside the two-way run it precedes.
+        const size_t anchored_budget = 16 * n;
+        auto r = avx512_stringzilla_guarded(text, n, pattern, m, anchored_budget);
+        if (!r.gave_up) return {r.found, r.index};
+        return resume_twoway(text, n, pattern, m, r.resume);
+    }
+    // Small haystacks take the 64-byte kernel, which needs no guard: it is
+    // entered only when n < kMinWide or n < m + 255, and in both cases the
+    // number of window positions is O(m) rather than O(n), so its total work is
+    // already bounded independently of the haystack length.
+    if (n < kMinWide || n < m + 255) {
+        return avx512_naive_search(text, n, pattern, m);
+    }
+    // The free case: one comparison against a compile-time constant, then the
+    // unguarded kernel. This is the branch the short needles of real workloads
+    // take, which is why the guard costs them nothing measurable.
+    if (m <= kFreeBelow) return avx512_naive_search256(text, n, pattern, m);
+
+    const size_t budget = (n / BudgetDen) * BudgetNum + 1;
+    auto r = avx512_naive_search256_guarded(text, n, pattern, m, budget);
+    if (!r.gave_up) return {r.found, r.index};
+    return resume_twoway(text, n, pattern, m, r.resume);
+}
+
+// The recommended configuration: the same 128-byte switch point as
+// avx512_needle_hammer, with a budget of n/8 narrowing rounds.
+std::pair<bool, size_t> avx512_needle_hammer_guarded(const char* t, size_t n,
+                                                    const char* p, size_t m)
+    { return avx512_needle_hammer_guarded_t<128, 1, 8>(t, n, p, m); }
+
+// Tighter and looser budgets, so the cost of the guard and the sharpness of the
+// bound can both be measured instead of assumed.
+std::pair<bool, size_t> avx512_needle_hammer_guarded_tight(const char* t, size_t n,
+                                                           const char* p, size_t m)
+    { return avx512_needle_hammer_guarded_t<128, 1, 32>(t, n, p, m); }
+std::pair<bool, size_t> avx512_needle_hammer_guarded_loose(const char* t, size_t n,
+                                                           const char* p, size_t m)
+    { return avx512_needle_hammer_guarded_t<128, 1, 2>(t, n, p, m); }
 
 
 // A second way to combine the two ideas, for reference: keep StringZilla's
@@ -740,6 +1061,24 @@ static inline std::pair<bool, size_t> x86_naive_search_wide_t(const char* text, 
 // a candidate must match at all three before a memcmp verifies it in full. The
 // filter is three compares per window regardless of the needle length, which is
 // what makes it the better half of the scheme for long needles.
+// Vectorised equality at width W, the narrow-ISA counterpart of
+// sz_equal_avx512. Used when the needle is too long to sit in one register.
+template <class Ops>
+static inline bool x86_equal_t(const char* a, const char* b, size_t length) {
+    constexpr size_t W = Ops::kWidth;
+    // (1u << 32) is undefined, so spell the all-lanes mask per width.
+    constexpr uint32_t kAll = (W >= 32) ? 0xFFFFFFFFu : ((1u << W) - 1);
+    while (length >= W) {
+        if (Ops::eq_mask(Ops::load(a), Ops::load(b)) != kAll) return false;
+        a += W; b += W; length -= W;
+    }
+    while (length) {
+        if (*a != *b) return false;
+        ++a; ++b; --length;
+    }
+    return true;
+}
+
 template <class Ops>
 static inline std::pair<bool, size_t> x86_stringzilla_find_t(const char* text, size_t n,
                                                              const char* pattern, size_t m) {
@@ -767,6 +1106,30 @@ static inline std::pair<bool, size_t> x86_stringzilla_find_t(const char* text, s
     const typename Ops::vec_t mid = Ops::broadcast(pattern[off_mid]);
     const typename Ops::vec_t last = Ops::broadcast(pattern[off_last]);
 
+    // Verification follows the same three paths as the AVX-512 kernel, for the
+    // same reason: a per-candidate std::memcmp call costs about ten cycles, and
+    // on an input that defeats the filter every haystack position becomes a
+    // candidate, so that constant is multiplied by n.
+    //
+    //   m <= 3   no verification -- the anchors 0, m/2, m-1 already cover every
+    //            byte of the needle, so a surviving bit is a confirmed match.
+    //   m <= W   the needle sits in one register, compared in a single step.
+    //   m > W    x86_equal_t, W bytes per iteration.
+    //
+    // The narrow ISAs have no byte-granular masked load, so the register-sized
+    // needle is staged through a zero-padded buffer once, here, rather than
+    // over-reading the needle on every candidate.
+    const bool anchors_cover_needle = (m <= 3);
+    const bool needle_fits_register = (m <= W);
+    alignas(32) char needle_buf[W] = {};
+    typename Ops::vec_t needle_vec = first;  // overwritten when used
+    uint32_t needle_bits = 0;
+    if (needle_fits_register && !anchors_cover_needle) {
+        std::memcpy(needle_buf, pattern, m);
+        needle_vec = Ops::load(needle_buf);
+        needle_bits = (m >= 32) ? 0xFFFFFFFFu : ((1u << m) - 1);
+    }
+
     size_t i = 0;
     // Each step covers candidate positions [i, i + W - 1]. The last anchor of
     // the last candidate reads text[i + W - 1 + off_last] and off_last <= m - 1,
@@ -777,15 +1140,33 @@ static inline std::pair<bool, size_t> x86_stringzilla_find_t(const char* text, s
         mask &= Ops::eq_mask(Ops::load(text + i + off_mid), mid);
         if (mask == 0) continue;
         mask &= Ops::eq_mask(Ops::load(text + i + off_last), last);
+
+        if (anchors_cover_needle) {
+            if (mask != 0) return {true, i + (size_t)__builtin_ctz(mask)};
+            continue;
+        }
+
+        // A full W-byte load at candidate i+b needs i + b + W <= n, and b can
+        // reach W-1. When m < W the loop bound above does not imply that, so
+        // check once per window rather than once per candidate; it only fails
+        // within the last register-width of the haystack.
+        const bool wide_load_safe = (i + 2 * W - 1 <= n);
         while (mask != 0) {
             size_t b = (size_t)__builtin_ctz(mask);
-            if (std::memcmp(text + i + b, pattern, m) == 0) return {true, i + b};
+            bool equal;
+            if (needle_fits_register && wide_load_safe) {
+                equal = (Ops::eq_mask(Ops::load(text + i + b), needle_vec)
+                         & needle_bits) == needle_bits;
+            } else {
+                equal = x86_equal_t<Ops>(text + i + b, pattern, m);
+            }
+            if (equal) return {true, i + b};
             mask &= mask - 1;  // clear the lowest set bit and continue
         }
     }
 
     for (; i + m <= n; ++i) {
-        if (std::memcmp(text + i, pattern, m) == 0) return {true, i};
+        if (x86_equal_t<Ops>(text + i, pattern, m)) return {true, i};
     }
     return {false, 0};
 }
@@ -829,10 +1210,11 @@ std::pair<bool, size_t> avx256_naive_search128(const char* t, size_t n, const ch
     { return x86_naive_search_wide_t<x86_ops256>(t, n, p, m); }
 std::pair<bool, size_t> avx256_stringzilla_find(const char* t, size_t n, const char* p, size_t m)
     { return x86_stringzilla_find_t<x86_ops256>(t, n, p, m); }
-// Switching at 2048, not at AVX-512's 512: the threshold belongs to the width,
-// not to the scheme. See the note above the SSE2 export for the measurements.
+// Switching at 3072, not at AVX-512's 128: the threshold belongs to the width,
+// not to the scheme. See the note above the SSE2 export for the measurements
+// and for why the narrow widths are chosen on benign data alone.
 std::pair<bool, size_t> avx256_needle_hammer(const char* t, size_t n, const char* p, size_t m)
-    { return x86_needle_hammer_t<x86_ops256, 2048>(t, n, p, m); }
+    { return x86_needle_hammer_t<x86_ops256, 3072>(t, n, p, m); }
 // Other switch points, so the crossover stays measurable at this width too.
 std::pair<bool, size_t> avx256_needle_hammer64(const char* t, size_t n, const char* p, size_t m)
     { return x86_needle_hammer_t<x86_ops256, 64>(t, n, p, m); }
@@ -849,24 +1231,29 @@ std::pair<bool, size_t> avx128_naive_search64(const char* t, size_t n, const cha
 std::pair<bool, size_t> avx128_stringzilla_find(const char* t, size_t n, const char* p, size_t m)
     { return x86_stringzilla_find_t<x86_ops128>(t, n, p, m); }
 // Switching at 8192. The crossover moves out sharply as the register narrows --
-// 512 bytes at 512-bit, 2048 at 256-bit, ~8192 at 128-bit -- because the
-// anchored kernel's per-window overhead (three loads, three movemask
-// round-trips through a GPR, two early-out branches) is amortized over only W
-// candidate positions, so it grows as the width shrinks, while the naive wide
-// kernel pays no such fixed cost. horspool ns per search, this machine:
+// 128 bytes at 512-bit, ~3K at 256-bit, ~8K at 128-bit -- because the anchored
+// kernel filters only W candidate positions per window for a fixed three loads,
+// three movemask round-trips through a GPR and two early-out branches, so its
+// per-position overhead grows as the width shrinks while the naive wide kernel
+// pays no such fixed cost. Re-measured against the fixed anchored kernel
+// (horspool, ns per search, this machine):
 //
-//   width  kernel            512   1024   2048   4096   8192
-//   256b   naive wide       4657   5507   7201  10404  16902
-//   256b   anchored         9406   9137   9526   9375   9091   -> crosses ~2.5K
-//   128b   naive wide       6468   7149   8525  10957  15975
-//   128b   anchored        17185  16885  17635  17144  16841   -> crosses ~8K
+//   width  kernel           1536   2048   3072   4096   8192  12288
+//   256b   naive wide       6309   7015   8830  10294  16724      -
+//   256b   anchored         8843   8574   8912   8754   8375      -  -> ~3.2K
+//   128b   naive wide          -   8418      -  11007  16067  21024
+//   128b   anchored            -  16482      -  16411  16057  15448  -> ~8.2K
 //
-// Consequence worth stating: a later switch means the adversarial worstcase
-// shapes stay on the naive kernel for longer, so the O(n*m) collapse is not
-// cut off until the (now much higher) threshold. That is the same trade the
-// AVX-512 version already documents -- needle length is a proxy for anchor
-// selectivity, and fixing the adversarial case needs a better filter, not a
-// better threshold.
+// Unlike the AVX-512 kernel, these two thresholds are set by benign data alone,
+// and that is a conclusion rather than an oversight. At 512-bit the threshold
+// also decides the adversarial crossover, because the anchored kernel survives
+// two of the three adversaries and the switch point is what hands work to it.
+// Here it decides nothing: on the all-common-byte shape the narrow anchored
+// kernels are worse than their own wide parents at every length measured
+// (256-bit: 13149 vs 6696 ns at m = 32, 21004 vs 13141 at 64; 128-bit: 18344 vs
+// 10347 and 27341 vs 20634), so switching earlier makes the worst case worse as
+// well as the benign case. Nothing is traded away by putting these thresholds
+// where benign data wants them.
 std::pair<bool, size_t> avx128_needle_hammer(const char* t, size_t n, const char* p, size_t m)
     { return x86_needle_hammer_t<x86_ops128, 8192>(t, n, p, m); }
 std::pair<bool, size_t> avx128_needle_hammer64(const char* t, size_t n, const char* p, size_t m)
