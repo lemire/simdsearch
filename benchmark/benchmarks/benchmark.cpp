@@ -150,7 +150,14 @@ static const std::vector<Algo> kAlgos = {
     {"find_avx512_needle_hammer64", Kind::Stateless, avx512_needle_hammer64},
     {"find_avx512_needle_hammer128", Kind::Stateless, avx512_needle_hammer128},
     {"find_avx512_needle_hammer256", Kind::Stateless, avx512_needle_hammer256},
+    {"find_avx512_needle_hammer512", Kind::Stateless, avx512_needle_hammer512},
     {"find_avx512_stringzilla_256", Kind::Stateless, avx512_stringzilla256_find},
+    // The same scheme with a run-time work counter that abandons the filter for
+    // two-way once verification work exceeds a budget proportional to n, so the
+    // searcher is linear-time on every input rather than only on benign ones.
+    {"find_avx512_needle_hammer_guarded", Kind::Stateless, avx512_needle_hammer_guarded},
+    {"find_avx512_needle_hammer_guarded_tight", Kind::Stateless, avx512_needle_hammer_guarded_tight},
+    {"find_avx512_needle_hammer_guarded_loose", Kind::Stateless, avx512_needle_hammer_guarded_loose},
     // The same needle-hammer scheme at 256-bit (AVX2) and 128-bit (SSE2)
     // register width, each with its own three component kernels so the scheme
     // can be read against its own parents at that width.
@@ -507,8 +514,12 @@ void horspool_benchmark(const std::string &text, const std::string &source_desc,
 // scanned, crediting one full haystack length per needle (the StringWars
 // convention), plus ns per needle.
 void ashvardanian_benchmark(const std::string &hay,
-                            const std::vector<const Algo *> &algos) {
-  const size_t max_needles = 1000;  // keep one pass quick; StringWars cycles all
+                            const std::vector<const Algo *> &algos,
+                            size_t max_needles = 1000) {
+  // Each timed cell scans the whole haystack once per needle and repeats the
+  // pass at least ten times, so the cost is max_needles * n * repeats. On a
+  // large haystack that is the difference between a minute and an afternoon;
+  // --needles trades averaging breadth for tractability at scale.
   auto needles = tokenize_words(hay);
   if (needles.size() > max_needles) needles.resize(max_needles);
   if (needles.empty()) {
@@ -877,6 +888,7 @@ int main(int argc, char **argv) {
     std::vector<size_t> lengths;       // horspool / worstcase only
     std::vector<const Algo *> algos;   // all modes; empty => all
     size_t worstcase_size = 1u << 16;  // worstcase only: haystack bytes
+    size_t max_needles = 1000;         // ashvardanian only: needle cap
     std::string needle_shape = "tail"; // worstcase only: tail|aba|mid|high
 
     // Helper: value of an option given either as "--opt val" or "--opt=val".
@@ -907,6 +919,12 @@ int main(int argc, char **argv) {
           lengths.push_back(std::stoul(t));
       } else if (arg == "--size" || arg.rfind("--size=", 0) == 0) {
         worstcase_size = std::stoul(take_value(arg, k));
+      } else if (arg == "--needles" || arg.rfind("--needles=", 0) == 0) {
+        max_needles = std::stoul(take_value(arg, k));
+        if (max_needles == 0) {
+          std::cerr << "--needles must be at least 1\n";
+          return 1;
+        }
       } else if (arg == "--needle" || arg.rfind("--needle=", 0) == 0) {
         needle_shape = take_value(arg, k);
       } else if (arg.rfind("--", 0) == 0) {
@@ -945,7 +963,7 @@ int main(int argc, char **argv) {
                            algos);
       }
     } else if (mode == "ashvardanian") {
-      ashvardanian_benchmark(load_file(path), algos);
+      ashvardanian_benchmark(load_file(path), algos, max_needles);
     } else if (mode == "worstcase") {
       if (lengths.empty())
         for (size_t L : {4u, 8u, 16u, 32u, 64u, 128u, 256u, 512u})
@@ -983,6 +1001,12 @@ int main(int argc, char **argv) {
   std::print("\n  horspool / worstcase:\n");
   std::print("    --lengths a,b,c   pattern lengths to test "
              "(horspool default 2..20, worstcase 2..512)\n");
+  std::print("\n  ashvardanian only:\n");
+  std::print("    --needles N       cap on word-token needles "
+             "(default 1000). Each needle costs a full\n"
+             "                      haystack scan per repetition, so "
+             "lower it to keep large\n"
+             "                      haystacks affordable.\n");
   std::print("\n  worstcase only:\n");
   std::print("    --size N          haystack size in bytes (default 65536)\n");
   std::print("    --needle shape    tail|aba|mid|high|ab|block (default tail); "

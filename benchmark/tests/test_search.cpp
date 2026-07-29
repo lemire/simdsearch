@@ -83,6 +83,13 @@ int main() {
       {"avx512_needle_hammer64", avx512_needle_hammer64},
       {"avx512_needle_hammer128", avx512_needle_hammer128},
       {"avx512_needle_hammer256", avx512_needle_hammer256},
+      {"avx512_needle_hammer512", avx512_needle_hammer512},
+      // The guarded variants must agree with everyone else on every input,
+      // including the ones that make them abandon the filter for two-way --
+      // the fallback path is only correct if it returns the same index.
+      {"avx512_needle_hammer_guarded", avx512_needle_hammer_guarded},
+      {"avx512_needle_hammer_guarded_tight", avx512_needle_hammer_guarded_tight},
+      {"avx512_needle_hammer_guarded_loose", avx512_needle_hammer_guarded_loose},
       {"avx512_stringzilla256_find", avx512_stringzilla256_find},
       {"avx256_naive_search", avx256_naive_search},
       {"avx256_naive_search128", avx256_naive_search128},
@@ -127,7 +134,13 @@ int main() {
     // not-found, to exercise both the wide stride and the scalar tail.
     for (size_t tlen : {1u, 7u, 63u, 64u, 65u, 256u, 257u, 1000u}) {
       std::string t(tlen, 'b');
-      for (size_t mlen : {1u, 2u, 4u, 5u, 16u, 33u, 64u, 100u}) {
+      // 3 exercises the anchored kernel's no-verification path (anchors cover
+      // the whole needle only for m <= 3); 63/64/65 straddle the register-width
+      // boundary where it switches from one masked compare to sz_equal_avx512.
+      // 15/16/17 and 31/32/33 straddle the m <= W register-compare boundary at
+      // SSE2 and AVX2 width; 63/64/65 do the same for AVX-512.
+      for (size_t mlen : {1u, 2u, 3u, 4u, 5u, 15u, 16u, 17u, 31u, 32u, 33u,
+                          63u, 64u, 65u, 100u}) {
         if (mlen > tlen) continue;
         std::string found(mlen, 'b');
         std::string missing(mlen, 'b');
