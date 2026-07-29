@@ -553,21 +553,40 @@ static inline std::pair<bool, size_t> avx512_needle_hammer_t(const char* text, s
     return avx512_naive_search256(text, n, pattern, m);
 }
 
-// The scheme itself, switching at 128 bytes of needle.
+// The scheme itself, switching at 256 bytes of needle.
 //
-// This was 512 while the anchored kernel was paying a 1.6x code-generation
-// penalty (see avx512_stringzilla_body). With that removed the anchored kernel
-// is the cheaper parent from about m = 24, so the crossover moved in by more
-// than an order of magnitude and the old threshold gave up 53% at m = 512.
+// Chosen from all five benchmarked machines, not from one, because the two
+// criteria that bear on it disagree and they disagree differently per vendor.
 //
-// Note that the switch point trades benign speed against adversarial
-// robustness, and the two disagree: a lower threshold hands more lengths to the
-// anchored kernel, which the all-common-byte adversary defeats. 32 is the
-// benign optimum. For a worst-case bound use avx512_needle_hammer_guarded,
-// which bounds both kernels rather than hoping the threshold avoids them.
+// Robustness. The switch point can only protect the adversarial crossover while
+// it sits BELOW the wide kernel's own crossover with two-way, W*. Measured,
+// W* is 130/132/135 bytes on Emerald/Granite/Sapphire Rapids but only 82/87 on
+// Zen 5/Zen 4 -- so on AMD any threshold above ~87 is irrelevant to the worst
+// case, and on Intel the role saturates at 135. Above that floor the choice is
+// purely a benign one.
+//
+// Benign. The parent kernels cross at 9-13 bytes on the Intel parts and at
+// 854-2300 on the AMD parts: the anchored kernel is far weaker relative to the
+// wide one on Zen. So Intel wants a small threshold and AMD a large one, and no
+// single constant is optimal for both.
+//
+// Geometric mean over the length sweep across all five machines, as a regret
+// against the best switch point for each machine:
+//
+//   T          16     32     64    128    256    512
+//   worst    1.82x  1.60x  1.40x  1.23x  1.10x  1.10x
+//
+// 256 is the smallest value that clears the robustness floor and ties for the
+// best worst-case regret. An earlier version shipped 128 on the mistaken
+// premise that a lower threshold buys robustness everywhere; it does not buy any
+// on AMD, where it cost up to 2.7x at m = 192 for nothing.
+//
+// For a genuine worst-case bound use avx512_needle_hammer_guarded, which bounds
+// both kernels rather than hoping the threshold avoids them -- and which, being
+// bounded by construction, could take the benign optimum instead.
 std::pair<bool, size_t> avx512_needle_hammer(const char* text, size_t n,
                                             const char* pattern, size_t m) {
-    return avx512_needle_hammer_t<128>(text, n, pattern, m);
+    return avx512_needle_hammer_t<256>(text, n, pattern, m);
 }
 
 // Same scheme at other switch points, so the crossover can be located
@@ -782,20 +801,20 @@ static inline std::pair<bool, size_t> avx512_needle_hammer_guarded_t(
     return resume_twoway(text, n, pattern, m, r.resume);
 }
 
-// The recommended configuration: the same 128-byte switch point as
+// The recommended configuration: the same 256-byte switch point as
 // avx512_needle_hammer, with a budget of n/8 narrowing rounds.
 std::pair<bool, size_t> avx512_needle_hammer_guarded(const char* t, size_t n,
                                                     const char* p, size_t m)
-    { return avx512_needle_hammer_guarded_t<128, 1, 8>(t, n, p, m); }
+    { return avx512_needle_hammer_guarded_t<256, 1, 8>(t, n, p, m); }
 
 // Tighter and looser budgets, so the cost of the guard and the sharpness of the
 // bound can both be measured instead of assumed.
 std::pair<bool, size_t> avx512_needle_hammer_guarded_tight(const char* t, size_t n,
                                                            const char* p, size_t m)
-    { return avx512_needle_hammer_guarded_t<128, 1, 32>(t, n, p, m); }
+    { return avx512_needle_hammer_guarded_t<256, 1, 32>(t, n, p, m); }
 std::pair<bool, size_t> avx512_needle_hammer_guarded_loose(const char* t, size_t n,
                                                            const char* p, size_t m)
-    { return avx512_needle_hammer_guarded_t<128, 1, 2>(t, n, p, m); }
+    { return avx512_needle_hammer_guarded_t<256, 1, 2>(t, n, p, m); }
 
 
 // A second way to combine the two ideas, for reference: keep StringZilla's
