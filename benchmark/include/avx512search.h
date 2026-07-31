@@ -364,8 +364,8 @@ std::pair<bool, size_t> avx512_naive_search256(const char* text, size_t n, const
 // interface). Faithful port of StringZilla's sz_find_skylake. Three needle
 // bytes (first/middle/last, chosen by sz_locate_needle_anomalies) are
 // broadcast and compared against the haystack; ANDing the three masks leaves
-// only candidates that match at all three anchors, which a memcmp then
-// verifies in full. Every load is a predicated _mm512_maskz_loadu_epi8, so a
+// only candidates that match at all three anchors, which a specialised compare
+// then verifies in full (three paths by needle length; see below). Every load is a predicated _mm512_maskz_loadu_epi8, so a
 // single masked loop covers the body, the tail, and haystacks shorter than one
 // 64-byte window with no scalar fallback (masked-off lanes are never touched,
 // so the loads stay in bounds at the end of the haystack).
@@ -526,7 +526,7 @@ std::pair<bool, size_t> avx512_stringzilla_find(const char* haystack, size_t h_l
 // here, because each pattern-byte broadcast is amortized over four 64-byte
 // chunks. avx512_stringzilla_find is O(1) filter rounds per window no matter
 // how long the needle is -- three anchors, chosen away from repeats -- but pays
-// a per-window setup and a memcmp per surviving candidate, which the naive
+// a per-window setup and a verifying compare per surviving candidate, which the naive
 // kernel's mask narrowing avoids on short needles.
 //
 // So: cheap-and-length-sensitive below the threshold, length-insensitive above.
@@ -632,7 +632,7 @@ std::pair<bool, size_t> avx512_needle_hammer512(const char* t, size_t n, const c
 //                    empty by round four and this loop does not execute at all,
 //                    so the benign count is ~0 rather than merely small.
 //
-//   anchored kernel  bytes examined by a verifying memcmp (m per surviving
+//   anchored kernel  bytes examined by its verifying compare (m per surviving
 //                    candidate). On ordinary text three anchors admit almost no
 //                    candidates, so again ~0.
 //
@@ -647,7 +647,7 @@ std::pair<bool, size_t> avx512_needle_hammer512(const char* t, size_t n, const c
 // does not fire in the regime where firing would be a mistake.
 //
 // The anchored budget is 16n bytes of verification, which costs well under one
-// instruction per haystack byte (memcmp is vectorised) and so is nearly free
+// instruction per haystack byte (the compare is vectorised) and so is nearly free
 // relative to the two-way run that follows it.
 
 // Wide-stride kernel with a bounded narrowing loop. Only the m >= 4 path is
@@ -1077,7 +1077,8 @@ static inline std::pair<bool, size_t> x86_naive_search_wide_t(const char* text, 
 // StringZilla's three-anchor filter at width W: the width-generic form of
 // avx512_stringzilla_find. Three needle offsets chosen by
 // sz_locate_needle_anomalies are broadcast and compared against the haystack;
-// a candidate must match at all three before a memcmp verifies it in full. The
+// a candidate must match at all three before a specialised compare verifies it
+// in full. The
 // filter is three compares per window regardless of the needle length, which is
 // what makes it the better half of the scheme for long needles.
 // Vectorised equality at width W, the narrow-ISA counterpart of

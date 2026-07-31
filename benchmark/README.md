@@ -101,8 +101,8 @@ find_bmh                      0.833 GB/s
 
 ## Needle-hammer: wide-stride below a needle-length threshold, anchored above
 
-`find_avx512_needle_hammer` runs `avx512_naive_search256` for needles up to 512 bytes
-and `avx512_stringzilla_find` above that. The two kernels fail in opposite
+`find_avx512_needle_hammer` runs `avx512_naive_search256` for needles up to 256
+bytes and `avx512_stringzilla_find` above that. The two kernels fail in opposite
 directions, and the threshold picks whichever failure is cheaper:
 
 - the naive 256-byte kernel filters on the needle's **first four bytes** and
@@ -111,32 +111,51 @@ directions, and the threshold picks whichever failure is cheaper:
   (ordinary text) it is the fastest kernel here, because each pattern-byte
   broadcast is amortized over four 64-byte chunks;
 - the StringZilla kernel filters on **three anomaly-chosen anchors**, a fixed
-  three compares per window regardless of needle length, then verifies survivors
-  with `memcmp`.
+  three compares per window regardless of needle length, then verifies each
+  survivor. Verification is specialised, never a library call: no check at all
+  for `m <= 3` (the anchors already covered every byte), one masked register
+  compare against the preloaded needle for `m < 64`, and `sz_equal_avx512` above
+  that. An earlier version of this port used a single `std::memcmp` instead,
+  which cost up to 2.4x on adversarial input; see the paper's Appendix B.
 
-`find_avx512_needle_hammer16/32/64/128/256` are the same scheme at other switch points,
-so the crossover can be measured instead of assumed.
+`find_avx512_needle_hammer16/32/64/128/256/512` are the same scheme at other
+switch points, so the crossover can be measured instead of assumed.
 
 On ordinary text (`horspool` mode over the 141 KB `data/43-0.txt`, ns per
-first-occurrence search, lower is better) needle-hammer tracks the lower envelope of
-its two parents at every length, and 512 is close to the true crossover — the
-parents cross between 512 and 640:
+first-occurrence search, lower is better) needle-hammer tracks the lower envelope
+of its two parents at every length:
 
 ```
-algo                           8     32    128    256    512    640   1024   2048   4096
-find_avx512                 2560   3491   3571   3578   3823   4089   4370   5190   7007
-find_avx512_256             1933   2670   2816   2970   3339   3679   4238   5814   9026
-find_avx512_stringzilla     3163   3991   3758   3600   3520   3645   3643   3581   3700
-find_avx512_needle_hammer   1935   2674   2823   2970   3336   3646   3649   3587   3701
-find_avx512_needle_hammer64 1939   2673   3762   3601   3518   3643   3641   3585   3698
-find_avx512_stringzilla_256 2231   2756   2741   2721   2668   2752   2773   2789   2826
-find_strstr                 4554   6012   6073   6007   5953   6363   6390   6636   7338
+algo                                      8     32    128    256    512   1024   2048   4096
+find_avx512_256                        1958   2725   2798   3012   3425   4204   5796   8999
+find_avx512_stringzilla                2034   2496   2428   2461   2464   2426   2350   2385
+find_avx512_needle_hammer              1960   2725   2794   3014   2468   2429   2352   2392
+find_avx512_needle_hammer_guarded      1959   2725   2804   3022   2470   2437   2355   2392
+find_strstr                            4600   6084   6028   6124   6092   6192   6720   7200
 ```
 
-Switching earlier is worse: `find_avx512_needle_hammer64` gives up 33% at length 128
-(3762 vs 2820) for no gain. In `ashvardanian` mode every needle is a short word,
-so the length switch never fires; needle-hammer leads anyway (11.20 vs 11.11 GB/s
-for `find_avx512_256`) on the strength of the short-haystack guard below.
+### Why 256 and not the benign optimum
+
+On this machine the two parents cross at about 9 bytes, so a benign-only choice
+would switch almost immediately. 256 is deliberately higher, for two reasons that
+only appear once you measure more than one machine and more than benign data:
+
+- **Robustness.** Below the switch point an adversary faces the wide kernel;
+  above it, the anchored one. The scheme's adversarial crossover with two-way is
+  therefore `min(threshold, m*_wide)`, where `m*_wide` is the wide kernel's own
+  crossover: 128/133/137 bytes on Emerald/Granite/Sapphire Rapids and 87/91 on
+  Zen 5/Zen 4. Any threshold at or above 137 extracts all the robustness
+  available; a lower one gives some away.
+- **Portability.** Above that floor the choice is purely benign, and the vendors
+  disagree by two orders of magnitude: the parents cross at 9-13 bytes on Intel
+  but at 830-2300 on AMD. Scoring each candidate by its worst-case regret against
+  the best choice per machine and length gives 1.82x at 16, 1.24x at 128, 1.10x
+  at 256 and 1.11x at 512. 256 is the smallest round value that clears the
+  robustness floor and ties for the best regret.
+
+The 128-bit and 256-bit hammers keep their own switch points (8192 and 3072),
+because the anchored kernel's fixed per-window cost is amortized over fewer
+candidate positions as the register narrows.
 
 Needle-hammer carries a **short-haystack guard** (`n < 2048` → the 64-byte
 `avx512_naive_search`). Without it the scheme lost 3× on small inputs: the
@@ -243,12 +262,12 @@ selective *in this haystack*, and that is observable at run time.
 So each kernel counts the work a *failing* filter causes and hands the rest of
 the haystack to Crochemore-Perrin once that count exceeds a budget proportional
 to `n`. The wide kernel counts narrowing rounds past the four unrolled ones; the
-anchored kernel counts bytes examined by a verifying `memcmp`. Both are ~0 on
+anchored kernel counts bytes examined by its verifying compare. Both are ~0 on
 ordinary text, so the budget is a bound on pathology rather than a throttle.
 Two-way resumes at the give-up point, not at zero -- the kernel has already
 proved there is no match below it.
 
-`find_avx512_needle_hammer_guarded` ships the same 128-byte switch point as the
+`find_avx512_needle_hammer_guarded` ships the same 256-byte switch point as the
 unguarded scheme, with a budget of `n/8` narrowing rounds and `16n` verification
 bytes; `_tight` (`n/32`) and `_loose` (`n/2`) exist so the constant can be
 measured rather than asserted.
@@ -267,16 +286,16 @@ find_avx512_needle_hammer      1887     2653     2617     2605     2480     2251
 find-all throughput: 11.07 GB/s unguarded, 10.94 GB/s guarded (-1.2%)
 ```
 
-Worst case at the shipped 128-byte threshold (16 KB haystack, ns per search):
+Worst case at the shipped 256-byte threshold (16 KB haystack, ns per search):
 
 ```
-needle length                 32       64      128      512     2048
-block  unguarded            3707    46917    54292    87714   205853
-block  guarded              3709    16213    11624     9415    13783
-tail   unguarded            3709      501      577     1024     2608
-tail   guarded              3711      501      578     1026     2618
+needle length                      32       64      128      512     2048
+block  unguarded                 3743     6988    13140    55421   172653
+block  guarded                   3741     6225     7665     8470    13368
+tail   unguarded                 3743     6952    13177     1031     2618
+tail   guarded                   3740    10330    14363     1032     2619
 two-way (amortized, worst
-  of the three shapes)     13110    13091    13036    12500    11314
+  of the three shapes)          13437    13284    13211    12940    11690
 ```
 
 The guard is free on `tail`, where the anchored kernel already copes, and buys a
