@@ -1,8 +1,6 @@
 # simdsearch
 
-Benchmarks and reference kernels for SIMD substring search, and the artifact for
-the paper *SIMD Substring Search Wins on Real Data and Survives Adversarial
-Inputs* (Lemire and Horspool).
+Benchmarks and reference kernels for SIMD substring search.
 
 ## What is here
 
@@ -37,10 +35,3 @@ kernel that filters on the needle's first four bytes and narrows a mask over a
 that exceeds a budget proportional to the haystack, which bounds the worst case
 without a needle-length argument. `benchmark/README.md` explains why the switch
 point is 256 rather than the benign optimum.
-
-## Paper and data
-
-The paper sources, the raw measurement files for all five machines, and the
-scripts that regenerate every figure and table live in
-[lemire/simdstringsearch](https://github.com/lemire/simdstringsearch). The
-measurements in that paper were taken at commit `5eb624f` of this repository.

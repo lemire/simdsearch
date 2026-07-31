@@ -116,7 +116,7 @@ directions, and the threshold picks whichever failure is cheaper:
   for `m <= 3` (the anchors already covered every byte), one masked register
   compare against the preloaded needle for `m < 64`, and `sz_equal_avx512` above
   that. An earlier version of this port used a single `std::memcmp` instead,
-  which cost up to 2.4x on adversarial input; see the paper's Appendix B.
+  which cost up to 2.4x on adversarial input.
 
 `find_avx512_needle_hammer16/32/64/128/256/512` are the same scheme at other
 switch points, so the crossover can be measured instead of assumed.

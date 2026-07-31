@@ -636,7 +636,7 @@ std::pair<bool, size_t> avx512_needle_hammer512(const char* t, size_t n, const c
 //                    candidate). On ordinary text three anchors admit almost no
 //                    candidates, so again ~0.
 //
-// The budgets are set from the instruction model of the paper. Two-way retires
+// The budgets are set from an instruction model. Two-way retires
 // about 14 instructions per haystack byte; a narrowing round is about 13
 // instructions per 256 bytes covered. Allowing n rounds therefore spends roughly
 // as many instructions as two-way would, so a guarded search that gives up costs
