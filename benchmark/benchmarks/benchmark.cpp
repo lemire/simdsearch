@@ -142,6 +142,10 @@ static const std::vector<Algo> kAlgos = {
     {"find_avx512", Kind::Stateless, avx512_naive_search},
     {"find_avx512_256", Kind::Stateless, avx512_naive_search256},
     {"find_avx512_stringzilla", Kind::Stateless, avx512_stringzilla_find},
+    // Same kernel, upstream's UTF-8 lead-byte anchor rule enabled. Off by
+    // default in the kernel; carried here so its cost can be measured.
+    {"find_avx512_stringzilla_hifilter", Kind::Stateless,
+     avx512_stringzilla_find_hifilter},
     // The needle-hammer scheme: 256-byte-stride naive kernel up to a needle-length
     // threshold, StringZilla's anchored kernel above it.
     {"find_avx512_needle_hammer", Kind::Stateless, avx512_needle_hammer},

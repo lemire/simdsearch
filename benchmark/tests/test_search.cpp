@@ -77,6 +77,10 @@ int main() {
       {"avx512_naive_search", avx512_naive_search},
       {"avx512_naive_search256", avx512_naive_search256},
       {"avx512_stringzilla_find", avx512_stringzilla_find},
+      // The same kernel with the optional UTF-8 lead-byte anchor rule on. It
+      // picks different anchors, so it exercises a different path through the
+      // selector and must be validated separately.
+      {"avx512_stringzilla_find_hifilter", avx512_stringzilla_find_hifilter},
       {"avx512_needle_hammer", avx512_needle_hammer},
       {"avx512_needle_hammer16", avx512_needle_hammer16},
       {"avx512_needle_hammer32", avx512_needle_hammer32},

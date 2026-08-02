@@ -426,6 +426,7 @@ static inline bool sz_equal_avx512(const char* a, const char* b, size_t length) 
 //   m < 64   the whole needle is preloaded into one register once, outside the
 //            loop; each candidate costs a masked load and a masked compare.
 //   m >= 64  sz_equal_avx512, 64 bytes per iteration.
+template <bool FilterHighBytes = false>
 static inline avx512_guarded_result avx512_stringzilla_body(
     const char* haystack, size_t h_len, const char* needle, size_t n_len,
     size_t budget_bytes) {
@@ -448,7 +449,8 @@ static inline avx512_guarded_result avx512_stringzilla_body(
     }
 
     size_t off_first, off_mid, off_last;
-    sz_locate_needle_anomalies(needle, n_len, off_first, off_mid, off_last);
+    sz_locate_needle_anomalies_t<FilterHighBytes>(needle, n_len, off_first,
+                                                  off_mid, off_last);
     __m512i first = _mm512_set1_epi8((char)needle[off_first]);
     __m512i mid = _mm512_set1_epi8((char)needle[off_mid]);
     __m512i last = _mm512_set1_epi8((char)needle[off_last]);
@@ -510,8 +512,21 @@ static inline avx512_guarded_result avx512_stringzilla_body(
 std::pair<bool, size_t> avx512_stringzilla_find(const char* haystack, size_t h_len,
                                                 const char* needle, size_t n_len)
 {
-    auto r = avx512_stringzilla_body(haystack, h_len, needle, n_len,
-                                     ~(size_t)0);  // unreachable budget
+    auto r = avx512_stringzilla_body<false>(haystack, h_len, needle, n_len,
+                                            ~(size_t)0);  // unreachable budget
+    return {r.found, r.index};
+}
+
+// The same kernel with upstream's UTF-8 lead-byte rule enabled, so the cost of
+// that choice can be measured rather than assumed. Not the default: see
+// sz_needle_anomalies.h.
+std::pair<bool, size_t> avx512_stringzilla_find_hifilter(const char* haystack,
+                                                         size_t h_len,
+                                                         const char* needle,
+                                                         size_t n_len)
+{
+    auto r = avx512_stringzilla_body<true>(haystack, h_len, needle, n_len,
+                                           ~(size_t)0);
     return {r.found, r.index};
 }
 
@@ -727,7 +742,7 @@ static inline avx512_guarded_result avx512_naive_search256_guarded(
 static inline avx512_guarded_result avx512_stringzilla_guarded(
     const char* text, size_t n, const char* pattern, size_t m,
     size_t budget_bytes) {
-    return avx512_stringzilla_body(text, n, pattern, m, budget_bytes);
+    return avx512_stringzilla_body<false>(text, n, pattern, m, budget_bytes);
 }
 
 // Hand the rest of the haystack to Crochemore-Perrin. The kernel has already
