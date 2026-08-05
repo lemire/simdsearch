@@ -75,7 +75,13 @@ int main() {
       {"twoway_bc_search", twoway_bc_search},
 #if defined(SIMDSEARCH_AVX512)
       {"avx512_naive_search", avx512_naive_search},
+      {"avx512_naive_search_blsr", avx512_naive_search_blsr},
+      {"avx512_naive_search_ovl", avx512_naive_search_ovl},
+      {"avx512_naive_search_v2", avx512_naive_search_v2},
+      {"avx512_naive_search_v3", avx512_naive_search_v3},
+      {"avx512_naive_search256_v3", avx512_naive_search256_v3},
       {"avx512_naive_search256", avx512_naive_search256},
+      {"avx512_naive_search256_opt", avx512_naive_search256_opt},
       {"avx512_stringzilla_find", avx512_stringzilla_find},
       // The same kernel with the optional UTF-8 lead-byte anchor rule on. It
       // picks different anchors, so it exercises a different path through the
