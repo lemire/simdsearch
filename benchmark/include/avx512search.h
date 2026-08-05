@@ -1014,7 +1014,7 @@ std::pair<bool, size_t> avx512_stringzilla_find_hifilter(const char* haystack,
 template <size_t Threshold>
 static inline std::pair<bool, size_t> avx512_needle_hammer_t(const char* text, size_t n,
                                                            const char* pattern, size_t m) {
-    constexpr size_t kMinWide = 2048;
+    constexpr size_t kMinWide = 1024;
     if (m > Threshold) return avx512_stringzilla_find(text, n, pattern, m);
     if (n < kMinWide || n < m + 255) return avx512_naive_search_v3_body(text, n, pattern, m);
     return avx512_naive_search256_v3_body(text, n, pattern, m);
@@ -1053,7 +1053,7 @@ static inline std::pair<bool, size_t> avx512_needle_hammer_t(const char* text, s
 // bounded by construction, could take the benign optimum instead.
 std::pair<bool, size_t> avx512_needle_hammer(const char* text, size_t n,
                                             const char* pattern, size_t m) {
-    return avx512_needle_hammer_t<256>(text, n, pattern, m);
+    return avx512_needle_hammer_t<512>(text, n, pattern, m);
 }
 
 // Same scheme at other switch points, so the crossover can be located
@@ -1220,7 +1220,7 @@ static inline std::pair<bool, size_t> resume_twoway(const char* text, size_t n,
 template <size_t Threshold, size_t BudgetNum = 1, size_t BudgetDen = 1>
 static inline std::pair<bool, size_t> avx512_needle_hammer_guarded_t(
     const char* text, size_t n, const char* pattern, size_t m) {
-    constexpr size_t kMinWide = 2048;
+    constexpr size_t kMinWide = 1024;
     // Needles this short cannot exhaust the budget however hostile the input:
     // the narrowing loop runs at most m-4 times per 256-byte block, i.e. about
     // (n/256)(m-4) rounds, which stays under n/BudgetDen exactly when
@@ -1272,16 +1272,16 @@ static inline std::pair<bool, size_t> avx512_needle_hammer_guarded_t(
 // avx512_needle_hammer, with a budget of n/8 narrowing rounds.
 std::pair<bool, size_t> avx512_needle_hammer_guarded(const char* t, size_t n,
                                                     const char* p, size_t m)
-    { return avx512_needle_hammer_guarded_t<256, 1, 8>(t, n, p, m); }
+    { return avx512_needle_hammer_guarded_t<512, 1, 8>(t, n, p, m); }
 
 // Tighter and looser budgets, so the cost of the guard and the sharpness of the
 // bound can both be measured instead of assumed.
 std::pair<bool, size_t> avx512_needle_hammer_guarded_tight(const char* t, size_t n,
                                                            const char* p, size_t m)
-    { return avx512_needle_hammer_guarded_t<256, 1, 32>(t, n, p, m); }
+    { return avx512_needle_hammer_guarded_t<512, 1, 32>(t, n, p, m); }
 std::pair<bool, size_t> avx512_needle_hammer_guarded_loose(const char* t, size_t n,
                                                            const char* p, size_t m)
-    { return avx512_needle_hammer_guarded_t<256, 1, 2>(t, n, p, m); }
+    { return avx512_needle_hammer_guarded_t<512, 1, 2>(t, n, p, m); }
 
 
 // A second way to combine the two ideas, for reference: keep StringZilla's
