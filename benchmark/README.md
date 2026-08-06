@@ -1,20 +1,16 @@
 # simdsearch benchmark
 
-SIMD substring search benchmarks. The SIMD backend is selected at compile time
-from the host architecture:
+SIMD substring search benchmarks for **AVX-512 capable processors**. The build
+requires AVX-512F and AVX-512BW; there is no other backend.
 
-- **x86-64 with AVX-512** (F + BW): `include/avx512search.h`
-  (`find_avx512`, `find_avx512_256`, `find_avx512_stringzilla`,
-  `find_avx512_needle_hammer`, `find_avx512_stringzilla_256`). The same header
-  also carries the 256-bit AVX2 (`find_avx256*`) and 128-bit SSE2
-  (`find_avx128*`) kernels, so one x86 build measures all three widths.
-- **ARM / AArch64 NEON**: `include/neonsearch.h`
-  (`find_neon`, `find_neon64`, `find_neon_stringzilla`)
-
-Both headers also provide the portable scalar/library searchers (`strstr`,
-`memmem`, `std::search` variants, Boyer–Moore–Horspool, and the linear-time
-searchers in `include/kmp_twoway.h`), so the table is identical across
-architectures apart from the SIMD rows.
+`include/avx512search.h` carries the kernels -- `find_avx512`,
+`find_avx512_256`, `find_avx512_stringzilla`, `find_avx512_needle_hammer`,
+`find_avx512_stringzilla_256` -- along with 256-bit AVX2 (`find_avx256*`) and
+128-bit SSE2 (`find_avx128*`) builds of the same kernels over a traits struct, so
+one binary measures all three register widths. It also provides the portable
+scalar and library searchers (`strstr`, `memmem`, `std::search` variants,
+Boyer-Moore-Horspool) alongside the linear-time searchers in
+`include/kmp_twoway.h`.
 
 `find_memmem` is the C library's length-delimited `memmem`. It is the closest
 library counterpart to the kernels here (no NUL terminator needed, so it is also

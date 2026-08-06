@@ -10,9 +10,8 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
-# Per-architecture SIMD flags. On x86-64 enable the AVX-512 subsets the
-# avx512search.h backend uses (F + BW for masked byte compares, plus VL/DQ).
-# On ARM, NEON is part of the AArch64 baseline so no extra flags are needed.
+# SIMD flags: the AVX-512 subsets avx512search.h uses (F + BW for masked byte
+# compares, plus VL/DQ). This project targets AVX-512 capable processors only.
 # Override with -DSIMDSEARCH_ARCH_FLAGS=... (e.g. "-march=native") if desired.
 set(SIMDSEARCH_ARCH_FLAGS "" CACHE STRING "Architecture SIMD flags")
 if(SIMDSEARCH_ARCH_FLAGS STREQUAL "")

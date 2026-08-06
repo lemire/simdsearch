@@ -16,15 +16,11 @@
 #include <utility>
 #include <vector>
 
-#if defined(__AVX512F__) && defined(__AVX512BW__)
-  #include "avx512search.h"
-  #define SIMDSEARCH_AVX512 1
-#elif defined(__aarch64__) || defined(__ARM_NEON)
-  #include "neonsearch.h"
-  #define SIMDSEARCH_NEON 1
-#else
-  #error "No supported SIMD backend (need AVX-512 BW or ARM NEON)"
+#if !defined(__AVX512F__) || !defined(__AVX512BW__)
+  #error "This project targets AVX-512 capable processors (AVX-512F + AVX-512BW)."
 #endif
+#include "avx512search.h"
+#define SIMDSEARCH_AVX512 1
 
 using search_fn = std::pair<bool, size_t> (*)(const char *, size_t,
                                               const char *, size_t);
@@ -108,10 +104,6 @@ int main() {
       {"avx128_needle_hammer", avx128_needle_hammer},
       {"avx128_needle_hammer64", avx128_needle_hammer64},
       {"avx128_needle_hammer512", avx128_needle_hammer512},
-#elif defined(SIMDSEARCH_NEON)
-      {"neon_naive_search", neon_naive_search},
-      {"neon_naive_search64", neon_naive_search64},
-      {"neon_stringzilla_find", neon_stringzilla_find},
 #endif
   };
 

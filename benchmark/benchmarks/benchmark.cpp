@@ -15,21 +15,14 @@
 #include "counters/bench.h"
 
 // Pick the SIMD backend for the host architecture. Each header is
-// self-contained (it also provides the portable scalar/library searchers), so
-// exactly one is included per build.
-#if defined(__AVX512F__) && defined(__AVX512BW__)
-  #include "avx512search.h"
-  #define SIMDSEARCH_AVX512 1
-  #define SIMD_NAIVE_SEARCH avx512_naive_search
-  #define SIMD_NAIVE_SEARCH_ALL avx512_naive_search_all
-#elif defined(__aarch64__) || defined(__ARM_NEON)
-  #include "neonsearch.h"
-  #define SIMDSEARCH_NEON 1
-  #define SIMD_NAIVE_SEARCH neon_naive_search
-  #define SIMD_NAIVE_SEARCH_ALL neon_naive_search_all
-#else
-  #error "No supported SIMD backend (need AVX-512 BW or ARM NEON)"
+// self-contained: it also provides the portable scalar and library searchers.
+#if !defined(__AVX512F__) || !defined(__AVX512BW__)
+  #error "This project targets AVX-512 capable processors (AVX-512F + AVX-512BW)."
 #endif
+#include "avx512search.h"
+#define SIMDSEARCH_AVX512 1
+#define SIMD_NAIVE_SEARCH avx512_naive_search
+#define SIMD_NAIVE_SEARCH_ALL avx512_naive_search_all
 
 double pretty_print(const std::string &name, size_t num_values,
                     counters::event_aggregate agg) {
@@ -182,10 +175,6 @@ static const std::vector<Algo> kAlgos = {
     {"find_avx128_needle_hammer64", Kind::Stateless, avx128_needle_hammer64},
     {"find_avx128_needle_hammer512", Kind::Stateless, avx128_needle_hammer512},
     {"find_avx128_needle_hammer8192", Kind::Stateless, avx128_needle_hammer8192},
-#elif defined(SIMDSEARCH_NEON)
-    {"find_neon", Kind::Stateless, neon_naive_search},
-    {"find_neon64", Kind::Stateless, neon_naive_search64},
-    {"find_neon_stringzilla", Kind::Stateless, neon_stringzilla_find},
 #endif
     {"find_bmh", Kind::Stateless, bmh_search},
     {"find_bmh16", Kind::Stateless, bmh_search16},
@@ -787,8 +776,7 @@ static std::string generate_small_alphabet_string(size_t size, size_t alphabet) 
 
 // Enumerate every (overlapping) occurrence by calling the first-match kernel in
 // a loop, advancing one byte past each match. This is the baseline: it pays the
-// kernel's per-call setup once per match found. Uses whichever naive kernel the
-// active backend provides (AVX-512 or NEON).
+// kernel's per-call setup once per match found.
 static size_t findall_loop_count(const char *t, size_t n, const char *p,
                                  size_t m) {
   size_t pos = 0, cnt = 0;
