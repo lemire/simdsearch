@@ -140,6 +140,8 @@ static const std::vector<Algo> kAlgos = {
     {"find_classic", Kind::Stateless, classic_find},
 #if defined(SIMDSEARCH_AVX512)
     {"find_avx512", Kind::Stateless, avx512_naive_search},
+    {"find_avx512_v3", Kind::Stateless, avx512_naive_search_v3},
+    {"find_avx512_256_v3", Kind::Stateless, avx512_naive_search256_v3},
     {"find_avx512_256", Kind::Stateless, avx512_naive_search256},
     {"find_avx512_stringzilla", Kind::Stateless, avx512_stringzilla_find},
     // Same kernel, upstream's UTF-8 lead-byte anchor rule enabled. Off by
@@ -950,7 +952,7 @@ int main(int argc, char **argv) {
                  mode);
 
     if (mode == "synthetic") {
-      collect_benchmark_results(1024, 100000, algos);
+      collect_benchmark_results(1024, max_needles ? max_needles : 100000, algos);
     } else if (mode == "horspool") {
       if (lengths.empty())
         for (size_t L = 2; L <= 20; ++L) lengths.push_back(L);

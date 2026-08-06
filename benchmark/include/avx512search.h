@@ -194,6 +194,158 @@ std::pair<bool, size_t> avx512_naive_search(const char* text, size_t n, const ch
     return {false, 0};
 }
 
+// The shipping form. Three ideas, each needed for a different reason:
+//
+//   independent compares  the four peeled compares no longer chain through one
+//                         mask register, so they issue in parallel (was ~50% of
+//                         profiled cycles as a serial dependency).
+//   single-survivor guard when exactly one lane survives -- the usual case at the
+//                         matching window -- verify it directly instead of
+//                         narrowing. When MANY survive, which is what an
+//                         adversary arranges, fall back to narrowing. Verifying
+//                         every survivor instead costs 64 checks per window and
+//                         is up to 10x worse on the adversarial shapes.
+//   inline verification   the needle is preloaded once for m <= 64, so a
+//                         candidate costs one masked compare rather than a call
+//                         into __memcmp_evex_movbe (12% of cycles).
+static inline __attribute__((always_inline)) std::pair<bool, size_t>
+avx512_naive_search_v3_body(const char* text, size_t n,
+                            const char* pattern, size_t m) {
+    if (m == 0) return {true, 0};
+    if (n < m) return {false, 0};
+    size_t i = 0;
+
+    const bool fits = (m <= 64);
+    const __mmask64 nmask = fits ? ((m == 64) ? ~(__mmask64)0
+                                              : (((__mmask64)1 << m) - 1))
+                                 : (__mmask64)0;
+    const __m512i nvec = fits ? _mm512_maskz_loadu_epi8(nmask, pattern)
+                              : _mm512_setzero_si512();
+
+    if (m >= 4) {
+        const __m512i p0 = _mm512_set1_epi8((char)pattern[0]);
+        const __m512i p1 = _mm512_set1_epi8((char)pattern[1]);
+        const __m512i p2 = _mm512_set1_epi8((char)pattern[2]);
+        const __m512i p3 = _mm512_set1_epi8((char)pattern[3]);
+        for (; i + m + 63 <= n; i += 64) {
+            const __mmask64 c0 = _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(text+i+0)), p0);
+            const __mmask64 c1 = _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(text+i+1)), p1);
+            const __mmask64 c2 = _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(text+i+2)), p2);
+            const __mmask64 c3 = _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(text+i+3)), p3);
+            __mmask64 f = (c0 & c1) & (c2 & c3);
+            if (f == 0) continue;
+            if ((f & (f - 1)) == 0) {                       // one survivor
+                const size_t b = (size_t)__builtin_ctzll(f);
+                if (fits) {
+                    if (_mm512_mask_cmpneq_epi8_mask(
+                            nmask, _mm512_maskz_loadu_epi8(nmask, text + i + b), nvec) == 0)
+                        return {true, i + b};
+                } else if (std::memcmp(text + i + b + 4, pattern + 4, m - 4) == 0) {
+                    return {true, i + b};
+                }
+                continue;
+            }
+            for (size_t k = 4; k < m && f != 0; ++k)        // many: narrow
+                f = _mm512_mask_cmpeq_epi8_mask(
+                        f, _mm512_loadu_si512((const void*)(text + i + k)),
+                        _mm512_set1_epi8((char)pattern[k]));
+            if (f != 0) return {true, i + (size_t)__builtin_ctzll(f)};
+        }
+    }
+    for (; i + m <= n; i += 64) {
+        const size_t cand = n - m - i + 1;
+        __mmask64 active = (cand >= 64) ? ~(__mmask64)0 : (((__mmask64)1 << cand) - 1);
+        __mmask64 f = active;
+        for (size_t k = 0; k < m && f != 0; ++k)
+            f = _mm512_mask_cmpeq_epi8_mask(
+                    f, _mm512_maskz_loadu_epi8(f, text + i + k),
+                    _mm512_set1_epi8((char)pattern[k]));
+        if (f != 0) return {true, i + (size_t)__builtin_ctzll(f)};
+    }
+    return {false, 0};
+}
+
+std::pair<bool, size_t> avx512_naive_search_v3(const char* text, size_t n,
+                                               const char* pattern, size_t m) {
+    return avx512_naive_search_v3_body(text, n, pattern, m);
+}
+
+// Wide-stride kernel, same three ideas as v3. The single-survivor guard is on the
+// WHOLE block, not per chunk: resolving chunks independently duplicates the
+// pattern broadcasts that the shared narrowing loop exists to amortise, which
+// measured 2.2x worse on the adversarial shapes.
+static inline __attribute__((always_inline)) std::pair<bool, size_t>
+avx512_naive_search256_v3_body(const char* text, size_t n,
+                               const char* pattern, size_t m) {
+    if (m == 0) return {true, 0};
+    if (n < m) return {false, 0};
+    size_t i = 0;
+
+    const bool fits = (m <= 64);
+    const __mmask64 nmask = fits ? ((m == 64) ? ~(__mmask64)0
+                                              : (((__mmask64)1 << m) - 1))
+                                 : (__mmask64)0;
+    const __m512i nvec = fits ? _mm512_maskz_loadu_epi8(nmask, pattern)
+                              : _mm512_setzero_si512();
+
+    if (m >= 4) {
+        const __m512i p0 = _mm512_set1_epi8((char)pattern[0]);
+        const __m512i p1 = _mm512_set1_epi8((char)pattern[1]);
+        const __m512i p2 = _mm512_set1_epi8((char)pattern[2]);
+        const __m512i p3 = _mm512_set1_epi8((char)pattern[3]);
+#define AVX512_CHUNK(OFF)                                                          \
+        ((_mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(text+i+(OFF)+0)), p0)   \
+        & _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(text+i+(OFF)+1)), p1))  \
+        & (_mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(text+i+(OFF)+2)), p2)  \
+        & _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(text+i+(OFF)+3)), p3)))
+        for (; i + m + 255 <= n; i += 256) {
+            __mmask64 fA = AVX512_CHUNK(0), fB = AVX512_CHUNK(64);
+            __mmask64 fC = AVX512_CHUNK(128), fD = AVX512_CHUNK(192);
+            if ((fA | fB | fC | fD) == 0) continue;
+
+            const int nz = (fA != 0) + (fB != 0) + (fC != 0) + (fD != 0);
+            const __mmask64 one = fA | fB | fC | fD;
+            if (nz == 1 && (one & (one - 1)) == 0) {          // one survivor in the block
+                const size_t off = (fA != 0) ? 0 : (fB != 0) ? 64 : (fC != 0) ? 128 : 192;
+                const size_t b = off + (size_t)__builtin_ctzll(one);
+                if (fits) {
+                    if (_mm512_mask_cmpneq_epi8_mask(
+                            nmask, _mm512_maskz_loadu_epi8(nmask, text + i + b), nvec) == 0)
+                        return {true, i + b};
+                } else if (std::memcmp(text + i + b + 4, pattern + 4, m - 4) == 0) {
+                    return {true, i + b};
+                }
+                continue;
+            }
+            for (size_t k = 4; k < m; ++k) {                  // many: shared narrowing
+                if ((fA | fB | fC | fD) == 0) break;
+                const __m512i pk = _mm512_set1_epi8((char)pattern[k]);
+                fA = _mm512_mask_cmpeq_epi8_mask(fA, _mm512_loadu_si512((const void*)(text+i+k+  0)), pk);
+                fB = _mm512_mask_cmpeq_epi8_mask(fB, _mm512_loadu_si512((const void*)(text+i+k+ 64)), pk);
+                fC = _mm512_mask_cmpeq_epi8_mask(fC, _mm512_loadu_si512((const void*)(text+i+k+128)), pk);
+                fD = _mm512_mask_cmpeq_epi8_mask(fD, _mm512_loadu_si512((const void*)(text+i+k+192)), pk);
+            }
+            if (fA) return {true, i +   0 + (size_t)__builtin_ctzll(fA)};
+            if (fB) return {true, i +  64 + (size_t)__builtin_ctzll(fB)};
+            if (fC) return {true, i + 128 + (size_t)__builtin_ctzll(fC)};
+            if (fD) return {true, i + 192 + (size_t)__builtin_ctzll(fD)};
+        }
+#undef AVX512_CHUNK
+    }
+    // Remainder: hand to the 64-byte kernel, which itself ends in a masked
+    // window, so no byte is left to a scalar loop.
+    if (i + m <= n) {
+        auto r = avx512_naive_search_v3_body(text + i, n - i, pattern, m);
+        if (r.first) return {true, i + r.second};
+    }
+    return {false, 0};
+}
+
+std::pair<bool, size_t> avx512_naive_search256_v3(const char* text, size_t n,
+                                                  const char* pattern, size_t m) {
+    return avx512_naive_search256_v3_body(text, n, pattern, m);
+}
+
 
 // Find-all variant of avx512_naive_search. Instead of returning at the first
 // match and discarding the rest of the mask, each 64-byte block builds the same
@@ -562,10 +714,10 @@ std::pair<bool, size_t> avx512_stringzilla_find_hifilter(const char* haystack,
 template <size_t Threshold>
 static inline std::pair<bool, size_t> avx512_needle_hammer_t(const char* text, size_t n,
                                                            const char* pattern, size_t m) {
-    constexpr size_t kMinWide = 2048;
+    constexpr size_t kMinWide = 1024;
     if (m > Threshold) return avx512_stringzilla_find(text, n, pattern, m);
-    if (n < kMinWide || n < m + 255) return avx512_naive_search(text, n, pattern, m);
-    return avx512_naive_search256(text, n, pattern, m);
+    if (n < kMinWide || n < m + 255) return avx512_naive_search_v3_body(text, n, pattern, m);
+    return avx512_naive_search256_v3_body(text, n, pattern, m);
 }
 
 // The scheme itself, switching at 256 bytes of needle.
@@ -601,7 +753,7 @@ static inline std::pair<bool, size_t> avx512_needle_hammer_t(const char* text, s
 // bounded by construction, could take the benign optimum instead.
 std::pair<bool, size_t> avx512_needle_hammer(const char* text, size_t n,
                                             const char* pattern, size_t m) {
-    return avx512_needle_hammer_t<256>(text, n, pattern, m);
+    return avx512_needle_hammer_t<512>(text, n, pattern, m);
 }
 
 // Same scheme at other switch points, so the crossover can be located
@@ -768,7 +920,7 @@ static inline std::pair<bool, size_t> resume_twoway(const char* text, size_t n,
 template <size_t Threshold, size_t BudgetNum = 1, size_t BudgetDen = 1>
 static inline std::pair<bool, size_t> avx512_needle_hammer_guarded_t(
     const char* text, size_t n, const char* pattern, size_t m) {
-    constexpr size_t kMinWide = 2048;
+    constexpr size_t kMinWide = 1024;
     // Needles this short cannot exhaust the budget however hostile the input:
     // the narrowing loop runs at most m-4 times per 256-byte block, i.e. about
     // (n/256)(m-4) rounds, which stays under n/BudgetDen exactly when
@@ -820,16 +972,16 @@ static inline std::pair<bool, size_t> avx512_needle_hammer_guarded_t(
 // avx512_needle_hammer, with a budget of n/8 narrowing rounds.
 std::pair<bool, size_t> avx512_needle_hammer_guarded(const char* t, size_t n,
                                                     const char* p, size_t m)
-    { return avx512_needle_hammer_guarded_t<256, 1, 8>(t, n, p, m); }
+    { return avx512_needle_hammer_guarded_t<512, 1, 8>(t, n, p, m); }
 
 // Tighter and looser budgets, so the cost of the guard and the sharpness of the
 // bound can both be measured instead of assumed.
 std::pair<bool, size_t> avx512_needle_hammer_guarded_tight(const char* t, size_t n,
                                                            const char* p, size_t m)
-    { return avx512_needle_hammer_guarded_t<256, 1, 32>(t, n, p, m); }
+    { return avx512_needle_hammer_guarded_t<512, 1, 32>(t, n, p, m); }
 std::pair<bool, size_t> avx512_needle_hammer_guarded_loose(const char* t, size_t n,
                                                            const char* p, size_t m)
-    { return avx512_needle_hammer_guarded_t<256, 1, 2>(t, n, p, m); }
+    { return avx512_needle_hammer_guarded_t<512, 1, 2>(t, n, p, m); }
 
 
 // A second way to combine the two ideas, for reference: keep StringZilla's
