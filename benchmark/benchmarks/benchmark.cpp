@@ -617,11 +617,9 @@ void ashvardanian_benchmark(const std::string &hay,
 //                                      in 'abab...'. So the pair rejects every
 //                                      position and the shape hands StringZilla
 //                                      exactly the 2-gram that distinguishes
-//                                      needle from haystack. Measured flat at
-//                                      ~3.5-4.1 us for L=8..4096 (64 KB
-//                                      haystack), second only to the anchored
-//                                      256-byte kernel. Use 'block' to defeat
-//                                      StringZilla.
+//                                      needle from haystack. It measures flat in
+//                                      L, so this shape does NOT defeat the
+//                                      anchored kernel. Use 'block' for that.
 static std::string make_worstcase_needle(const std::string &shape, size_t L) {
   std::string nd(L, 'a');
   if (shape == "tail") nd[L - 1] = 'b';

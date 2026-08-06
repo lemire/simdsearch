@@ -133,17 +133,18 @@ std::pair<bool, size_t> bmh_search16(const char* text, size_t n, const char* pat
 //
 //   independent compares  the four peeled compares do not chain through one
 //                         mask register, so they issue in parallel. Chaining
-//                         them costs ~50% of profiled cycles to the serial
-//                         dependency.
+//                         them spends a large share of profiled cycles on the
+//                         serial dependency.
 //   single-survivor guard when exactly one lane survives -- the usual case at the
 //                         matching window -- verify it directly instead of
 //                         narrowing. When MANY survive, which is what an
 //                         adversary arranges, fall back to narrowing. Verifying
-//                         every survivor instead costs 64 checks per window and
-//                         is up to 10x worse on the adversarial shapes.
+//                         every survivor instead costs one check per lane per
+//                         window and is far worse on the adversarial shapes.
 //   inline verification   the needle is preloaded once for m <= 64, so a
 //                         candidate costs one masked compare rather than a call
-//                         into __memcmp_evex_movbe (12% of cycles).
+//                         into __memcmp_evex_movbe, which profiles as a
+//                         significant share of the total.
 static inline __attribute__((always_inline)) std::pair<bool, size_t>
 avx512_naive_search_body(const char* text, size_t n,
                             const char* pattern, size_t m) {
@@ -208,8 +209,8 @@ std::pair<bool, size_t> avx512_naive_search(const char* text, size_t n,
 
 // Wide-stride kernel, same three ideas as v3. The single-survivor guard is on the
 // WHOLE block, not per chunk: resolving chunks independently duplicates the
-// pattern broadcasts that the shared narrowing loop exists to amortise, which
-// measured 2.2x worse on the adversarial shapes.
+// pattern broadcasts that the shared narrowing loop exists to amortise, and
+// measures worse on the adversarial shapes.
 static inline __attribute__((always_inline)) std::pair<bool, size_t>
 avx512_naive_search256_body(const char* text, size_t n,
                                const char* pattern, size_t m) {
@@ -400,8 +401,8 @@ static inline bool sz_equal_avx512(const char* a, const char* b, size_t length) 
 // The budget is not a template parameter, and deliberately so. Templating the
 // body on whether the counter is compiled in produces two machine-code bodies,
 // and GCC generates markedly better code for the guarded one: with budgets set
-// so that neither can bail, the guarded instantiation measures 2251 ns against
-// 3621 ns for identical work at m = 2048. One body removes that discrepancy
+// so that neither can bail, the guarded instantiation measures substantially
+// faster than the unguarded one for identical work. One body removes that
 // instead of leaving it to be explained.
 //
 // Unguarded callers pass SIZE_MAX. The counter cannot reach it: doing so would
@@ -548,8 +549,9 @@ std::pair<bool, size_t> avx512_stringzilla_find_hifilter(const char* haystack,
 // chunk has a hit. On a small haystack the match tends to arrive early relative
 // to 256 bytes, so that block granularity costs up to 4x the compare work for
 // nothing. Below kMinWide the 64-byte kernel is therefore the better lower half.
-// Measured on a 1 KB haystack (synthetic mode): 133-159 ns without the guard
-// versus 43-54 ns with it, matching find_avx512. A 8192-byte cutoff measures the
+// On a 1 KB haystack (synthetic mode) the guard is worth several times the
+// unguarded cost, bringing the scheme level with the single-window kernel it
+// dispatches to. A larger cutoff measures the
 // same, so take the smaller.
 //
 // The second condition is the narrower structural one: the wide loop only runs
@@ -589,12 +591,10 @@ static inline std::pair<bool, size_t> avx512_needle_hammer_t(const char* text, s
 // optimal for both. Geometric mean over the length sweep, as regret against the
 // best switch point for that machine and length, worst over the fleet:
 //
-//   T          16     32     64    128    256    512
-//   worst    1.86x  1.63x  1.44x  1.27x  1.13x  1.07x
-//
-// 512 clears the floor and minimises worst-case regret. The regret is
-// almost entirely one vendor's: the Intel parts sit within 6.5% at every
-// candidate, while Zen 5 pays 86% at T = 16 and nothing at 512.
+// 512 clears the floor and minimises worst-case regret. The regret is almost
+// entirely one vendor's: the Intel parts are near-indifferent across the whole
+// candidate range, while Zen pays heavily at the small thresholds and nothing at
+// 512. Re-derive with the thresholds mode rather than trusting this.
 //
 // For a genuine worst-case bound use avx512_needle_hammer_guarded, which bounds
 // both kernels rather than hoping the threshold avoids them -- and which, being
@@ -660,12 +660,13 @@ std::pair<bool, size_t> avx512_needle_hammer512(const char* t, size_t n, const c
 // exactly when m <= 36. That is the free path in the dispatcher, and it is the
 // only length range where the guard provably costs nothing. Above it the guard
 // can fire even where the unguarded kernel would have won: on the tail shape at
-// m = 64 it gives up and pays 41 us against the unguarded kernel's 26 us. It is
+// moderate needle lengths it gives up where the unguarded kernel would have
+// won, and pays the restart. It is
 // not free there. Note that 216 bytes, the instruction-model crossover with
 // two-way quoted above, does not bound this counter and says nothing about when
 // the guard fires. What the guard buys for
-// that 57% is the bound: the same cell reaches 207 us unguarded at m = 512 and
-// keeps climbing, while guarded it stops at 66 us, under two-way's 53 us doubled.
+// that is the bound: unguarded the same cell keeps climbing without limit,
+// while guarded it settles near two-way's own cost.
 //
 // The anchored budget is 16n bytes of verification, which costs well under one
 // instruction per haystack byte (the compare is vectorised) and so is nearly free
@@ -737,8 +738,8 @@ static inline avx512_guarded_result avx512_naive_search256_guarded(
         // The only unbounded loop in this kernel, and so the only one counted.
         // The budget is tested once per 256-byte block rather than once per
         // round: keeping the inner loop byte-identical to the unguarded kernel
-        // is what makes the benign overhead vanish (testing per round cost 8% on
-        // the find-all workload). Overshoot is at most m-4 rounds, negligible
+        // is what makes the benign overhead vanish; testing per round is
+        // measurably worse. Overshoot is at most m-4 rounds, negligible
         // against a budget of n/8.
         size_t j = 4;
         for (; j < m; ++j) {
@@ -786,7 +787,7 @@ static inline avx512_guarded_result avx512_stringzilla_guarded(
 // proved there is no occurrence starting below `from`, so two-way only has to
 // cover the remainder -- the abandoned prefix is not rescanned. Plain two-way
 // rather than the bad-character variant: on the low-diversity haystacks that
-// trip the guard the skip table buys nothing and measures ~4x slower.
+// trip the guard the skip table buys nothing and measures slower.
 static inline std::pair<bool, size_t> resume_twoway(const char* text, size_t n,
                                                     const char* pattern, size_t m,
                                                     size_t from) {
@@ -823,7 +824,7 @@ static inline std::pair<bool, size_t> avx512_needle_hammer_guarded_t(
         // Budget the verification in bytes against the HAYSTACK, not the
         // needle. A max(2n, 128m) form, with the 128m floor there to stop
         // benign long-needle searches tripping, makes the worst case grow
-        // linearly in m (38 us at m = 8192 against 13 us at m = 2048). Scaling
+        // linearly in m. Scaling
         // with n alone fixes both ends: 16n is far above the
         // benign verification load even for an 8 KB needle drawn from ordinary
         // text, and it caps adversarial verification independently of m. At
@@ -1273,7 +1274,7 @@ static inline std::pair<bool, size_t> x86_stringzilla_find_t(const char* text, s
 // It is an absolute byte count, not a multiple of the block size. Scaling it
 // per width (8 blocks: 2048 / 1024 / 512) was the obvious guess and it measured
 // wrong -- on the 1 KB haystack of `synthetic` the wide kernel loses at every
-// width (AVX2: 74 ns vs 49 ns for the single-window kernel; SSE2: 79 vs 65),
+// width, at both narrower widths,
 // so the cutoff has to sit above 1024 everywhere. The scaled rule put it at
 // 1024 and 512, i.e. exactly below the haystack, and both narrow hammers took
 // the wide path and lost. 2048 is the value measured for AVX-512 and it is the
@@ -1320,24 +1321,13 @@ std::pair<bool, size_t> avx128_stringzilla_find(const char* t, size_t n, const c
 // kernel filters only W candidate positions per window for a fixed three loads,
 // three movemask round-trips through a GPR and two early-out branches, so its
 // per-position overhead grows as the width shrinks while the naive wide kernel
-// pays no such fixed cost. Re-measured against the fixed anchored kernel
-// (horspool, ns per search, this machine):
-//
-//   width  kernel           1536   2048   3072   4096   8192  12288
-//   256b   naive wide       6309   7015   8830  10294  16724      -
-//   256b   anchored         8843   8574   8912   8754   8375      -  -> ~3.2K
-//   128b   naive wide          -   8418      -  11007  16067  21024
-//   128b   anchored            -  16482      -  16411  16057  15448  -> ~8.2K
-//
-// Unlike the AVX-512 kernel, these two thresholds are set by benign data alone,
+// pays no such fixed cost. Unlike the AVX-512 kernel, these two thresholds are set by benign data alone,
 // and that is a conclusion rather than an oversight. At 512-bit the threshold
 // also decides the adversarial crossover, because the anchored kernel survives
 // two of the three adversaries and the switch point is what hands work to it.
 // Here it decides nothing: on the all-common-byte shape the narrow anchored
-// kernels are worse than their own wide parents at every length measured
-// (256-bit: 13149 vs 6696 ns at m = 32, 21004 vs 13141 at 64; 128-bit: 18344 vs
-// 10347 and 27341 vs 20634), so switching earlier makes the worst case worse as
-// well as the benign case. Nothing is traded away by putting these thresholds
+// kernels are worse than their own wide parents at every length measured, so
+// switching earlier makes the worst case worse as well as the benign case. Nothing is traded away by putting these thresholds
 // where benign data wants them.
 std::pair<bool, size_t> avx128_needle_hammer(const char* t, size_t n, const char* p, size_t m)
     { return x86_needle_hammer_t<x86_ops128, 8192>(t, n, p, m); }
