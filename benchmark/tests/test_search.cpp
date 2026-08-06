@@ -47,11 +47,12 @@ static size_t g_failures = 0;
 static size_t g_checks = 0;
 
 // Compare one searcher against the reference for a single (text, pattern) pair.
-// m == 0 is skipped: the searchers disagree on the empty-needle convention and
-// the benchmark never passes an empty needle.
+// The empty needle is included: every searcher must agree with
+// string_view::find(""), which is {true, 0} for any haystack including an empty
+// one. It is the one convention every kernel has to special-case by hand, so it
+// is exactly the kind of thing that drifts.
 static void check(const NamedFn &nf, const std::string &text,
                   const std::string &pat) {
-  if (pat.empty()) return;
   auto [rf, ri] = reference(text.data(), text.size(), pat.data(), pat.size());
   auto [gf, gi] = nf.fn(text.data(), text.size(), pat.data(), pat.size());
   ++g_checks;
@@ -281,6 +282,61 @@ int main() {
       }
     }
   }
+
+  // ---- Empty needle, explicitly ------------------------------------------
+  for (const char *t : {"", "a", "abcabc"})
+    for (auto &fn : fns) check(fn, std::string(t), std::string());
+
+#if defined(SIMDSEARCH_AVX512)
+  // ---- Budget exhausted, then two-way finds the match --------------------
+  //
+  // The fuzz sweep above can only reach the give-up path by accident, and on
+  // inputs where the answer is "absent" -- so a guard that gave up and returned
+  // {false, 0} without resuming would still pass. This case is deterministic and
+  // the answer is a real match, so it fails if the resume is dropped, if it
+  // resumes at the wrong offset, or if the budget stops firing at all.
+  //
+  // Haystack is all 'a' with the needle appended, needle is a^(m-1) then 'b'.
+  // Every position survives the four-byte filter, so the wide kernel narrows
+  // m-4 rounds per 256-byte block: n(m-4)/256 rounds against a budget of n/8,
+  // which at m = 64 is 4x over. The single match sits at the very end, past the
+  // give-up point, and only the two-way resume can find it.
+  {
+    const size_t m = 64, prefix = 20000;
+    std::string needle(m - 1, 'a');
+    needle += 'b';
+    std::string hay(prefix, 'a');
+    hay += needle;
+
+    auto r = avx512_naive_search256_guarded(hay.data(), hay.size(),
+                                            needle.data(), m, hay.size() / 8 + 1);
+    ++g_checks;
+    if (!r.gave_up) {
+      std::printf("MISMATCH budget test: wide kernel did not exhaust its "
+                  "budget (found=%d index=%zu)\n", (int)r.found, r.index);
+      ++g_failures;
+    }
+    ++g_checks;
+    if (r.gave_up && r.resume > prefix) {
+      std::printf("MISMATCH budget test: resumed at %zu, past the match at "
+                  "%zu\n", r.resume, prefix);
+      ++g_failures;
+    }
+    // The scheme as a whole must still return the match.
+    for (const NamedFn &nf : {NamedFn{"avx512_needle_hammer_guarded",
+                                      avx512_needle_hammer_guarded},
+                              NamedFn{"avx512_needle_hammer",
+                                      avx512_needle_hammer}})
+      check(nf, hay, needle);
+
+    // Same shape with no match at all: the guard must report absence, not a
+    // spurious hit, after giving up.
+    std::string absent(prefix + m, 'a');
+    for (const NamedFn &nf : {NamedFn{"avx512_needle_hammer_guarded",
+                                      avx512_needle_hammer_guarded}})
+      check(nf, absent, needle);
+  }
+#endif
 
   std::printf("ran %zu checks, %zu failures\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;

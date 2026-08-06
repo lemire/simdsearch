@@ -197,9 +197,10 @@ std::pair<bool, size_t> avx512_naive_search(const char* text, size_t n, const ch
 
 // The shipping form. Three ideas, each needed for a different reason:
 //
-//   independent compares  the four peeled compares no longer chain through one
-//                         mask register, so they issue in parallel (was ~50% of
-//                         profiled cycles as a serial dependency).
+//   independent compares  the four peeled compares do not chain through one
+//                         mask register, so they issue in parallel. Chaining
+//                         them costs ~50% of profiled cycles to the serial
+//                         dependency.
 //   single-survivor guard when exactly one lane survives -- the usual case at the
 //                         matching window -- verify it directly instead of
 //                         narrowing. When MANY survive, which is what an
@@ -557,21 +558,21 @@ static inline bool sz_equal_avx512(const char* a, const char* b, size_t length) 
 // differ only in the budget they pass -- which is what makes the guarded and
 // unguarded searchers comparable.
 //
-// The budget is not a template parameter, and deliberately so. An earlier
-// version templated the body on whether the counter was compiled in; that
-// produced two machine-code bodies and GCC generated markedly better code for
-// the guarded one. With budgets set so that neither could bail, the guarded
-// instantiation measured 2251 ns against 3621 ns for identical work at
-// m = 2048. One body removes the discrepancy instead of explaining it.
+// The budget is not a template parameter, and deliberately so. Templating the
+// body on whether the counter is compiled in produces two machine-code bodies,
+// and GCC generates markedly better code for the guarded one: with budgets set
+// so that neither can bail, the guarded instantiation measures 2251 ns against
+// 3621 ns for identical work at m = 2048. One body removes that discrepancy
+// instead of leaving it to be explained.
 //
 // Unguarded callers pass SIZE_MAX. The counter cannot reach it: doing so would
 // need ~2^64 bytes of verification, which no reachable input supplies.
 //
-// Verification follows StringZilla's three length-specialised paths, which an
-// earlier version of this port collapsed into a single std::memcmp call. That
-// collapse was expensive exactly where it is least affordable: on an input that
-// defeats the filter, every haystack position becomes a candidate, so the
-// per-candidate constant is multiplied by n. The three paths are
+// Verification follows StringZilla's three length-specialised paths rather than
+// collapsing to a single std::memcmp call. The collapse is expensive exactly
+// where it is least affordable: on an input that defeats the filter, every
+// haystack position becomes a candidate, so the per-candidate constant is
+// multiplied by n. The three paths are
 //
 //   m <= 3   no verification at all. The anchors are 0, m/2 and m-1, which for
 //            m <= 3 covers every byte of the needle, so a surviving mask bit is
@@ -642,7 +643,6 @@ static inline avx512_guarded_result avx512_stringzilla_body(
         while (mask != 0) {
             size_t b = (size_t)__builtin_ctzll(mask);
             verified += n_len;
-            if (verified > budget_bytes) return {false, 0, true, i};
             bool equal;
             if (needle_fits_register) {
                 equal = _mm512_mask_cmpneq_epi8_mask(
@@ -653,6 +653,10 @@ static inline avx512_guarded_result avx512_stringzilla_body(
                 equal = sz_equal_avx512(haystack + i + b, needle, n_len);
             }
             if (equal) return {true, i + b, false, 0};
+            // Budget tested after the compare, for the same reason as the wide
+            // kernel: the candidate is already paid for, so a match is reported
+            // rather than thrown away. Overshoot is one verification.
+            if (verified > budget_bytes) return {false, 0, true, i};
             mask &= mask - 1;  // clear the lowest set bit and continue
         }
     }
@@ -749,9 +753,7 @@ static inline std::pair<bool, size_t> avx512_needle_hammer_t(const char* text, s
 //   T          16     32     64    128    256    512
 //   worst    1.86x  1.63x  1.44x  1.27x  1.13x  1.07x
 //
-// 512 clears the floor and minimises worst-case regret. It was 256 under the
-// previous kernels, where the same table read 1.10x at both 256 and 512; making
-// the wide kernel faster raised the value of keeping work on it. The regret is
+// 512 clears the floor and minimises worst-case regret. The regret is
 // almost entirely one vendor's: the Intel parts sit within 6.5% at every
 // candidate, while Zen 5 pays 86% at T = 16 and nothing at 512.
 //
@@ -775,8 +777,6 @@ std::pair<bool, size_t> avx512_needle_hammer128(const char* t, size_t n, const c
     { return avx512_needle_hammer_t<128>(t, n, p, m); }
 std::pair<bool, size_t> avx512_needle_hammer256(const char* t, size_t n, const char* p, size_t m)
     { return avx512_needle_hammer_t<256>(t, n, p, m); }
-// 512 was the default before the anchored kernel's code-generation penalty was
-// removed; kept so the sweep still brackets the old choice.
 std::pair<bool, size_t> avx512_needle_hammer512(const char* t, size_t n, const char* p, size_t m)
     { return avx512_needle_hammer_t<512>(t, n, p, m); }
 
@@ -822,9 +822,9 @@ std::pair<bool, size_t> avx512_needle_hammer512(const char* t, size_t n, const c
 // only length range where the guard provably costs nothing. Above it the guard
 // can fire even where the unguarded kernel would have won: on the tail shape at
 // m = 64 it gives up and pays 41 us against the unguarded kernel's 26 us. It is
-// not free there, and the earlier claim here that it could not fire below ~216
-// bytes was wrong -- 216 is the instruction-model crossover with two-way, a
-// different quantity that does not bound this counter. What the guard buys for
+// not free there. Note that 216 bytes, the instruction-model crossover with
+// two-way quoted above, does not bound this counter and says nothing about when
+// the guard fires. What the guard buys for
 // that 57% is the bound: the same cell reaches 207 us unguarded at m = 512 and
 // keeps climbing, while guarded it stops at 66 us, under two-way's 53 us doubled.
 //
@@ -911,12 +911,16 @@ static inline avx512_guarded_result avx512_naive_search256_guarded(
             fD = _mm512_mask_cmpeq_epi8_mask(fD, _mm512_loadu_si512((const void*)(text+i+j+192)), pj);
         }
         rounds += j - 4;
-        if (rounds > budget_rounds) return {false, 0, true, i};
 
+        // Resolve before testing the budget. The narrowing above is spent
+        // whether or not the budget survives it, so giving up on a block that
+        // just produced the answer would discard a proven match and pay two-way
+        // to find it again.
         if (fA) return {true, i +   0 + (size_t)__builtin_ctzll(fA), false, 0};
         if (fB) return {true, i +  64 + (size_t)__builtin_ctzll(fB), false, 0};
         if (fC) return {true, i + 128 + (size_t)__builtin_ctzll(fC), false, 0};
         if (fD) return {true, i + 192 + (size_t)__builtin_ctzll(fD), false, 0};
+        if (rounds > budget_rounds) return {false, 0, true, i};
     }
 #undef AVX512_CHUNK
 
@@ -975,14 +979,13 @@ static inline std::pair<bool, size_t> avx512_needle_hammer_guarded_t(
         // haystack. Benign verification work is (candidates surviving three
         // anchors) x m, and on a long needle drawn from ordinary text the
         // anchors are common letters, so a flat byte budget trips on perfectly
-        // benign input -- measured as a 43% regression at m = 8192 before this
-        // term was added. Allow whichever is larger: 16 bytes per haystack byte,
-        // or 128 full verifications.
+        // benign input.
+        //
         // Budget the verification in bytes against the HAYSTACK, not the
-        // needle. An earlier version used max(2n, 128m); the 128m floor was
-        // there to stop benign long-needle searches tripping, but it made the
-        // worst case grow linearly in m (38 us at m = 8192 rather than 13 us at
-        // m = 2048). Scaling with n alone fixes both ends: 16n is far above the
+        // needle. A max(2n, 128m) form, with the 128m floor there to stop
+        // benign long-needle searches tripping, makes the worst case grow
+        // linearly in m (38 us at m = 8192 against 13 us at m = 2048). Scaling
+        // with n alone fixes both ends: 16n is far above the
         // benign verification load even for an 8 KB needle drawn from ordinary
         // text, and it caps adversarial verification independently of m. At
         // roughly one instruction per 32 bytes compared, 16n bytes is about n/2

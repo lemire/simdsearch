@@ -115,8 +115,9 @@ directions, and the threshold picks whichever failure is cheaper:
   survivor. Verification is specialised, never a library call: no check at all
   for `m <= 3` (the anchors already covered every byte), one masked register
   compare against the preloaded needle for `m < 64`, and `sz_equal_avx512` above
-  that. An earlier version of this port used a single `std::memcmp` instead,
-  which cost up to 2.4x on adversarial input.
+  that. Using a single `std::memcmp` instead costs up to 2.4x on adversarial
+  input: a filter-defeating input makes every position a candidate, so the
+  per-candidate constant is multiplied by `n`.
 
 `find_avx512_needle_hammer16/32/64/128/256/512` are the same scheme at other
 switch points, so the crossover can be measured instead of assumed.
@@ -308,59 +309,59 @@ non-amortized `find_twoway` grows the same way on its own.
 ### One body, one instantiation
 
 `avx512_stringzilla_body` is shared by `avx512_stringzilla_find` (which passes an
-unreachable budget) and `avx512_stringzilla_guarded`. That is not tidiness. An
-earlier version kept two copies, and a later one templated the body on whether
-the counter was compiled in; both produced two machine-code bodies, and GCC
-generated markedly better code for the guarded one -- 2251 ns against 3621 ns at
-`m = 2048` for identical work, with budgets set so that neither could bail.
+unreachable budget) and `avx512_stringzilla_guarded`. That is not tidiness.
+Either keeping two copies or templating the body on whether the counter is
+compiled in produces two machine-code bodies, and GCC generates markedly better
+code for the guarded one -- 2251 ns against 3621 ns at `m = 2048` for identical
+work, with budgets set so that neither can bail. A single instantiation makes
+guarded and unguarded comparable by construction rather than by coincidence.
 
-Collapsing to a single instantiation makes guarded and unguarded comparable by
-construction, and incidentally hands the anchored kernel the faster code path:
-`find_avx512_stringzilla` went from 3624 ns to 2223 ns at `m = 2048`.
+### The switch point is a fleet minimax, not a per-machine optimum
 
-**That fix moved the switch point, and the default is now 128 rather than 512.**
-With the anchored kernel no longer paying the penalty it becomes the cheaper
-parent from about `m = 24`:
+Two criteria bear on the threshold, and they disagree between vendors.
 
-```
-ns per search              16       24       32       40       64       96      256      512
-find_avx512_256          2615     2592     2620     2657     2697     2739     3015     3445
-find_avx512_stringzilla  2611     2552     2606     2611     2577     2307     2367     2241
-```
+Robustness bounds it from below. A switch point protects the adversarial
+crossover only while it sits below the wide kernel's own crossover with two-way.
+That crossover is 128/113/119 bytes on Emerald/Granite/Sapphire Rapids and 87/104
+on Zen 5/Zen 4, so 128 is the fleet floor: at or above it the scheme is
+adversarially maximal on every machine, below it on none.
 
-The two parents are within 1% of each other over a wide band, so the exact value
-matters little on benign data -- the benign optimum is around 8.
-
-**But 8 is not what ships, and the reason is the next section.** At 512-bit the
-switch point does more than pick the faster kernel: it decides which of the two
-an adversary is allowed to attack. 128 is the largest needle length at which the
-wide kernel is still ahead of two-way under its own worst case, so putting the
-threshold there gives away nothing exploitable, at a cost of up to ~25% on benign
-text at intermediate lengths. Measured, a 16-byte threshold would drop the
-adversarial crossover from ~126 bytes to ~28.
-
-### The switch point trades benign speed against robustness
-
-Lowering it hands more needle lengths to the anchored kernel, and the
-all-common-byte `block` adversary defeats exactly that kernel. The two criteria
-therefore disagree, and neither threshold is right for both. Worst case over the
-three adversaries, 16 KB haystack, ns per search:
+Above the floor the choice is purely benign, and there the vendors pull apart.
+The anchored kernel is far weaker relative to the wide one on Zen, so Intel wants
+a small threshold and AMD a large one. Geometric mean over the length sweep, as
+regret against the best switch point for that machine and length, worst over the
+fleet:
 
 ```
-m                            32      64     128     512    2048
-threshold 128 (shipped)    3707    6989   13177   55444  172580
-threshold 16               3707   46917   54292   87714  205853
-guarded, threshold 128     3707   10327   14370    8486   13386
-two-way (amortized)       13318   13296   13432   13204   11622
+T          16     32     64    128    256    512
+worst    1.86x  1.63x  1.44x  1.27x  1.13x  1.07x
 ```
 
-On benign data a low threshold is right; on adversarial data a high one is; and
-no threshold is right at large `m`, where both parents collapse. The guarded
-searcher is what actually resolves this -- it bounds both kernels instead of
-hoping the threshold avoids them, and it stays within about 1.25x of two-way's
-own worst case at every length while keeping the benign optimum. **If the
-worst-case behaviour matters at all, prefer
-`find_avx512_needle_hammer_guarded` over tuning the threshold.**
+`512` clears the floor and minimises worst-case regret, so that is what ships. No
+value is optimal on any one machine, which is the point: the regret is almost
+entirely one vendor's, with the Intel parts within 6.5% at every candidate while
+Zen 5 pays 86% at `T = 16` and nothing at 512.
+`find_avx512_needle_hammer16/32/64/128/256/512` exist so this can be re-measured
+on new hardware rather than trusted.
+
+### No threshold fixes the worst case; the guard does
+
+The threshold decides which parent an adversary may attack, not whether one is
+attackable. Worst over the three adversarial shapes (`tail`, `mid`, `block`),
+16 KB haystack, ns per search on the reference machine:
+
+```
+m                             8      16      32      64     128     256     512    1024    2048
+needle-hammer               757    1622    3274    6552   13292   26122   51219   89695  170763
+needle-hammer guarded       784    1623    3269   10342   14382   16494   17977    9520   11579
+two-way (amortized)       13349   13334   13344   13221   13254   13173   12920   12601   11679
+```
+
+Unguarded, the worst case grows without bound -- 13x two-way at `m = 2048`. The
+guard caps it near two-way's own cost at every length, at the price of giving up
+early on some inputs where the unguarded kernel would still have won (`m = 64`,
+where it pays 10.3 us against 6.6 us). **If worst-case behaviour matters at all,
+prefer `find_avx512_needle_hammer_guarded` over tuning the threshold.**
 
 ## Capping the needle count: `--needles`
 
