@@ -417,9 +417,10 @@ void list_algos() {
 // how that algorithm's cost evolves with pattern length.
 void horspool_benchmark(const std::string &text, const std::string &source_desc,
                         const std::vector<size_t> &requested_lengths,
-                        const std::vector<const Algo *> &algos) {
+                        const std::vector<const Algo *> &algos,
+                        size_t patterns_override = 0) {
   static std::mt19937 gen(std::random_device{}());
-  const size_t patterns_per_len = 2000;
+  const size_t patterns_per_len = patterns_override ? patterns_override : 2000;
   volatile uint64_t sink = 0;
 
   // Keep only lengths that fit the text.
@@ -880,7 +881,8 @@ int main(int argc, char **argv) {
     bool path_given = false;
     std::vector<size_t> lengths;       // horspool / worstcase only
     std::vector<const Algo *> algos;   // all modes; empty => all
-    size_t worstcase_size = 1u << 16;  // worstcase only: haystack bytes
+    size_t patterns_per_len_opt = 0;
+  size_t worstcase_size = 1u << 16;  // worstcase only: haystack bytes
     size_t max_needles = 1000;         // ashvardanian only: needle cap
     std::string needle_shape = "tail"; // worstcase only: tail|aba|mid|high
 
@@ -912,6 +914,12 @@ int main(int argc, char **argv) {
           lengths.push_back(std::stoul(t));
       } else if (arg == "--size" || arg.rfind("--size=", 0) == 0) {
         worstcase_size = std::stoul(take_value(arg, k));
+      } else if (arg == "--patterns" || arg.rfind("--patterns=", 0) == 0) {
+        patterns_per_len_opt = std::stoul(take_value(arg, k));
+        if (patterns_per_len_opt == 0) {
+          std::cerr << "--patterns must be at least 1\n";
+          return 1;
+        }
       } else if (arg == "--needles" || arg.rfind("--needles=", 0) == 0) {
         max_needles = std::stoul(take_value(arg, k));
         if (max_needles == 0) {
@@ -944,7 +952,8 @@ int main(int argc, char **argv) {
       if (lengths.empty())
         for (size_t L = 2; L <= 20; ++L) lengths.push_back(L);
       if (path_given) {
-        horspool_benchmark(load_file(path), path, lengths, algos);
+        horspool_benchmark(load_file(path), path, lengths, algos,
+                           patterns_per_len_opt);
       } else {
         // No source file given: generate a random text big enough for the
         // longest requested pattern (and a reasonable haystack to scan).
@@ -953,7 +962,7 @@ int main(int argc, char **argv) {
         size_t gen_size = std::max<size_t>(1u << 17, max_len * 2 + 64);
         horspool_benchmark(generate_random_string(gen_size),
                            std::format("random ({} bytes)", gen_size), lengths,
-                           algos);
+                           algos, patterns_per_len_opt);
       }
     } else if (mode == "ashvardanian") {
       ashvardanian_benchmark(load_file(path), algos, max_needles);
@@ -991,6 +1000,17 @@ int main(int argc, char **argv) {
   std::print("\n  options (all modes):\n");
   std::print("    --algos x,y       algorithms to test (default all), by name\n");
   std::print("    --list            list available algorithm names and exit\n");
+  std::print("\n  horspool:\n");
+  std::print("    --patterns N      random patterns per length (default 2000). "
+             "Each is validated\n"
+             "                      against std::string::find before timing, "
+             "which is O(n) per\n"
+             "                      pattern and dominates the cost on a large "
+             "corpus. Lowering it\n"
+             "                      narrows the averaging, not the timed "
+             "workload: a cell repeats\n"
+             "                      until it accumulates a fixed span of "
+             "measured time either way.\n");
   std::print("\n  horspool / worstcase:\n");
   std::print("    --lengths a,b,c   pattern lengths to test "
              "(horspool default 2..20, worstcase 2..512)\n");
