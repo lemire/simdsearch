@@ -113,6 +113,11 @@ int main() {
       {"neon_naive_search", neon_naive_search},
       {"neon_naive_search64", neon_naive_search64},
       {"neon_stringzilla_find", neon_stringzilla_find},
+    {"neon_naive_search_v3", neon_naive_search_v3},
+    {"neon_naive_search64_v3", neon_naive_search64_v3},
+    {"neon_needle_hammer", neon_needle_hammer},
+    {"neon_nh_t16", neon_needle_hammer_t16_u0},
+    {"neon_nh_t1024", neon_needle_hammer_t1024_u0},
 #endif
   };
 

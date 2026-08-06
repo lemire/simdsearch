@@ -1,4 +1,11 @@
 #pragma once
+
+#ifndef NEON_NH_TAU
+#define NEON_NH_TAU 16
+#endif
+#ifndef NEON_NH_MU
+#define NEON_NH_MU 256
+#endif
 #include <arm_neon.h>
 #include <algorithm>
 #include <cstddef>
@@ -149,12 +156,12 @@ std::pair<bool, size_t> neon_naive_search(const char* text, size_t n, const char
                 uint8x16_t p3 = vdupq_n_u8((uint8_t)pattern[3]);
                 found = vandq_u8(found, vceqq_u8(vld1q_u8((const uint8_t*)(text + i + 3)), p3));
                 for (size_t j = 4; j < m; ++j) {
-                    if (vmaxvq_u32(found) == 0) break;
+                    if (vmaxvq_u32(vreinterpretq_u32_u8(found)) == 0) break;
                     uint8x16_t tj = vld1q_u8((const uint8_t*)(text + i + j));
                     uint8x16_t pj = vdupq_n_u8((uint8_t)pattern[j]);
                     found = vandq_u8(found, vceqq_u8(tj, pj));
                 }
-                if (vmaxvq_u32(found) == 0) continue;
+                if (vmaxvq_u32(vreinterpretq_u32_u8(found)) == 0) continue;
 
                 uint8x8_t nibble_mask = vshrn_n_u16(vreinterpretq_u16_u8(found), 4);
                 uint64_t mask = vget_lane_u64(vreinterpret_u64_u8(nibble_mask), 0);
@@ -168,12 +175,12 @@ std::pair<bool, size_t> neon_naive_search(const char* text, size_t n, const char
                 uint8x16_t p0 = vdupq_n_u8((uint8_t)pattern[0]);
                 uint8x16_t found = vceqq_u8(t0, p0);
                 for (size_t j = 1; j < m; ++j) {
-                    if (vmaxvq_u32(found) == 0) break;
+                    if (vmaxvq_u32(vreinterpretq_u32_u8(found)) == 0) break;
                     uint8x16_t tj = vld1q_u8((const uint8_t*)(text + i + j));
                     uint8x16_t pj = vdupq_n_u8((uint8_t)pattern[j]);
                     found = vandq_u8(found, vceqq_u8(tj, pj));
                 }
-                if (vmaxvq_u32(found) == 0) continue;
+                if (vmaxvq_u32(vreinterpretq_u32_u8(found)) == 0) continue;
 
 
                 uint8x8_t nibble_mask = vshrn_n_u16(vreinterpretq_u16_u8(found), 4);
@@ -300,7 +307,7 @@ std::pair<bool, size_t> neon_naive_search64(const char* text, size_t n, const ch
 
             for (size_t j = 4; j < m; ++j) {
                 uint8x16_t any = vorrq_u8(vorrq_u8(fA, fB), vorrq_u8(fC, fD));
-                if (vmaxvq_u32(any) == 0) break;
+                if (vmaxvq_u32(vreinterpretq_u32_u8(any)) == 0) break;
                 uint8x16_t pj = vdupq_n_u8((uint8_t)pattern[j]);
                 fA = vandq_u8(fA, vceqq_u8(vld1q_u8((const uint8_t*)(text + i + j +  0)), pj));
                 fB = vandq_u8(fB, vceqq_u8(vld1q_u8((const uint8_t*)(text + i + j + 16)), pj));
@@ -309,20 +316,20 @@ std::pair<bool, size_t> neon_naive_search64(const char* text, size_t n, const ch
             }
 
             uint8x16_t any = vorrq_u8(vorrq_u8(fA, fB), vorrq_u8(fC, fD));
-            if (vmaxvq_u32(any) == 0) continue;
+            if (vmaxvq_u32(vreinterpretq_u32_u8(any)) == 0) continue;
 
             // Walk lanes in order so we return the lowest-index match.
-            if (vmaxvq_u32(fA) != 0) {
+            if (vmaxvq_u32(vreinterpretq_u32_u8(fA)) != 0) {
                 uint8x8_t nm = vshrn_n_u16(vreinterpretq_u16_u8(fA), 4);
                 uint64_t mask = vget_lane_u64(vreinterpret_u64_u8(nm), 0);
                 return {true, i + (__builtin_ctzll(mask) >> 2)};
             }
-            if (vmaxvq_u32(fB) != 0) {
+            if (vmaxvq_u32(vreinterpretq_u32_u8(fB)) != 0) {
                 uint8x8_t nm = vshrn_n_u16(vreinterpretq_u16_u8(fB), 4);
                 uint64_t mask = vget_lane_u64(vreinterpret_u64_u8(nm), 0);
                 return {true, i + 16 + (__builtin_ctzll(mask) >> 2)};
             }
-            if (vmaxvq_u32(fC) != 0) {
+            if (vmaxvq_u32(vreinterpretq_u32_u8(fC)) != 0) {
                 uint8x8_t nm = vshrn_n_u16(vreinterpretq_u16_u8(fC), 4);
                 uint64_t mask = vget_lane_u64(vreinterpret_u64_u8(nm), 0);
                 return {true, i + 32 + (__builtin_ctzll(mask) >> 2)};
@@ -343,6 +350,204 @@ std::pair<bool, size_t> neon_naive_search64(const char* text, size_t n, const ch
     return {false, 0};
 }
 
+
+// ---------------------------------------------------------------------------
+// NEON Needle-Hammer.
+//
+// Same three ideas as the AVX-512 v3 kernels, retargeted to a machine with no
+// mask registers. The parts that carry over unchanged are the ones about
+// dependency structure, not about instruction set: filter on four needle bytes
+// with INDEPENDENT compares so the four vceqq chains issue in parallel rather
+// than serialising through one accumulator; take the overwhelmingly common
+// "exactly one candidate survived the filter" case out of the narrowing loop and
+// verify it in place; and leave no bytes to a scalar loop.
+//
+// What does not carry over is the mask. AVX-512 keeps candidates in a k register
+// where "exactly one bit set" is the BLSR idiom on a value it already has. NEON
+// keeps them in a uint8x16_t of 0x00/0xFF lanes, so the test needs a movemask
+// first. shrn #4 narrows the 16 lanes to 4 bits each in a 64-bit GPR, and
+// masking with 0x8888... leaves one bit per lane -- at which point BLSR works as
+// it does on x86, and ctz/4 is the lane index. That movemask is not overhead
+// charged to the guard: every path that reports a match needs it anyway.
+static inline uint64_t neon_lane_mask(uint8x16_t v) {
+    return vget_lane_u64(vreinterpret_u64_u8(
+               vshrn_n_u16(vreinterpretq_u16_u8(v), 4)), 0) &
+           0x8888888888888888ull;
+}
+
+// Verify a candidate whose first four bytes already matched.
+static inline bool neon_verify_tail(const char* p, const char* pattern, size_t m) {
+    return std::memcmp(p + 4, pattern + 4, m - 4) == 0;
+}
+
+// Single-window kernel, 16-byte stride.
+static inline __attribute__((always_inline)) std::pair<bool, size_t>
+neon_naive_search_v3_body(const char* text, size_t n, const char* pattern, size_t m) {
+    if (m == 0) return {true, 0};
+    if (n < m) return {false, 0};
+
+    size_t i = 0;
+    if (m >= 4 && n >= m + 15) {
+        const uint8x16_t p0 = vdupq_n_u8((uint8_t)pattern[0]);
+        const uint8x16_t p1 = vdupq_n_u8((uint8_t)pattern[1]);
+        const uint8x16_t p2 = vdupq_n_u8((uint8_t)pattern[2]);
+        const uint8x16_t p3 = vdupq_n_u8((uint8_t)pattern[3]);
+        for (; i + m + 15 <= n; i += 16) {
+            uint8x16_t f =
+                vandq_u8(vandq_u8(vceqq_u8(vld1q_u8((const uint8_t*)(text+i+0)), p0),
+                                  vceqq_u8(vld1q_u8((const uint8_t*)(text+i+1)), p1)),
+                         vandq_u8(vceqq_u8(vld1q_u8((const uint8_t*)(text+i+2)), p2),
+                                  vceqq_u8(vld1q_u8((const uint8_t*)(text+i+3)), p3)));
+            uint64_t mask = neon_lane_mask(f);
+            if (mask == 0) continue;
+
+            if ((mask & (mask - 1)) == 0) {              // one survivor: verify here
+                const size_t b = (size_t)__builtin_ctzll(mask) >> 2;
+                if (neon_verify_tail(text + i + b, pattern, m)) return {true, i + b};
+                continue;
+            }
+            for (size_t k = 4; k < m; ++k) {             // many: narrow (adversarial)
+                if (vmaxvq_u32(vreinterpretq_u32_u8(f)) == 0) break;
+                f = vandq_u8(f, vceqq_u8(vld1q_u8((const uint8_t*)(text+i+k)),
+                                         vdupq_n_u8((uint8_t)pattern[k])));
+            }
+            mask = neon_lane_mask(f);
+            if (mask) return {true, i + ((size_t)__builtin_ctzll(mask) >> 2)};
+        }
+
+        // Overlap epilogue. NEON has no masked load, so instead of narrowing the
+        // window we slide it back to the last legal position and re-scan bytes
+        // already scanned. That is sound precisely because they were scanned and
+        // held no match, so the lowest surviving lane here cannot precede i --
+        // and it costs one window rather than up to 15 scalar memcmp calls.
+        // Guarded on the main loop having run: if it did not, i is 0 and sliding
+        // back would read out of bounds.
+        if (i + m <= n) {
+            const size_t last = n - m - 15;
+            uint8x16_t f =
+                vandq_u8(vandq_u8(vceqq_u8(vld1q_u8((const uint8_t*)(text+last+0)), p0),
+                                  vceqq_u8(vld1q_u8((const uint8_t*)(text+last+1)), p1)),
+                         vandq_u8(vceqq_u8(vld1q_u8((const uint8_t*)(text+last+2)), p2),
+                                  vceqq_u8(vld1q_u8((const uint8_t*)(text+last+3)), p3)));
+            for (size_t k = 4; k < m; ++k) {
+                if (vmaxvq_u32(vreinterpretq_u32_u8(f)) == 0) break;
+                f = vandq_u8(f, vceqq_u8(vld1q_u8((const uint8_t*)(text+last+k)),
+                                         vdupq_n_u8((uint8_t)pattern[k])));
+            }
+            uint64_t mask = neon_lane_mask(f);
+            while (mask) {
+                const size_t b = last + ((size_t)__builtin_ctzll(mask) >> 2);
+                if (b >= i) return {true, b};
+                mask &= mask - 1;
+            }
+            return {false, 0};
+        }
+        return {false, 0};
+    }
+
+    // m < 4. The filter IS the whole needle here, so there is nothing left to
+    // verify and no narrowing loop to enter; without this branch the kernel drops
+    // to a scalar memcmp per position, which measured 76x slower than the
+    // anchored kernel at m = 3 on a find-first workload.
+    if (n >= m + 15) {
+        const uint8x16_t q0 = vdupq_n_u8((uint8_t)pattern[0]);
+        const uint8x16_t q1 = vdupq_n_u8((uint8_t)pattern[m > 1 ? 1 : 0]);
+        const uint8x16_t q2 = vdupq_n_u8((uint8_t)pattern[m > 2 ? 2 : 0]);
+        for (; i + m + 15 <= n; i += 16) {
+            uint8x16_t f = vceqq_u8(vld1q_u8((const uint8_t*)(text + i)), q0);
+            if (m > 1) f = vandq_u8(f, vceqq_u8(vld1q_u8((const uint8_t*)(text+i+1)), q1));
+            if (m > 2) f = vandq_u8(f, vceqq_u8(vld1q_u8((const uint8_t*)(text+i+2)), q2));
+            const uint64_t mask = neon_lane_mask(f);
+            if (mask) return {true, i + ((size_t)__builtin_ctzll(mask) >> 2)};
+        }
+        if (i + m <= n) {
+            const size_t last = n - m - 15;
+            uint8x16_t f = vceqq_u8(vld1q_u8((const uint8_t*)(text + last)), q0);
+            if (m > 1) f = vandq_u8(f, vceqq_u8(vld1q_u8((const uint8_t*)(text+last+1)), q1));
+            if (m > 2) f = vandq_u8(f, vceqq_u8(vld1q_u8((const uint8_t*)(text+last+2)), q2));
+            uint64_t mask = neon_lane_mask(f);
+            while (mask) {
+                const size_t b = last + ((size_t)__builtin_ctzll(mask) >> 2);
+                if (b >= i) return {true, b};
+                mask &= mask - 1;
+            }
+        }
+        return {false, 0};
+    }
+
+    for (; i + m <= n; ++i)
+        if (std::memcmp(text + i, pattern, m) == 0) return {true, i};
+    return {false, 0};
+}
+
+// Wide-stride kernel, 64 bytes per iteration as four 16-byte chunks. As on
+// AVX-512 the single-survivor guard is on the WHOLE block, not per chunk:
+// resolving chunks independently duplicates the pattern broadcasts that the
+// shared narrowing loop exists to amortise.
+static inline __attribute__((always_inline)) std::pair<bool, size_t>
+neon_naive_search64_v3_body(const char* text, size_t n, const char* pattern, size_t m) {
+    if (m == 0) return {true, 0};
+    if (n < m) return {false, 0};
+
+    size_t i = 0;
+    if (m >= 4 && n >= m + 63) {
+        const uint8x16_t p0 = vdupq_n_u8((uint8_t)pattern[0]);
+        const uint8x16_t p1 = vdupq_n_u8((uint8_t)pattern[1]);
+        const uint8x16_t p2 = vdupq_n_u8((uint8_t)pattern[2]);
+        const uint8x16_t p3 = vdupq_n_u8((uint8_t)pattern[3]);
+#define NEON_CHUNK(OFF)                                                            \
+        vandq_u8(vandq_u8(vceqq_u8(vld1q_u8((const uint8_t*)(text+i+(OFF)+0)), p0), \
+                          vceqq_u8(vld1q_u8((const uint8_t*)(text+i+(OFF)+1)), p1)),\
+                 vandq_u8(vceqq_u8(vld1q_u8((const uint8_t*)(text+i+(OFF)+2)), p2), \
+                          vceqq_u8(vld1q_u8((const uint8_t*)(text+i+(OFF)+3)), p3)))
+        for (; i + m + 63 <= n; i += 64) {
+            uint8x16_t fA = NEON_CHUNK(0),  fB = NEON_CHUNK(16);
+            uint8x16_t fC = NEON_CHUNK(32), fD = NEON_CHUNK(48);
+            uint64_t mA = neon_lane_mask(fA), mB = neon_lane_mask(fB);
+            uint64_t mC = neon_lane_mask(fC), mD = neon_lane_mask(fD);
+            if ((mA | mB | mC | mD) == 0) continue;
+
+            const int nz = (mA != 0) + (mB != 0) + (mC != 0) + (mD != 0);
+            const uint64_t one = mA | mB | mC | mD;
+            if (nz == 1 && (one & (one - 1)) == 0) {     // one survivor in the block
+                const size_t off = (mA != 0) ? 0 : (mB != 0) ? 16 : (mC != 0) ? 32 : 48;
+                const size_t b = off + ((size_t)__builtin_ctzll(one) >> 2);
+                if (neon_verify_tail(text + i + b, pattern, m)) return {true, i + b};
+                continue;
+            }
+            for (size_t k = 4; k < m; ++k) {             // many: shared narrowing
+                uint8x16_t any = vorrq_u8(vorrq_u8(fA, fB), vorrq_u8(fC, fD));
+                if (vmaxvq_u32(vreinterpretq_u32_u8(any)) == 0) break;
+                const uint8x16_t pk = vdupq_n_u8((uint8_t)pattern[k]);
+                fA = vandq_u8(fA, vceqq_u8(vld1q_u8((const uint8_t*)(text+i+k+ 0)), pk));
+                fB = vandq_u8(fB, vceqq_u8(vld1q_u8((const uint8_t*)(text+i+k+16)), pk));
+                fC = vandq_u8(fC, vceqq_u8(vld1q_u8((const uint8_t*)(text+i+k+32)), pk));
+                fD = vandq_u8(fD, vceqq_u8(vld1q_u8((const uint8_t*)(text+i+k+48)), pk));
+            }
+            if ((mA = neon_lane_mask(fA)) != 0) return {true, i +  0 + ((size_t)__builtin_ctzll(mA) >> 2)};
+            if ((mB = neon_lane_mask(fB)) != 0) return {true, i + 16 + ((size_t)__builtin_ctzll(mB) >> 2)};
+            if ((mC = neon_lane_mask(fC)) != 0) return {true, i + 32 + ((size_t)__builtin_ctzll(mC) >> 2)};
+            if ((mD = neon_lane_mask(fD)) != 0) return {true, i + 48 + ((size_t)__builtin_ctzll(mD) >> 2)};
+        }
+#undef NEON_CHUNK
+    }
+    // Remainder: hand to the 16-byte kernel, which ends in an overlap window, so
+    // no byte reaches a scalar loop.
+    if (i + m <= n) {
+        auto r = neon_naive_search_v3_body(text + i, n - i, pattern, m);
+        if (r.first) return {true, i + r.second};
+    }
+    return {false, 0};
+}
+
+std::pair<bool, size_t> neon_naive_search_v3(const char* text, size_t n,
+                                             const char* pattern, size_t m) {
+    return neon_naive_search_v3_body(text, n, pattern, m);
+}
+std::pair<bool, size_t> neon_naive_search64_v3(const char* text, size_t n,
+                                               const char* pattern, size_t m) {
+    return neon_naive_search64_v3_body(text, n, pattern, m);
+}
 
 // Port of StringZilla's sz_find_vreinterpretq_u8_u4_: shrn #4 movemask, keeping
 // one bit per lane so ctz/4 indexes candidates and "mask &= mask - 1" advances.
@@ -455,3 +660,43 @@ std::pair<bool, size_t> neon_stringzilla_find(const char* haystack, size_t h_len
 
     return {false, 0};
 }
+
+
+// ---------------------------------------------------------------------------
+// The scheme: dispatch on haystack size, then on needle length.
+//
+//   n < MinWide      the wide kernel's 64-byte stride cannot amortise on a small
+//                    haystack -- it falls through to the 16-byte kernel below
+//                    m + 63 anyway, so below MinWide we go there directly.
+//   m <= Threshold   wide kernel. Filtering on four needle bytes rejects almost
+//                    every position on real text, and the wide stride pays the
+//                    four broadcasts once per 64 bytes instead of once per 16.
+//   m >  Threshold   anchored kernel. Its three anchors are chosen for rarity,
+//                    so its filter keeps working where a fixed first-four filter
+//                    starts admitting candidates; and its cost per position does
+//                    not grow with m, while the wide kernel's verification does.
+template <size_t Threshold, size_t MinWide>
+static inline std::pair<bool, size_t>
+neon_needle_hammer_t(const char* text, size_t n, const char* pattern, size_t m) {
+    if (m == 0) return {true, 0};
+    if (n < m) return {false, 0};
+    if (n < MinWide) return neon_naive_search_v3_body(text, n, pattern, m);
+    if (m <= Threshold) return neon_naive_search64_v3_body(text, n, pattern, m);
+    return neon_stringzilla_find(text, n, pattern, m);
+}
+
+std::pair<bool, size_t> neon_needle_hammer(const char* text, size_t n,
+                                           const char* pattern, size_t m) {
+    return neon_needle_hammer_t<NEON_NH_TAU, NEON_NH_MU>(text, n, pattern, m);
+}
+
+// Sweep instances, used only to fix the two constants above.
+#define NEON_NH_SWEEP(T, U)                                                        \
+    std::pair<bool, size_t> neon_needle_hammer_t##T##_u##U(                        \
+        const char* text, size_t n, const char* pattern, size_t m) {               \
+        return neon_needle_hammer_t<T, U>(text, n, pattern, m);                    \
+    }
+NEON_NH_SWEEP(16, 0)   NEON_NH_SWEEP(32, 0)   NEON_NH_SWEEP(64, 0)
+NEON_NH_SWEEP(128, 0)  NEON_NH_SWEEP(256, 0)  NEON_NH_SWEEP(512, 0)
+NEON_NH_SWEEP(1024, 0)
+
