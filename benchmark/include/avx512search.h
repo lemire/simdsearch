@@ -1,3 +1,4 @@
+#pragma once
 #include <immintrin.h>
 #include <algorithm>
 #include <cstddef>
@@ -714,39 +715,45 @@ std::pair<bool, size_t> avx512_stringzilla_find_hifilter(const char* haystack,
 template <size_t Threshold>
 static inline std::pair<bool, size_t> avx512_needle_hammer_t(const char* text, size_t n,
                                                            const char* pattern, size_t m) {
+    // 1024, not the 2048 the narrow widths use. The guard existed because the
+    // wide kernel collapsed on small haystacks -- its 256-byte loop left up to
+    // 255 positions to a scalar memcmp. That tail is gone here and the kernel
+    // now falls through to the 64-byte path below m + 255, so it degenerates to
+    // the single-window kernel rather than degrading. Measured across the fleet
+    // the wide kernel is at least as good from 1024 bytes up; only at 512 do the
+    // two AMD parts still prefer single. The narrow widths keep 2048 because
+    // their kernels still have the scalar tail this value was chosen to avoid.
     constexpr size_t kMinWide = 1024;
     if (m > Threshold) return avx512_stringzilla_find(text, n, pattern, m);
     if (n < kMinWide || n < m + 255) return avx512_naive_search_v3_body(text, n, pattern, m);
     return avx512_naive_search256_v3_body(text, n, pattern, m);
 }
 
-// The scheme itself, switching at 256 bytes of needle.
+// The scheme itself, switching at 512 bytes of needle.
 //
 // Chosen from all five benchmarked machines, not from one, because the two
 // criteria that bear on it disagree and they disagree differently per vendor.
 //
 // Robustness. The switch point can only protect the adversarial crossover while
-// it sits BELOW the wide kernel's own crossover with two-way, W*. Measured,
-// W* is 130/132/135 bytes on Emerald/Granite/Sapphire Rapids but only 82/87 on
-// Zen 5/Zen 4 -- so on AMD any threshold above ~87 is irrelevant to the worst
-// case, and on Intel the role saturates at 135. Above that floor the choice is
-// purely a benign one.
+// it sits BELOW the wide kernel's own crossover with two-way, W*. Re-measured
+// against the current kernels, W* is 128/113/119 bytes on Emerald/Granite/
+// Sapphire Rapids and 87/104 on Zen 5/Zen 4, so the fleet floor is 128: any
+// threshold at or above it is adversarially maximal everywhere, and none below
+// it is. Above the floor the choice is purely benign.
 //
-// Benign. The parent kernels cross at 9-13 bytes on the Intel parts and at
-// 854-2300 on the AMD parts: the anchored kernel is far weaker relative to the
-// wide one on Zen. So Intel wants a small threshold and AMD a large one, and no
-// single constant is optimal for both.
-//
-// Geometric mean over the length sweep across all five machines, as a regret
-// against the best switch point for each machine:
+// Benign. The anchored kernel is far weaker relative to the wide one on Zen, so
+// Intel wants a small threshold and AMD a large one and no single constant is
+// optimal for both. Geometric mean over the length sweep, as regret against the
+// best switch point for that machine and length, worst over the fleet:
 //
 //   T          16     32     64    128    256    512
-//   worst    1.82x  1.60x  1.40x  1.23x  1.10x  1.10x
+//   worst    1.86x  1.63x  1.44x  1.27x  1.13x  1.07x
 //
-// 256 is the smallest value that clears the robustness floor and ties for the
-// best worst-case regret. An earlier version shipped 128 on the mistaken
-// premise that a lower threshold buys robustness everywhere; it does not buy any
-// on AMD, where it cost up to 2.7x at m = 192 for nothing.
+// 512 clears the floor and minimises worst-case regret. It was 256 under the
+// previous kernels, where the same table read 1.10x at both 256 and 512; making
+// the wide kernel faster raised the value of keeping work on it. The regret is
+// almost entirely one vendor's: the Intel parts sit within 6.5% at every
+// candidate, while Zen 5 pays 86% at T = 16 and nothing at 512.
 //
 // For a genuine worst-case bound use avx512_needle_hammer_guarded, which bounds
 // both kernels rather than hoping the threshold avoids them -- and which, being
@@ -807,55 +814,86 @@ std::pair<bool, size_t> avx512_needle_hammer512(const char* t, size_t n, const c
 // about 14 instructions per haystack byte; a narrowing round is about 13
 // instructions per 256 bytes covered. Allowing n rounds therefore spends roughly
 // as many instructions as two-way would, so a guarded search that gives up costs
-// about twice two-way and never less than two-way's guarantee -- and, crucially,
-// a needle short enough that the unguarded kernel would still beat two-way
-// (m <~ 216 bytes by that model) cannot exhaust the budget in the first place,
-// because it cannot execute more than m-4 rounds per block. The guard therefore
-// does not fire in the regime where firing would be a mistake.
+// about twice two-way and never less than two-way's guarantee.
+//
+// Where the guard can fire. A block admits at most m-4 rounds, so the whole
+// haystack admits at most n(m-4)/256, and the budget of n/8 is out of reach
+// exactly when m <= 36. That is the free path in the dispatcher, and it is the
+// only length range where the guard provably costs nothing. Above it the guard
+// can fire even where the unguarded kernel would have won: on the tail shape at
+// m = 64 it gives up and pays 41 us against the unguarded kernel's 26 us. It is
+// not free there, and the earlier claim here that it could not fire below ~216
+// bytes was wrong -- 216 is the instruction-model crossover with two-way, a
+// different quantity that does not bound this counter. What the guard buys for
+// that 57% is the bound: the same cell reaches 207 us unguarded at m = 512 and
+// keeps climbing, while guarded it stops at 66 us, under two-way's 53 us doubled.
 //
 // The anchored budget is 16n bytes of verification, which costs well under one
 // instruction per haystack byte (the compare is vectorised) and so is nearly free
 // relative to the two-way run that follows it.
 
-// Wide-stride kernel with a bounded narrowing loop. Only the m >= 4 path is
-// instrumented: for m < 4 the narrowing loop cannot run more than twice per
-// block, so its total work is bounded by 2n/256 rounds and no guard is needed.
+// Wide-stride kernel with a bounded narrowing loop. Body-for-body the same as
+// avx512_naive_search256_v3_body with the counter compiled in, so any difference
+// between guarded and unguarded is the guard and nothing else. Only the m >= 4
+// path is instrumented: for m < 4 the narrowing loop cannot run more than twice
+// per block, so its total work is bounded by 2n/256 rounds and no guard is
+// needed.
 static inline avx512_guarded_result avx512_naive_search256_guarded(
     const char* text, size_t n, const char* pattern, size_t m,
     size_t budget_rounds) {
     if (m == 0) return {true, 0, false, 0};
     if (n < m) return {false, 0, false, 0};
     if (m < 4 || n < m + 255) {
-        auto [f, idx] = avx512_naive_search256(text, n, pattern, m);
+        auto [f, idx] = avx512_naive_search256_v3_body(text, n, pattern, m);
         return {f, idx, false, 0};
     }
+
+    const bool fits = (m <= 64);
+    const __mmask64 nmask = fits ? ((m == 64) ? ~(__mmask64)0
+                                              : (((__mmask64)1 << m) - 1))
+                                 : (__mmask64)0;
+    const __m512i nvec = fits ? _mm512_maskz_loadu_epi8(nmask, pattern)
+                              : _mm512_setzero_si512();
+
+    const __m512i p0 = _mm512_set1_epi8((char)pattern[0]);
+    const __m512i p1 = _mm512_set1_epi8((char)pattern[1]);
+    const __m512i p2 = _mm512_set1_epi8((char)pattern[2]);
+    const __m512i p3 = _mm512_set1_epi8((char)pattern[3]);
+#define AVX512_CHUNK(OFF)                                                          \
+        ((_mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(text+i+(OFF)+0)), p0)   \
+        & _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(text+i+(OFF)+1)), p1))  \
+        & (_mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(text+i+(OFF)+2)), p2)  \
+        & _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(text+i+(OFF)+3)), p3)))
 
     size_t rounds = 0;
     size_t i = 0;
     for (; i + m + 255 <= n; i += 256) {
-        __m512i p0 = _mm512_set1_epi8((char)pattern[0]);
-        __mmask64 fA = _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(text + i +   0)), p0);
-        __mmask64 fB = _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(text + i +  64)), p0);
-        __mmask64 fC = _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(text + i + 128)), p0);
-        __mmask64 fD = _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(text + i + 192)), p0);
+        __mmask64 fA = AVX512_CHUNK(0), fB = AVX512_CHUNK(64);
+        __mmask64 fC = AVX512_CHUNK(128), fD = AVX512_CHUNK(192);
+        if ((fA | fB | fC | fD) == 0) continue;
 
-        __m512i p1 = _mm512_set1_epi8((char)pattern[1]);
-        fA = _mm512_mask_cmpeq_epi8_mask(fA, _mm512_loadu_si512((const void*)(text + i +   1)), p1);
-        fB = _mm512_mask_cmpeq_epi8_mask(fB, _mm512_loadu_si512((const void*)(text + i +  65)), p1);
-        fC = _mm512_mask_cmpeq_epi8_mask(fC, _mm512_loadu_si512((const void*)(text + i + 129)), p1);
-        fD = _mm512_mask_cmpeq_epi8_mask(fD, _mm512_loadu_si512((const void*)(text + i + 193)), p1);
-
-        __m512i p2 = _mm512_set1_epi8((char)pattern[2]);
-        fA = _mm512_mask_cmpeq_epi8_mask(fA, _mm512_loadu_si512((const void*)(text + i +   2)), p2);
-        fB = _mm512_mask_cmpeq_epi8_mask(fB, _mm512_loadu_si512((const void*)(text + i +  66)), p2);
-        fC = _mm512_mask_cmpeq_epi8_mask(fC, _mm512_loadu_si512((const void*)(text + i + 130)), p2);
-        fD = _mm512_mask_cmpeq_epi8_mask(fD, _mm512_loadu_si512((const void*)(text + i + 194)), p2);
-
-        __m512i p3 = _mm512_set1_epi8((char)pattern[3]);
-        fA = _mm512_mask_cmpeq_epi8_mask(fA, _mm512_loadu_si512((const void*)(text + i +   3)), p3);
-        fB = _mm512_mask_cmpeq_epi8_mask(fB, _mm512_loadu_si512((const void*)(text + i +  67)), p3);
-        fC = _mm512_mask_cmpeq_epi8_mask(fC, _mm512_loadu_si512((const void*)(text + i + 131)), p3);
-        fD = _mm512_mask_cmpeq_epi8_mask(fD, _mm512_loadu_si512((const void*)(text + i + 195)), p3);
+        // One survivor in the block: verified in place, no narrowing, so nothing
+        // is charged. That is not a hole an adversary can widen. The path costs
+        // at most m bytes of vector compare per 256 bytes of haystack, so even
+        // at the largest needle the wide kernel ever sees (m = tau = 512) it is
+        // two compared bytes per haystack byte, a few hundredths of an
+        // instruction each -- far below the ~14 instructions per byte that
+        // two-way would spend on the same text. The expensive path is the one
+        // with many survivors, and that is the one counted.
+        const int nz = (fA != 0) + (fB != 0) + (fC != 0) + (fD != 0);
+        const __mmask64 one = fA | fB | fC | fD;
+        if (nz == 1 && (one & (one - 1)) == 0) {
+            const size_t off = (fA != 0) ? 0 : (fB != 0) ? 64 : (fC != 0) ? 128 : 192;
+            const size_t b = off + (size_t)__builtin_ctzll(one);
+            if (fits) {
+                if (_mm512_mask_cmpneq_epi8_mask(
+                        nmask, _mm512_maskz_loadu_epi8(nmask, text + i + b), nvec) == 0)
+                    return {true, i + b, false, 0};
+            } else if (std::memcmp(text + i + b + 4, pattern + 4, m - 4) == 0) {
+                return {true, i + b, false, 0};
+            }
+            continue;
+        }
 
         // The only unbounded loop in this kernel, and so the only one counted.
         // The budget is tested once per 256-byte block rather than once per
@@ -866,24 +904,28 @@ static inline avx512_guarded_result avx512_naive_search256_guarded(
         size_t j = 4;
         for (; j < m; ++j) {
             if ((fA | fB | fC | fD) == 0) break;
-            __m512i pj = _mm512_set1_epi8((char)pattern[j]);
-            fA = _mm512_mask_cmpeq_epi8_mask(fA, _mm512_loadu_si512((const void*)(text + i + j +   0)), pj);
-            fB = _mm512_mask_cmpeq_epi8_mask(fB, _mm512_loadu_si512((const void*)(text + i + j +  64)), pj);
-            fC = _mm512_mask_cmpeq_epi8_mask(fC, _mm512_loadu_si512((const void*)(text + i + j + 128)), pj);
-            fD = _mm512_mask_cmpeq_epi8_mask(fD, _mm512_loadu_si512((const void*)(text + i + j + 192)), pj);
+            const __m512i pj = _mm512_set1_epi8((char)pattern[j]);
+            fA = _mm512_mask_cmpeq_epi8_mask(fA, _mm512_loadu_si512((const void*)(text+i+j+  0)), pj);
+            fB = _mm512_mask_cmpeq_epi8_mask(fB, _mm512_loadu_si512((const void*)(text+i+j+ 64)), pj);
+            fC = _mm512_mask_cmpeq_epi8_mask(fC, _mm512_loadu_si512((const void*)(text+i+j+128)), pj);
+            fD = _mm512_mask_cmpeq_epi8_mask(fD, _mm512_loadu_si512((const void*)(text+i+j+192)), pj);
         }
         rounds += j - 4;
         if (rounds > budget_rounds) return {false, 0, true, i};
 
-        if ((fA | fB | fC | fD) == 0) continue;
-        if (fA != 0) return {true, i +   0 + (size_t)__builtin_ctzll(fA), false, 0};
-        if (fB != 0) return {true, i +  64 + (size_t)__builtin_ctzll(fB), false, 0};
-        if (fC != 0) return {true, i + 128 + (size_t)__builtin_ctzll(fC), false, 0};
-        return {true, i + 192 + (size_t)__builtin_ctzll(fD), false, 0};
+        if (fA) return {true, i +   0 + (size_t)__builtin_ctzll(fA), false, 0};
+        if (fB) return {true, i +  64 + (size_t)__builtin_ctzll(fB), false, 0};
+        if (fC) return {true, i + 128 + (size_t)__builtin_ctzll(fC), false, 0};
+        if (fD) return {true, i + 192 + (size_t)__builtin_ctzll(fD), false, 0};
     }
+#undef AVX512_CHUNK
 
-    for (; i + m <= n; ++i) {
-        if (std::memcmp(text + i, pattern, m) == 0) return {true, i, false, 0};
+    // Remainder: fewer than m + 255 bytes left, so the narrowing the 64-byte
+    // kernel may do there is bounded by a constant independent of n. Uncounted
+    // for the same reason the m < 4 case is.
+    if (i + m <= n) {
+        auto r = avx512_naive_search_v3_body(text + i, n - i, pattern, m);
+        if (r.first) return {true, i + r.second, false, 0};
     }
     return {false, 0, false, 0};
 }
@@ -955,12 +997,12 @@ static inline std::pair<bool, size_t> avx512_needle_hammer_guarded_t(
     // number of window positions is O(m) rather than O(n), so its total work is
     // already bounded independently of the haystack length.
     if (n < kMinWide || n < m + 255) {
-        return avx512_naive_search(text, n, pattern, m);
+        return avx512_naive_search_v3_body(text, n, pattern, m);
     }
     // The free case: one comparison against a compile-time constant, then the
     // unguarded kernel. This is the branch the short needles of real workloads
     // take, which is why the guard costs them nothing measurable.
-    if (m <= kFreeBelow) return avx512_naive_search256(text, n, pattern, m);
+    if (m <= kFreeBelow) return avx512_naive_search256_v3_body(text, n, pattern, m);
 
     const size_t budget = (n / BudgetDen) * BudgetNum + 1;
     auto r = avx512_naive_search256_guarded(text, n, pattern, m, budget);
@@ -1006,6 +1048,12 @@ std::pair<bool, size_t> avx512_stringzilla256_find(const char* text, size_t n,
 
     size_t off_first, off_mid, off_last;
     sz_locate_needle_anomalies(pattern, m, off_first, off_mid, off_last);
+    const bool n_fits = (m <= 64);
+    const __mmask64 n_mask = n_fits ? ((m == 64) ? ~(__mmask64)0
+                                                 : (((__mmask64)1 << m) - 1))
+                                    : (__mmask64)0;
+    const __m512i n_vec = n_fits ? _mm512_maskz_loadu_epi8(n_mask, pattern)
+                                 : _mm512_setzero_si512();
     const __m512i first = _mm512_set1_epi8((char)pattern[off_first]);
     const __m512i mid = _mm512_set1_epi8((char)pattern[off_mid]);
     const __m512i last = _mm512_set1_epi8((char)pattern[off_last]);
@@ -1041,7 +1089,15 @@ std::pair<bool, size_t> avx512_stringzilla256_find(const char* text, size_t n,
             __mmask64 mk = masks[k];
             while (mk != 0) {
                 size_t off = i + 64 * k + (size_t)__builtin_ctzll(mk);
-                if (std::memcmp(text + off, pattern, m) == 0) return {true, off};
+                bool eq;
+                if (n_fits) {
+                    eq = _mm512_mask_cmpneq_epi8_mask(
+                             n_mask, _mm512_maskz_loadu_epi8(n_mask, text + off),
+                             n_vec) == 0;
+                } else {
+                    eq = sz_equal_avx512(text + off, pattern, m);
+                }
+                if (eq) return {true, off};
                 mk &= mk - 1;
             }
         }

@@ -47,6 +47,13 @@ static inline void sz_locate_needle_anomalies_t(const char* start, size_t length
             while ((s[vsecond] > 191 || s[vsecond] == s[vthird]) &&
                    (vsecond + 1 < vthird))
                 ++vsecond;
+            // Asymmetric on purpose: the skip loop stops at 191 but the
+            // accept test rejects it, so a needle whose only non-lead candidate
+            // is exactly 0xBF keeps the default anchor. 0xBF is a continuation
+            // byte and the heuristic above says it is a good one, so this is an
+            // off-by-one -- but it is upstream's, and this is a port. Left as
+            // is so the anchors match sz_find byte for byte; it costs at most
+            // one missed anchor improvement and never correctness.
             if (s[vsecond] < 191) second = vsecond;
             else vsecond = second;
             while ((s[vfirst] > 191 || s[vfirst] == s[vsecond] ||

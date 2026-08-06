@@ -1,3 +1,4 @@
+#pragma once
 #include <arm_neon.h>
 #include <algorithm>
 #include <cstddef>
@@ -129,7 +130,8 @@ std::pair<bool, size_t> bmh_search16(const char* text, size_t n, const char* pat
 // return bool and index of first occurrence
 // based on https://onlinelibrary.wiley.com/doi/pdf/10.1002/spe.2511
 std::pair<bool, size_t> neon_naive_search(const char* text, size_t n, const char* pattern, size_t m) {
-    if (m == 0 || n < m) return {false, 0};
+    if (m == 0) return {true, 0};
+    if (n < m) return {false, 0};
     const size_t step = 16;
 
     size_t i = 0;
@@ -205,7 +207,8 @@ std::pair<bool, size_t> neon_naive_search(const char* text, size_t n, const char
 template <typename F>
 void neon_naive_search_all(const char* text, size_t n, const char* pattern,
                            size_t m, F callback) {
-    if (m == 0 || n < m) return;
+    if (m == 0) { callback(0); return; }
+    if (n < m) return;
     const size_t step = 16;
 
     // Visit every set lane in a match vector, lowest index first. The shrn #4
@@ -264,7 +267,8 @@ void neon_naive_search_all(const char* text, size_t n, const char* pattern,
 // four 16-byte chunks (A/B/C/D), so each vdupq_n_u8 broadcast of a pattern
 // byte is reused across four match accumulators instead of one.
 std::pair<bool, size_t> neon_naive_search64(const char* text, size_t n, const char* pattern, size_t m) {
-    if (m == 0 || n < m) return {false, 0};
+    if (m == 0) return {true, 0};
+    if (n < m) return {false, 0};
 
     size_t i = 0;
     // SIMD reads bytes [i, i + 63 + (m - 1)], so require i + m + 63 <= n.
