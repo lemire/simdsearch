@@ -139,17 +139,11 @@ struct Algo {
 static const std::vector<Algo> kAlgos = {
     {"find_classic", Kind::Stateless, classic_find},
 #if defined(SIMDSEARCH_AVX512)
-    // BASELINE ROWS, NOT THE SHIPPING KERNELS. find_avx512 and find_avx512_256
-    // are the single-window and wide-stride kernels in their straightforward
-    // form: one serial mask chain, no single-survivor fast path, a scalar tail.
-    // They are kept so the cost of those three choices can be read directly off
-    // the difference against the _v3 rows below, which ARE what Needle-Hammer
-    // dispatches to. Do not quote find_avx512* as the performance of this work.
+    // Needle-Hammer's two component kernels: the single-window one and the
+    // wide-stride one it dispatches to. These are the kernels, not variants of
+    // them.
     {"find_avx512", Kind::Stateless, avx512_naive_search},
     {"find_avx512_256", Kind::Stateless, avx512_naive_search256},
-    // The shipping kernels.
-    {"find_avx512_v3", Kind::Stateless, avx512_naive_search_v3},
-    {"find_avx512_256_v3", Kind::Stateless, avx512_naive_search256_v3},
     {"find_avx512_stringzilla", Kind::Stateless, avx512_stringzilla_find},
     // Same kernel, upstream's UTF-8 lead-byte anchor rule enabled. Off by
     // default in the kernel; carried here so its cost can be measured.

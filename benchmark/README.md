@@ -92,16 +92,18 @@ ctest --test-dir build --output-on-failure
 GB/s of haystack scanned, higher is better):
 
 ```
-find_classic                  2.534 GB/s
-find_avx512                   8.936 GB/s
-find_avx512_stringzilla       9.392 GB/s
-find_strstr                   7.632 GB/s
-find_bmh                      0.833 GB/s
+find_classic                  2.537 GB/s
+find_avx512                   7.767 GB/s
+find_avx512_256               8.270 GB/s
+find_avx512_needle_hammer     8.243 GB/s
+find_avx512_stringzilla       8.610 GB/s
+find_strstr                   7.683 GB/s
+find_bmh                      0.835 GB/s
 ```
 
 ## Needle-hammer: wide-stride below a needle-length threshold, anchored above
 
-`find_avx512_needle_hammer` runs `avx512_naive_search256` for needles up to 256
+`find_avx512_needle_hammer` runs `avx512_naive_search256` for needles up to 512
 bytes and `avx512_stringzilla_find` above that. The two kernels fail in opposite
 directions, and the threshold picks whichever failure is cheaper:
 
