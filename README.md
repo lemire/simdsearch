@@ -6,8 +6,7 @@ Benchmarks and reference kernels for SIMD substring search.
 
 **An x86-64 processor with AVX-512, specifically AVX-512F and AVX-512BW, running
 Linux with GCC 14 or newer.** That is the only supported configuration: it is
-what Needle-Hammer is designed for, what the switch points are fitted to, and
-what every published number was measured on.
+what Needle-Hammer is designed for and what the switch points are fitted to.
 
 Nothing else is supported. The AVX2 and SSE2 builds exist to demonstrate that the
 threshold belongs to the register width rather than to the scheme, not as
@@ -15,7 +14,7 @@ deployment targets. `neonsearch.h` is a set of ARM NEON reference kernels used
 for cross-architecture comparison; there is no NEON Needle-Hammer, no NEON
 guarded searcher, and the NEON kernels are not tuned, not fitted, and not
 recommended for use. Builds on non-AVX-512 hardware will compile and run, but the
-scheme they exercise is not the one this work is about.
+scheme they exercise is not the one these kernels are built around.
 
 ## What is here
 
@@ -51,4 +50,4 @@ that exceeds a budget proportional to the haystack, which bounds the worst case
 without a needle-length argument. `benchmark/README.md` explains how the switch
 point is chosen: the two criteria that bear on it, worst-case robustness and
 benign throughput, disagree between Intel and AMD, so it minimises regret across
-the fleet rather than being optimal on any one machine.
+a range of parts rather than being optimal on any one machine.

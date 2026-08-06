@@ -21,8 +21,8 @@
 // rather than tuned for one encoding. The rule helps only where lead bytes are
 // both frequent and drawn from a tiny set of values -- measurably on Cyrillic
 // UTF-8, where nearly every lead byte is 0xD0 or 0xD1, and not detectably
-// anywhere else we tested. Both settings are benchmarked; the paper reports the
-// difference.
+// anywhere else tested. Both settings are benchmarked, so the difference can be
+// measured on whatever corpus you care about.
 template <bool FilterHighBytes = false>
 static inline void sz_locate_needle_anomalies_t(const char* start, size_t length,
                                                 size_t& first, size_t& second,

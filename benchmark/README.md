@@ -106,9 +106,9 @@ Above that floor the choice is purely benign, and there the vendors pull apart:
 the anchored kernel is far weaker relative to the wide one on AMD than on Intel,
 so Intel wants a small threshold and AMD a large one, and no single constant is
 optimal for both. The shipped 512 is the value that clears the robustness floor
-and minimises worst-case regret across the machines we measured -- deliberately
-not the optimum for any one of them. Re-derive it on new hardware with the
-`thresholds` mode rather than trusting it.
+and minimises worst-case regret across a range of Intel and AMD parts --
+deliberately not the optimum for any one of them. Re-derive it on new hardware
+with the `thresholds` mode rather than trusting it.
 
 Needle-hammer also carries a **short-haystack guard** (`n < 1024` uses the
 64-byte kernel). The wide kernel builds four chunk masks and only then scans
@@ -196,13 +196,12 @@ code for the guarded one -- enough to swamp the guard's actual cost. A single
 instantiation makes guarded and unguarded comparable by construction rather than
 by coincidence.
 
-## Where the measurements are
+## Results are not checked in
 
-This repository is the benchmark harness, not the results. Numbers depend on the
-processor, the libc, the compiler and the corpus, so quoting any here would date
-the file and invite comparison across machines that were never comparable. Run
-the modes above on the hardware you care about. The published measurements and
-the analysis behind the constants chosen here are in the accompanying paper.
+This is the harness, not the results. Numbers depend on the processor, the libc,
+the compiler and the corpus, so quoting any here would date the file and invite
+comparison across machines that were never comparable. Run the modes above on the
+hardware you care about and read your own numbers.
 
 ## Capping the needle count: `--needles`
 
