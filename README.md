@@ -22,12 +22,13 @@ scheme they exercise is not the one these kernels are built around.
   length-dispatched **Needle-Hammer** scheme, plus 256-bit (AVX2) and 128-bit
   (SSE2) builds of the same kernels over a traits struct, so one x86 binary
   measures all three register widths.
-- `benchmark/include/neonsearch.h` — ARM NEON kernels, unsupported (see below).
+- `benchmark/include/neonsearch.h` — ARM NEON kernels, unsupported (see
+  Requirements above).
 - `benchmark/benchmarks/benchmark.cpp` — the driver. Modes: `synthetic`,
   `horspool`, `ashvardanian` (find-all), `worstcase`, `findall`.
 - `benchmark/tests/` — validation against `std::string::find` across the
   needle- and haystack-length boundaries of every kernel.
-- `benchmark/README.md` — the detailed measurements and design notes.
+- `benchmark/README.md` — the algorithm list, build options and test notes.
 
 ## Build and run
 
@@ -37,17 +38,3 @@ cmake --build benchmark/build -j
 benchmark/build/benchmark horspool benchmark/data/43-0.txt
 benchmark/build/test_search        # validation
 ```
-
-## The scheme in one paragraph
-
-`find_avx512_needle_hammer` dispatches on the needle length: a wide-stride
-kernel that filters on the needle's first four bytes and narrows a mask over a
-256-byte block for `m <= 512`, and a port of StringZilla's three-anchor
-`sz_find` above that, with a guard routing short haystacks to a 64-byte kernel.
-`find_avx512_needle_hammer_guarded` adds a work counter: it measures the work a
-*failing* filter causes and hands the remainder to Crochemore-Perrin two-way once
-that exceeds a budget proportional to the haystack, which bounds the worst case
-without a needle-length argument. `benchmark/README.md` explains how the switch
-point is chosen: the two criteria that bear on it, worst-case robustness and
-benign throughput, disagree between Intel and AMD, so it minimises regret across
-a range of parts rather than being optimal on any one machine.

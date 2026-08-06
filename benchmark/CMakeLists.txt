@@ -35,18 +35,9 @@ target_include_directories(benchmark PRIVATE benchmarks include)
 target_compile_options(benchmark PRIVATE ${SIMDSEARCH_ARCH_FLAGS})
 target_link_libraries(benchmark PRIVATE counters)
 
-# Glob ("stringmatchlen") pattern-matching benchmark: Redis baseline vs barch's
-# memchr/memmem-accelerated matcher.
-add_executable(glob_benchmark benchmarks/glob_benchmark.cpp)
-target_include_directories(glob_benchmark PRIVATE benchmarks include)
-target_link_libraries(glob_benchmark PRIVATE counters)
-
 enable_testing()
 add_executable(test_search tests/test_search.cpp)
 target_include_directories(test_search PRIVATE include)
 target_compile_options(test_search PRIVATE ${SIMDSEARCH_ARCH_FLAGS})
 add_test(NAME test_search COMMAND test_search)
 
-add_executable(test_glob tests/test_glob.cpp)
-target_include_directories(test_glob PRIVATE include)
-add_test(NAME test_glob COMMAND test_glob)
