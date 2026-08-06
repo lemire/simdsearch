@@ -149,12 +149,12 @@ std::pair<bool, size_t> neon_naive_search(const char* text, size_t n, const char
                 uint8x16_t p3 = vdupq_n_u8((uint8_t)pattern[3]);
                 found = vandq_u8(found, vceqq_u8(vld1q_u8((const uint8_t*)(text + i + 3)), p3));
                 for (size_t j = 4; j < m; ++j) {
-                    if (vmaxvq_u32(found) == 0) break;
+                    if (vmaxvq_u32(vreinterpretq_u32_u8(found)) == 0) break;
                     uint8x16_t tj = vld1q_u8((const uint8_t*)(text + i + j));
                     uint8x16_t pj = vdupq_n_u8((uint8_t)pattern[j]);
                     found = vandq_u8(found, vceqq_u8(tj, pj));
                 }
-                if (vmaxvq_u32(found) == 0) continue;
+                if (vmaxvq_u32(vreinterpretq_u32_u8(found)) == 0) continue;
 
                 uint8x8_t nibble_mask = vshrn_n_u16(vreinterpretq_u16_u8(found), 4);
                 uint64_t mask = vget_lane_u64(vreinterpret_u64_u8(nibble_mask), 0);
@@ -168,12 +168,12 @@ std::pair<bool, size_t> neon_naive_search(const char* text, size_t n, const char
                 uint8x16_t p0 = vdupq_n_u8((uint8_t)pattern[0]);
                 uint8x16_t found = vceqq_u8(t0, p0);
                 for (size_t j = 1; j < m; ++j) {
-                    if (vmaxvq_u32(found) == 0) break;
+                    if (vmaxvq_u32(vreinterpretq_u32_u8(found)) == 0) break;
                     uint8x16_t tj = vld1q_u8((const uint8_t*)(text + i + j));
                     uint8x16_t pj = vdupq_n_u8((uint8_t)pattern[j]);
                     found = vandq_u8(found, vceqq_u8(tj, pj));
                 }
-                if (vmaxvq_u32(found) == 0) continue;
+                if (vmaxvq_u32(vreinterpretq_u32_u8(found)) == 0) continue;
 
 
                 uint8x8_t nibble_mask = vshrn_n_u16(vreinterpretq_u16_u8(found), 4);
@@ -300,7 +300,7 @@ std::pair<bool, size_t> neon_naive_search64(const char* text, size_t n, const ch
 
             for (size_t j = 4; j < m; ++j) {
                 uint8x16_t any = vorrq_u8(vorrq_u8(fA, fB), vorrq_u8(fC, fD));
-                if (vmaxvq_u32(any) == 0) break;
+                if (vmaxvq_u32(vreinterpretq_u32_u8(any)) == 0) break;
                 uint8x16_t pj = vdupq_n_u8((uint8_t)pattern[j]);
                 fA = vandq_u8(fA, vceqq_u8(vld1q_u8((const uint8_t*)(text + i + j +  0)), pj));
                 fB = vandq_u8(fB, vceqq_u8(vld1q_u8((const uint8_t*)(text + i + j + 16)), pj));
@@ -309,20 +309,20 @@ std::pair<bool, size_t> neon_naive_search64(const char* text, size_t n, const ch
             }
 
             uint8x16_t any = vorrq_u8(vorrq_u8(fA, fB), vorrq_u8(fC, fD));
-            if (vmaxvq_u32(any) == 0) continue;
+            if (vmaxvq_u32(vreinterpretq_u32_u8(any)) == 0) continue;
 
             // Walk lanes in order so we return the lowest-index match.
-            if (vmaxvq_u32(fA) != 0) {
+            if (vmaxvq_u32(vreinterpretq_u32_u8(fA)) != 0) {
                 uint8x8_t nm = vshrn_n_u16(vreinterpretq_u16_u8(fA), 4);
                 uint64_t mask = vget_lane_u64(vreinterpret_u64_u8(nm), 0);
                 return {true, i + (__builtin_ctzll(mask) >> 2)};
             }
-            if (vmaxvq_u32(fB) != 0) {
+            if (vmaxvq_u32(vreinterpretq_u32_u8(fB)) != 0) {
                 uint8x8_t nm = vshrn_n_u16(vreinterpretq_u16_u8(fB), 4);
                 uint64_t mask = vget_lane_u64(vreinterpret_u64_u8(nm), 0);
                 return {true, i + 16 + (__builtin_ctzll(mask) >> 2)};
             }
-            if (vmaxvq_u32(fC) != 0) {
+            if (vmaxvq_u32(vreinterpretq_u32_u8(fC)) != 0) {
                 uint8x8_t nm = vshrn_n_u16(vreinterpretq_u16_u8(fC), 4);
                 uint64_t mask = vget_lane_u64(vreinterpret_u64_u8(nm), 0);
                 return {true, i + 32 + (__builtin_ctzll(mask) >> 2)};
