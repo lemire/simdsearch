@@ -10,6 +10,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <random>
 #include <string>
 #include <string_view>
@@ -47,19 +48,27 @@ static size_t g_checks = 0;
 // string_view::find(""), which is {true, 0} for any haystack including an empty
 // one. It is the one convention every kernel has to special-case by hand, so it
 // is exactly the kind of thing that drifts.
-static void check(const NamedFn &nf, const std::string &text,
-                  const std::string &pat) {
-  auto [rf, ri] = reference(text.data(), text.size(), pat.data(), pat.size());
-  auto [gf, gi] = nf.fn(text.data(), text.size(), pat.data(), pat.size());
+//
+// Overloads take either std::string or raw (ptr, len) so alignment tests can
+// pass a crafted misaligned pointer without copying into a fresh allocation.
+static void check(const NamedFn &nf, const char *text, size_t n,
+                  const char *pat, size_t m) {
+  auto [rf, ri] = reference(text, n, pat, m);
+  auto [gf, gi] = nf.fn(text, n, pat, m);
   ++g_checks;
   if (gf != rf || (rf && gi != ri)) {
     if (g_failures < 20) {
       std::printf(
           "MISMATCH %-26s text_len=%zu pat_len=%zu got={%d,%zu} ref={%d,%zu}\n",
-          nf.name, text.size(), pat.size(), (int)gf, gi, (int)rf, ri);
+          nf.name, n, m, (int)gf, gi, (int)rf, ri);
     }
     ++g_failures;
   }
+}
+
+static void check(const NamedFn &nf, const std::string &text,
+                  const std::string &pat) {
+  check(nf, text.data(), text.size(), pat.data(), pat.size());
 }
 
 int main() {
@@ -280,7 +289,9 @@ int main() {
   // path taken only when the buffer is misaligned, and a std::string happens to
   // land wherever the allocator puts it, so the fuzz sweep above exercises one
   // arbitrary alignment rather than all of them. Here we place the same text at
-  // every offset in a 64-byte window and check each one.
+  // every offset in a 64-byte window and call the kernels on that pointer
+  // directly -- copying into std::string would re-allocate and lose the
+  // crafted misalignment.
   {
     std::vector<char> raw(4096 + 128);
     char *page = raw.data() + (64 - (reinterpret_cast<uintptr_t>(raw.data()) & 63));
@@ -290,18 +301,16 @@ int main() {
       char *hay = page + off;
       const size_t hlen = 2048;
       for (size_t i = 0; i < hlen; ++i) hay[i] = alpha[g() % 3];
-      std::string text(hay, hlen);
       for (size_t plen : {4u, 5u, 8u, 17u, 64u, 100u}) {
         // present, at a position that straddles the alignment head
         for (size_t at : {size_t(0), size_t(1), size_t(37), size_t(63), size_t(64),
                           size_t(300)}) {
           if (at + plen > hlen) continue;
-          std::string pat(hay + at, plen);
-          for (auto &fn : fns) check(fn, text, pat);
+          for (auto &fn : fns) check(fn, hay, hlen, hay + at, plen);
         }
         // absent
         std::string absent(plen, 'z');
-        for (auto &fn : fns) check(fn, text, absent);
+        for (auto &fn : fns) check(fn, hay, hlen, absent.data(), absent.size());
       }
     }
   }
@@ -311,6 +320,67 @@ int main() {
     for (auto &fn : fns) check(fn, std::string(t), std::string());
 
 #if defined(SIMDSEARCH_AVX512)
+  // ---- Find-all enumerator (avx512_naive_search_all) ---------------------
+  //
+  // Overlapping occurrences, short needles, and empty-needle convention must
+  // agree with a pos+1 walk of the first-match kernel. ctest only runs this
+  // file; findall benchmark mode is optional and easy to skip.
+  {
+    auto ref_findall = [](const char *t, size_t n, const char *p, size_t m) {
+      std::vector<size_t> idx;
+      if (m == 0) {
+        for (size_t i = 0; i <= n; ++i) idx.push_back(i);
+        return idx;
+      }
+      size_t pos = 0;
+      while (pos + m <= n) {
+        auto [f, i] = reference(t + pos, n - pos, p, m);
+        if (!f) break;
+        idx.push_back(pos + i);
+        pos += i + 1;
+      }
+      return idx;
+    };
+    auto check_all = [&](const char *t, size_t n, const char *p, size_t m) {
+      std::vector<size_t> got;
+      avx512_naive_search_all(t, n, p, m, [&](size_t i) { got.push_back(i); });
+      auto exp = ref_findall(t, n, p, m);
+      ++g_checks;
+      if (got != exp) {
+        if (g_failures < 20) {
+          std::printf("MISMATCH avx512_naive_search_all text_len=%zu pat_len=%zu "
+                      "got %zu hits ref %zu hits\n",
+                      n, m, got.size(), exp.size());
+        }
+        ++g_failures;
+      }
+    };
+
+    // Dense small-alphabet: many overlapping matches.
+    {
+      std::string t(200, 'a');
+      for (size_t m : {1u, 2u, 3u, 4u, 5u, 8u, 17u, 64u}) {
+        std::string p(m, 'a');
+        check_all(t.data(), t.size(), p.data(), p.size());
+      }
+      std::string miss(4, 'b');
+      check_all(t.data(), t.size(), miss.data(), miss.size());
+    }
+    // Pattern placed near SIMD block tails and remainder.
+    {
+      std::string t(130, 'x');
+      t.replace(60, 4, "abcd");
+      t.replace(120, 4, "abcd");
+      check_all(t.data(), t.size(), "abcd", 4);
+      check_all(t.data(), t.size(), "ab", 2);
+      check_all(t.data(), t.size(), "x", 1);
+    }
+    // Empty needle: indices 0..n (n+1 matches), matching the first-match loop
+    // baseline (advance one byte after each {true, 0}).
+    for (const char *s : {"", "a", "abc"})
+      check_all(s, std::strlen(s), "", 0);
+  }
+
   // ---- Budget exhausted, then two-way finds the match --------------------
   //
   // The fuzz sweep above can only reach the give-up path by accident, and on

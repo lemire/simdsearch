@@ -6,7 +6,7 @@ is (a) LLC-resident on every machine we test and (b) Latin-1-ish text with the
 byte-frequency skew that anchor-and-verify filters like best. Neither property is
 universal, so this script materialises two extra axes.
 
-*Diversity* (`corpora/<name>.dat`, ~4 MB each). Low-entropy and non-Latin inputs
+*Diversity* (`corpora/<name>.dat`, ~1 MB each). Low-entropy and non-Latin inputs
 are not adversaries -- they are ordinary production workloads that happen to have
 the byte-frequency structure the anchored filter depends on:
 
@@ -32,7 +32,7 @@ Real text is fetched from Project Gutenberg when a network is available and
 regenerated deterministically otherwise; every synthetic corpus is seeded, so
 runs are reproducible. Usage:
 
-    python3 bench/corpora.py --out corpora [--sizes] [--max-size 1G]
+    python3 benchmark/tools/corpora.py --out corpora [--sizes] [--max-size 1G]
 """
 import argparse
 import os
@@ -300,14 +300,17 @@ def main():
     os.makedirs(a.out, exist_ok=True)
     bookpath = a.book
     if not bookpath:
-        for cand in (os.path.join(ROOT, "..", "simdsearch",
-                                  "benchmark/data/43-0.txt"),
-                     os.path.join(ROOT, "bench/data/43-0.txt")):
+        for cand in (
+            os.path.join(ROOT, "benchmark", "data", "43-0.txt"),
+            os.path.join(HERE, "..", "data", "43-0.txt"),
+            os.path.join(ROOT, "..", "simdsearch", "benchmark", "data",
+                         "43-0.txt"),
+        ):
             if os.path.exists(cand):
                 bookpath = cand
                 break
     if not bookpath or not os.path.exists(bookpath):
-        sys.exit("could not find the baseline text; pass --book <path to 43-0.txt>")
+        sys.exit("could not find the baseline text; pass --book <path to 43-0.txt")
     book = open(bookpath, "rb").read()
     print(f"baseline text: {bookpath} ({len(book)} bytes)")
 

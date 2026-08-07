@@ -407,7 +407,14 @@ std::pair<bool, size_t> avx512_naive_search256(const char* text, size_t n,
 template <typename F>
 void avx512_naive_search_all(const char* text, size_t n, const char* pattern,
                              size_t m, F callback) {
-    if (m == 0 || n < m) return;
+    // Empty needle: match at every index in [0, n], matching the first-match
+    // loop baseline (returns {true, 0} then advances one byte). Unsupported to
+    // leave undefined -- callers comparing loop vs block would disagree.
+    if (m == 0) {
+        for (size_t i = 0; i <= n; ++i) callback(i);
+        return;
+    }
+    if (n < m) return;
 
     size_t i = 0;
     // SIMD chunk reads bytes [i, i + 63 + (m - 1)], so require i + m + 63 <= n.
@@ -660,25 +667,26 @@ std::pair<bool, size_t> avx512_stringzilla_find_hifilter(const char* haystack,
 // chunk has a hit. On a small haystack the match tends to arrive early relative
 // to 256 bytes, so that block granularity costs up to 4x the compare work for
 // nothing. Below kMinWide the 64-byte kernel is therefore the better lower half.
-// On a 1 KB haystack (synthetic mode) the guard is worth several times the
-// unguarded cost, bringing the scheme level with the single-window kernel it
-// dispatches to. A larger cutoff measures the
-// same, so take the smaller.
+// On a ~1 KB haystack the guard is worth several times the unguarded cost,
+// bringing the scheme level with the single-window kernel it dispatches to. A
+// larger cutoff measures the same, so take the smaller.
 //
 // The second condition is the narrower structural one: the wide loop only runs
-// while i + m + 255 <= n, and anything it cannot cover drops to a scalar memcmp
+// while i + m + 255 <= n, and anything it cannot cover falls through to
+// avx512_naive_search_body (SIMD masked 64-byte windows), not a scalar memcmp
 // loop. It matters only for needles too long for kMinWide to already catch.
 template <size_t Threshold>
 static inline std::pair<bool, size_t> avx512_needle_hammer_t(const char* text, size_t n,
                                                            const char* pattern, size_t m) {
     // 1024, not the 2048 the narrow widths use. The guard existed because the
     // wide kernel collapsed on small haystacks -- its 256-byte loop left up to
-    // 255 positions to a scalar memcmp. That tail is gone here and the kernel
-    // now falls through to the 64-byte path below m + 255, so it degenerates to
+    // 255 positions on a slow tail. That tail is gone here and the kernel now
+    // falls through to the 64-byte SIMD path below m + 255, so it degenerates to
     // the single-window kernel rather than degrading. Measured across the fleet
     // the wide kernel is at least as good from 1024 bytes up; only at 512 do the
     // two AMD parts still prefer single. The narrow widths keep 2048 because
-    // their kernels still have the scalar tail this value was chosen to avoid.
+    // their kernels still have a scalar memcmp tail this value was chosen to
+    // avoid.
     constexpr size_t kMinWide = 1024;
     if (m > Threshold) return avx512_stringzilla_find(text, n, pattern, m);
     if (n < kMinWide || n < m + 255) return avx512_naive_search_body(text, n, pattern, m);
@@ -974,8 +982,9 @@ static inline std::pair<bool, size_t> avx512_needle_hammer_guarded_t(
     return resume_twoway(text, n, pattern, m, r.resume);
 }
 
-// The recommended configuration: the same 256-byte switch point as
-// avx512_needle_hammer, with a budget of n/8 narrowing rounds.
+// The recommended configuration: the same 512-byte needle-length switch point
+// as avx512_needle_hammer (the 256-byte figure is the wide stride, not the
+// threshold), with a budget of n/8 narrowing rounds.
 std::pair<bool, size_t> avx512_needle_hammer_guarded(const char* t, size_t n,
                                                     const char* p, size_t m)
     { return avx512_needle_hammer_guarded_t<512, 1, 8>(t, n, p, m); }
@@ -1394,12 +1403,13 @@ static inline std::pair<bool, size_t> x86_stringzilla_find_t(const char* text, s
 //
 // It is an absolute byte count, not a multiple of the block size. Scaling it
 // per width (8 blocks: 2048 / 1024 / 512) was the obvious guess and it measured
-// wrong -- on the 1 KB haystack of `synthetic` the wide kernel loses at every
-// width, at both narrower widths,
-// so the cutoff has to sit above 1024 everywhere. The scaled rule put it at
-// 1024 and 512, i.e. exactly below the haystack, and both narrow hammers took
-// the wide path and lost. 2048 is the value measured for AVX-512 and it is the
-// right side of that boundary for all three widths.
+// wrong -- on a ~1 KB haystack the wide kernel loses at every width, at both
+// narrower widths, so the cutoff has to sit above 1024 everywhere. The scaled
+// rule put it at 1024 and 512, i.e. exactly below that short-haystack size, and
+// both narrow hammers took the wide path and lost. 2048 is the value measured
+// for AVX-512 and it is the right side of that boundary for all three widths.
+// (Synthetic mode now uses a 64 KiB haystack so the wide path is measured; this
+// MinWide value is still about short-haystack behaviour, not that workload.)
 template <class Ops, size_t Threshold, size_t MinWide = 2048>
 static inline std::pair<bool, size_t> x86_needle_hammer_t(const char* text, size_t n,
                                                           const char* pattern, size_t m) {
@@ -1417,9 +1427,9 @@ std::pair<bool, size_t> avx256_naive_search128(const char* t, size_t n, const ch
     { return x86_naive_search_wide_t<x86_ops256>(t, n, p, m); }
 std::pair<bool, size_t> avx256_stringzilla_find(const char* t, size_t n, const char* p, size_t m)
     { return x86_stringzilla_find_t<x86_ops256>(t, n, p, m); }
-// Switching at 3072, not at AVX-512's 128: the threshold belongs to the width,
-// not to the scheme. See the note above the SSE2 export for the measurements
-// and for why the narrow widths are chosen on benign data alone.
+// Switching at 3072, not at AVX-512's shipped 512: the threshold belongs to the
+// width, not to the scheme. See the note above the SSE2 export for the
+// measurements and for why the narrow widths are chosen on benign data alone.
 std::pair<bool, size_t> avx256_needle_hammer(const char* t, size_t n, const char* p, size_t m)
     { return x86_needle_hammer_t<x86_ops256, 3072>(t, n, p, m); }
 // Other switch points, so the crossover stays measurable at this width too.
@@ -1438,8 +1448,8 @@ std::pair<bool, size_t> avx128_naive_search64(const char* t, size_t n, const cha
 std::pair<bool, size_t> avx128_stringzilla_find(const char* t, size_t n, const char* p, size_t m)
     { return x86_stringzilla_find_t<x86_ops128>(t, n, p, m); }
 // Switching at 8192. The crossover moves out sharply as the register narrows --
-// 128 bytes at 512-bit, ~3K at 256-bit, ~8K at 128-bit -- because the anchored
-// kernel filters only W candidate positions per window for a fixed three loads,
+// 512 bytes at 512-bit (shipped), ~3K at 256-bit, ~8K at 128-bit -- because the
+// anchored kernel filters only W candidate positions per window for a fixed three loads,
 // three movemask round-trips through a GPR and two early-out branches, so its
 // per-position overhead grows as the width shrinks while the naive wide kernel
 // pays no such fixed cost. Unlike the AVX-512 kernel, these two thresholds are set by benign data alone,

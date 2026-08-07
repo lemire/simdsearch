@@ -44,7 +44,7 @@ several times slower than the SIMD kernels on ordinary text, which is the trade.
 ```
 cmake -B build
 cmake --build build
-./build/benchmark <mode>      # synthetic | horspool | ashvardanian
+./build/benchmark <mode>      # synthetic | horspool | ashvardanian | worstcase | findall
 ```
 
 On x86-64 the build enables `-mavx512f -mavx512bw -mavx512vl -mavx512dq`
@@ -54,11 +54,24 @@ automatically. Override the SIMD flags if needed, e.g. `-march=native`:
 cmake -B build -DSIMDSEARCH_ARCH_FLAGS="-march=native"
 ```
 
+Modes:
+
+- `synthetic` — random 64 KiB haystack, 100k short needles (first-occurrence)
+- `horspool` — random substrings of a source text (optional datafile)
+- `ashvardanian` — StringWars-style find-all over a datafile (default
+  `./data/43-0.txt` when cwd is `benchmark/`; pass an explicit path from the
+  repo root)
+- `worstcase` — adversarial haystack/needle shapes
+- `findall` — overlapping find-all: first-match loop vs block enumerator
+
+Synthetic and horspool draws use a fixed RNG seed (override with `--seed`).
+
 ## Tests
 
 Correctness tests cross-check every searcher against `std::string::find` over
 deterministic edge cases (alignment boundaries, all-equal runs, found/missing,
-needle == haystack) plus a seeded randomized fuzz sweep:
+needle == haystack), the find-all enumerator, plus a seeded randomized fuzz
+sweep:
 
 ```
 ctest --test-dir build --output-on-failure

@@ -42,9 +42,21 @@ double pretty_print(const std::string &name, size_t num_values,
   return double(num_values) / agg.fastest_elapsed_ns();
 }
 
+// Fixed default seed so horspool/synthetic timings are reproducible across runs.
+// Override with --seed N. Salted streams keep generators independent of each
+// other while still fully determined by the seed.
+static uint64_t g_rng_seed = 0xC0FFEE42ull;
+
+static std::mt19937 make_bench_rng(uint64_t salt) {
+  std::seed_seq seq{static_cast<uint32_t>(g_rng_seed),
+                    static_cast<uint32_t>(g_rng_seed >> 32),
+                    static_cast<uint32_t>(salt),
+                    static_cast<uint32_t>(salt >> 32)};
+  return std::mt19937(seq);
+}
+
 std::string generate_random_string(size_t size = 4096) {
-    // Use a high-quality random number generator
-    static std::mt19937 gen(std::random_device{}());
+    std::mt19937 gen = make_bench_rng(0xA11CEull);
 
     // Printable ASCII characters: space to '~'
     static const std::string chars =
@@ -73,7 +85,7 @@ std::vector<std::string> extract_random_substrings(
         return {};
     }
 
-    static std::mt19937 gen(std::random_device{}());
+    std::mt19937 gen = make_bench_rng(0xBEEFull);
 
     std::uniform_int_distribution<size_t> length_dist(min_len, max_len);
 
@@ -302,10 +314,12 @@ static bool needs_amort(const std::vector<const Algo *> &algos) {
 
 // Count all non-overlapping occurrences of needle #id in haystack by repeatedly
 // searching the remaining suffix and advancing past each match (StringWars'
-// forward find-all loop).
+// forward find-all loop). Empty needles are undefined for non-overlapping
+// advance (m == 0 never moves pos); report zero rather than spin forever.
 static size_t count_all(const Algo &a, const AmortState &am, size_t id,
                         const std::string &hay, const std::string &needle) {
   size_t pos = 0, cnt = 0, m = needle.size();
+  if (m == 0) return 0;
   while (pos + m <= hay.size()) {
     auto [f, idx] = do_find(a, am, id, hay.data() + pos, hay.size() - pos,
                             needle.data(), m);
@@ -342,8 +356,9 @@ std::vector<std::string> tokenize_words(const std::string &s) {
   return out;
 }
 
-// Synthetic mode: random 1KB text, many short random needles, first-occurrence
-// search timed per needle.
+// Synthetic mode: random text, many short random needles, first-occurrence
+// search timed per needle. Default haystack is large enough that Needle-Hammer's
+// 256-byte-stride body actually runs (n >= 1024 and n >= m + 255).
 void collect_benchmark_results(size_t input_size, size_t number_strings,
                                const std::vector<const Algo *> &algos) {
   std::string source = generate_random_string(input_size);
@@ -419,7 +434,7 @@ void horspool_benchmark(const std::string &text, const std::string &source_desc,
                         const std::vector<size_t> &requested_lengths,
                         const std::vector<const Algo *> &algos,
                         size_t patterns_override = 0) {
-  static std::mt19937 gen(std::random_device{}());
+  std::mt19937 gen = make_bench_rng(0xA0B5E00Dull);
   const size_t patterns_per_len = patterns_override ? patterns_override : 2000;
   volatile uint64_t sink = 0;
 
@@ -882,8 +897,10 @@ int main(int argc, char **argv) {
     std::vector<size_t> lengths;       // horspool / worstcase only
     std::vector<const Algo *> algos;   // all modes; empty => all
     size_t patterns_per_len_opt = 0;
-  size_t worstcase_size = 1u << 16;  // worstcase only: haystack bytes
-    size_t max_needles = 1000;         // ashvardanian only: needle cap
+    size_t worstcase_size = 1u << 16;  // worstcase / findall default haystack
+    // 0 means "mode default" so synthetic can use 100k without sharing the
+    // ashvardanian 1000 cap.
+    size_t max_needles = 0;
     std::string needle_shape = "tail"; // worstcase only: tail|aba|mid|high
 
     // Helper: value of an option given either as "--opt val" or "--opt=val".
@@ -926,6 +943,8 @@ int main(int argc, char **argv) {
           std::cerr << "--needles must be at least 1\n";
           return 1;
         }
+      } else if (arg == "--seed" || arg.rfind("--seed=", 0) == 0) {
+        g_rng_seed = std::stoull(take_value(arg, k));
       } else if (arg == "--needle" || arg.rfind("--needle=", 0) == 0) {
         needle_shape = take_value(arg, k);
       } else if (arg.rfind("--", 0) == 0) {
@@ -947,7 +966,11 @@ int main(int argc, char **argv) {
                  mode);
 
     if (mode == "synthetic") {
-      collect_benchmark_results(1024, max_needles ? max_needles : 100000, algos);
+      // 64 KiB: well above kMinWide (1024) and m+255 for short needles, so
+      // Needle-Hammer's 256-byte-stride body is actually measured.
+      constexpr size_t kSyntheticHaystack = 1u << 16;
+      collect_benchmark_results(kSyntheticHaystack,
+                                max_needles ? max_needles : 100000, algos);
     } else if (mode == "horspool") {
       if (lengths.empty())
         for (size_t L = 2; L <= 20; ++L) lengths.push_back(L);
@@ -965,7 +988,8 @@ int main(int argc, char **argv) {
                            algos, patterns_per_len_opt);
       }
     } else if (mode == "ashvardanian") {
-      ashvardanian_benchmark(load_file(path), algos, max_needles);
+      ashvardanian_benchmark(load_file(path), algos,
+                             max_needles ? max_needles : 1000);
     } else if (mode == "worstcase") {
       if (lengths.empty())
         for (size_t L : {4u, 8u, 16u, 32u, 64u, 128u, 256u, 512u})
@@ -986,7 +1010,8 @@ int main(int argc, char **argv) {
 
   std::print("usage: {} <mode> [datafile] [options]\n", argv[0]);
   std::print("  modes:\n");
-  std::print("    synthetic     random 1KB text, 100k short needles (original)\n");
+  std::print("    synthetic     random 64 KiB text, 100k short needles "
+             "(wide Needle-Hammer path runs)\n");
   std::print("    horspool      random substrings of a source text, "
              "first-occurrence ns matrix\n");
   std::print("    ashvardanian  StringWars-style forward find-all over the "
@@ -995,11 +1020,15 @@ int main(int argc, char **argv) {
              "(never matches), ns-per-search matrix\n");
   std::print("    findall       enumerate ALL matches: first-match-in-a-loop "
              "vs block-enumerate\n");
-  std::print("  datafile is optional for horspool (random text if omitted); "
-             "ashvardanian defaults to ./data/43-0.txt\n");
+  std::print("  datafile is optional for horspool and findall (random text if "
+             "omitted); ashvardanian\n"
+             "  defaults to ./data/43-0.txt (run from benchmark/ or pass an "
+             "explicit path)\n");
   std::print("\n  options (all modes):\n");
   std::print("    --algos x,y       algorithms to test (default all), by name\n");
   std::print("    --list            list available algorithm names and exit\n");
+  std::print("    --seed N          RNG seed for synthetic/horspool pattern "
+             "draws (default 0xC0FFEE42)\n");
   std::print("\n  horspool:\n");
   std::print("    --patterns N      random patterns per length (default 2000). "
              "Each is validated\n"
@@ -1011,17 +1040,19 @@ int main(int argc, char **argv) {
              "workload: a cell repeats\n"
              "                      until it accumulates a fixed span of "
              "measured time either way.\n");
-  std::print("\n  horspool / worstcase:\n");
-  std::print("    --lengths a,b,c   pattern lengths to test "
-             "(horspool default 2..20, worstcase 2..512)\n");
-  std::print("\n  ashvardanian only:\n");
-  std::print("    --needles N       cap on word-token needles "
-             "(default 1000). Each needle costs a full\n"
-             "                      haystack scan per repetition, so "
-             "lower it to keep large\n"
-             "                      haystacks affordable.\n");
+  std::print("\n  horspool / worstcase / findall:\n");
+  std::print("    --lengths a,b,c   pattern lengths "
+             "(horspool default 2..20; worstcase 4,8,...,512; "
+             "findall 1,2,3,4,6,8,12,16)\n");
+  std::print("\n  synthetic / ashvardanian:\n");
+  std::print("    --needles N       synthetic: number of short needles "
+             "(default 100000);\n"
+             "                      ashvardanian: cap on word-token needles "
+             "(default 1000)\n");
+  std::print("\n  worstcase / findall:\n");
+  std::print("    --size N          haystack size in bytes when no datafile "
+             "(default 65536)\n");
   std::print("\n  worstcase only:\n");
-  std::print("    --size N          haystack size in bytes (default 65536)\n");
   std::print("    --needle shape    tail|aba|mid|high|ab|block (default tail); "
              "'block' (all-'a' needle) is the only shape that defeats "
              "StringZilla\n");

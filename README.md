@@ -19,10 +19,12 @@ deployment targets.
   length-dispatched **Needle-Hammer** scheme, plus 256-bit (AVX2) and 128-bit
   (SSE2) builds of the same kernels over a traits struct, so one x86 binary
   measures all three register widths.
-- `benchmark/benchmarks/benchmark.cpp` — the driver. Modes: `synthetic`,
-  `horspool`, `ashvardanian` (find-all), `worstcase`, `findall`.
+- `benchmark/benchmarks/benchmark.cpp` — the driver. Modes: `synthetic` (64 KiB
+  random text, 100k short needles), `horspool`, `ashvardanian` (find-all),
+  `worstcase`, `findall`.
 - `benchmark/tests/` — validation against `std::string::find` across the
-  needle- and haystack-length boundaries of every kernel.
+  needle- and haystack-length boundaries of every kernel, plus the find-all
+  enumerator and misaligned haystack heads.
 - `benchmark/tools/corpora.py` — builds the eight benchmark datasets (English
   prose, DNA, protein, minified JSON, base64, log lines, C/C++ source, and UTF-8
   Cyrillic and CJK), about 1 MB each, and writes a `MANIFEST.txt` of their
