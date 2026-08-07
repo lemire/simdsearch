@@ -897,7 +897,10 @@ int main(int argc, char **argv) {
     std::vector<size_t> lengths;       // horspool / worstcase only
     std::vector<const Algo *> algos;   // all modes; empty => all
     size_t patterns_per_len_opt = 0;
-    size_t worstcase_size = 1u << 16;  // worstcase / findall default haystack
+    // --size: haystack bytes for synthetic / worstcase / findall. 0 means the
+    // mode default, so a harness can pin it explicitly and a reader can tell
+    // pinned from defaulted.
+    size_t haystack_size = 0;
     // 0 means "mode default" so synthetic can use 100k without sharing the
     // ashvardanian 1000 cap.
     size_t max_needles = 0;
@@ -930,7 +933,7 @@ int main(int argc, char **argv) {
         for (const auto &t : split_csv(take_value(arg, k)))
           lengths.push_back(std::stoul(t));
       } else if (arg == "--size" || arg.rfind("--size=", 0) == 0) {
-        worstcase_size = std::stoul(take_value(arg, k));
+        haystack_size = std::stoul(take_value(arg, k));
       } else if (arg == "--patterns" || arg.rfind("--patterns=", 0) == 0) {
         patterns_per_len_opt = std::stoul(take_value(arg, k));
         if (patterns_per_len_opt == 0) {
@@ -966,10 +969,9 @@ int main(int argc, char **argv) {
                  mode);
 
     if (mode == "synthetic") {
-      // 64 KiB: well above kMinWide (1024) and m+255 for short needles, so
-      // Needle-Hammer's 256-byte-stride body is actually measured.
-      constexpr size_t kSyntheticHaystack = 1u << 16;
-      collect_benchmark_results(kSyntheticHaystack,
+      // 64 KiB default: well above kMinWide (1024) and m+255 for short
+      // needles, so Needle-Hammer's 256-byte-stride body is actually measured.
+      collect_benchmark_results(haystack_size ? haystack_size : (1u << 16),
                                 max_needles ? max_needles : 100000, algos);
     } else if (mode == "horspool") {
       if (lengths.empty())
@@ -994,7 +996,8 @@ int main(int argc, char **argv) {
       if (lengths.empty())
         for (size_t L : {4u, 8u, 16u, 32u, 64u, 128u, 256u, 512u})
           lengths.push_back(L);
-      worstcase_benchmark(worstcase_size, needle_shape, lengths, algos);
+      worstcase_benchmark(haystack_size ? haystack_size : (1u << 16),
+                          needle_shape, lengths, algos);
     } else {  // findall
       if (lengths.empty())
         for (size_t L : {1u, 2u, 3u, 4u, 6u, 8u, 12u, 16u}) lengths.push_back(L);
@@ -1002,8 +1005,11 @@ int main(int argc, char **argv) {
         findall_benchmark(load_file(path), path, lengths);
       else
         findall_benchmark(
-            generate_small_alphabet_string(worstcase_size, 4),
-            std::format("random 4-symbol ({} bytes)", worstcase_size), lengths);
+            generate_small_alphabet_string(
+                haystack_size ? haystack_size : (1u << 16), 4),
+            std::format("random 4-symbol ({} bytes)",
+                        haystack_size ? haystack_size : (1u << 16)),
+            lengths);
     }
     return 0;
   }
@@ -1049,7 +1055,7 @@ int main(int argc, char **argv) {
              "(default 100000);\n"
              "                      ashvardanian: cap on word-token needles "
              "(default 1000)\n");
-  std::print("\n  worstcase / findall:\n");
+  std::print("\n  synthetic / worstcase / findall:\n");
   std::print("    --size N          haystack size in bytes when no datafile "
              "(default 65536)\n");
   std::print("\n  worstcase only:\n");
