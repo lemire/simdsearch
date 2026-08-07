@@ -196,6 +196,37 @@ std::pair<bool, size_t> bmh_search16(const char* text, size_t n, const char* pat
 
 
 
+// Scan the first `count` candidate positions with a single masked window.
+//
+// Its purpose is alignment. The strided loops below issue four loads per
+// 64-byte chunk, at offsets 0 to 3; the offset-0 load is aligned exactly when
+// the scan pointer is, and a misaligned buffer therefore splits a cache line on
+// all four rather than three. Walking the scan pointer up to a 64-byte boundary
+// first costs one masked window and removes a quarter of the split loads for the
+// whole rest of the search.
+//
+// Requires count < 64 and count + m - 1 <= n, so every masked lane reads in
+// bounds. Returns the first match below `count`, if any.
+static inline __attribute__((always_inline)) std::pair<bool, size_t>
+avx512_masked_head(const char* text, const char* pattern, size_t m, size_t count) {
+    __mmask64 f = (((__mmask64)1 << count) - 1);
+    for (size_t k = 0; k < m && f != 0; ++k)
+        f = _mm512_mask_cmpeq_epi8_mask(f, _mm512_maskz_loadu_epi8(f, text + k),
+                                        _mm512_set1_epi8((char)pattern[k]));
+    if (f != 0) return {true, (size_t)__builtin_ctzll(f)};
+    return {false, 0};
+}
+
+// Candidate positions to skip so that text + head sits on a 64-byte boundary,
+// clamped so the masked head never runs past the last candidate position.
+static inline size_t avx512_align_head(const char* text, size_t n, size_t m) {
+    const size_t off = ((uintptr_t)text) & 63;
+    if (off == 0) return 0;
+    const size_t head = 64 - off;
+    const size_t positions = n - m + 1;          // callers guarantee n >= m
+    return head < positions ? head : positions;
+}
+
 // Single-window kernel, 64 bytes per iteration. Three ideas, each needed for
 // a different reason:
 //
@@ -228,6 +259,12 @@ avx512_naive_search_body(const char* text, size_t n,
                               : _mm512_setzero_si512();
 
     if (m >= 4) {
+        const size_t head = avx512_align_head(text, n, m);
+        if (head) {
+            auto r = avx512_masked_head(text, pattern, m, head);
+            if (r.first) return r;
+            i = head;
+        }
         const __m512i p0 = _mm512_set1_epi8((char)pattern[0]);
         const __m512i p1 = _mm512_set1_epi8((char)pattern[1]);
         const __m512i p2 = _mm512_set1_epi8((char)pattern[2]);
@@ -294,6 +331,12 @@ avx512_naive_search256_body(const char* text, size_t n,
                               : _mm512_setzero_si512();
 
     if (m >= 4) {
+        const size_t head = avx512_align_head(text, n, m);
+        if (head) {
+            auto r = avx512_masked_head(text, pattern, m, head);
+            if (r.first) return r;
+            i = head;
+        }
         const __m512i p0 = _mm512_set1_epi8((char)pattern[0]);
         const __m512i p1 = _mm512_set1_epi8((char)pattern[1]);
         const __m512i p2 = _mm512_set1_epi8((char)pattern[2]);
@@ -775,6 +818,16 @@ static inline avx512_guarded_result avx512_naive_search256_guarded(
 
     size_t rounds = 0;
     size_t i = 0;
+    // Same alignment head as the unguarded kernel. It is uncounted: it is a
+    // single window, so its work is bounded by a constant independent of n.
+    {
+        const size_t head = avx512_align_head(text, n, m);
+        if (head) {
+            auto r = avx512_masked_head(text, pattern, m, head);
+            if (r.first) return {true, r.second, false, 0};
+            i = head;
+        }
+    }
     for (; i + m + 255 <= n; i += 256) {
         __mmask64 fA = AVX512_CHUNK(0), fB = AVX512_CHUNK(64);
         __mmask64 fC = AVX512_CHUNK(128), fD = AVX512_CHUNK(192);

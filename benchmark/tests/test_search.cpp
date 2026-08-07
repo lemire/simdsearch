@@ -273,6 +273,39 @@ int main() {
     }
   }
 
+  // ---- Haystack alignment -------------------------------------------------
+  //
+  // The kernels walk the scan pointer to a 64-byte boundary and cover the
+  // positions below it with one masked window. That head is a distinct code
+  // path taken only when the buffer is misaligned, and a std::string happens to
+  // land wherever the allocator puts it, so the fuzz sweep above exercises one
+  // arbitrary alignment rather than all of them. Here we place the same text at
+  // every offset in a 64-byte window and check each one.
+  {
+    std::vector<char> raw(4096 + 128);
+    char *page = raw.data() + (64 - (reinterpret_cast<uintptr_t>(raw.data()) & 63));
+    std::mt19937 g(99);
+    const char alpha[] = "abc";
+    for (size_t off = 0; off < 64; ++off) {
+      char *hay = page + off;
+      const size_t hlen = 2048;
+      for (size_t i = 0; i < hlen; ++i) hay[i] = alpha[g() % 3];
+      std::string text(hay, hlen);
+      for (size_t plen : {4u, 5u, 8u, 17u, 64u, 100u}) {
+        // present, at a position that straddles the alignment head
+        for (size_t at : {size_t(0), size_t(1), size_t(37), size_t(63), size_t(64),
+                          size_t(300)}) {
+          if (at + plen > hlen) continue;
+          std::string pat(hay + at, plen);
+          for (auto &fn : fns) check(fn, text, pat);
+        }
+        // absent
+        std::string absent(plen, 'z');
+        for (auto &fn : fns) check(fn, text, absent);
+      }
+    }
+  }
+
   // ---- Empty needle, explicitly ------------------------------------------
   for (const char *t : {"", "a", "abcabc"})
     for (auto &fn : fns) check(fn, std::string(t), std::string());
