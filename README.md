@@ -23,6 +23,12 @@ deployment targets.
   `horspool`, `ashvardanian` (find-all), `worstcase`, `findall`.
 - `benchmark/tests/` — validation against `std::string::find` across the
   needle- and haystack-length boundaries of every kernel.
+- `benchmark/tools/corpora.py` — builds the eight benchmark datasets (English
+  prose, DNA, protein, minified JSON, base64, log lines, C/C++ source, and UTF-8
+  Cyrillic and CJK), about 1 MB each, and writes a `MANIFEST.txt` of their
+  SHA-256 digests. Two of them are fetched from Project Gutenberg and fall back
+  to a seeded synthetic generator offline, so check the manifest before comparing
+  numbers across machines.
 - `benchmark/README.md` — the algorithm list, build options and test notes.
 
 ## Build and run
