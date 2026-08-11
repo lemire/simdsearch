@@ -716,39 +716,44 @@ static inline std::pair<bool, size_t> neon_needle_hammer_t(const char* text, siz
 // The shipped constants. Overridable at build time so the sweep harness can
 // re-fit them without editing this file.
 //
-// Both are minimax choices over an Apple M4 Max and four Graviton parts
-// (Neoverse N1/V1/V2/V3), fitted the same way the 512-bit values are. Neither is
-// a rescaling of its x86 counterpart, and they fail to transfer differently.
+// Both are minimax choices over an Apple M4 Max and three Graviton parts
+// (Neoverse V1/V2/V3), fitted the same way the 512-bit values are. Neither is a
+// rescaling of its x86 counterpart, and they fail to transfer differently.
 //
-// tau = 64. At this width the two kernels' cost curves are close to PARALLEL in
-// m: which of them wins is decided by the alphabet of the haystack, not by the
+// tau = 4096, which is to say: do not switch within any needle length we
+// measured. At this width the two kernels' cost curves are close to PARALLEL in
+// m -- which of them wins is decided by the alphabet of the haystack, not by the
 // length of the needle. Three anchors admit one position in 64 of a four-symbol
 // corpus and every one of them is verified, so the anchored kernel loses to the
 // wide one by 1.4x to 1.9x on DNA at every length from 8 bytes to 4096; on
-// skewed text it wins by 5% to 30%, again at every length. Needle length, the
-// only thing this constant can observe, does not separate those cases. Per
-// machine the regret is therefore monotone in tau with no interior optimum --
-// four of the five parts want no switch at all, and the N1 wants the anchored
-// kernel everywhere -- and only that disagreement puts the fleet optimum in the
-// interior. The whole candidate range spans about a tenth in worst-case regret,
-// so this is a weak constant rather than a tuned one.
+// skewed text it wins by 20% to 50%, again at every length. Needle length, the
+// only thing this constant can observe, does not separate those cases, and every
+// machine's regret is monotone toward the top of the range. The whole candidate
+// range spans about a twentieth in worst-case regret, so this is a weak constant
+// rather than a tuned one.
 //
-// Robustness does not pick it either, and should not be asked to: on the all-'a'
-// block shape no threshold helps, because that needle defeats the anchors
-// exactly as it defeats the prefix filter. The bound comes from the work counter
-// below. What the width does change is how much the counter has to carry:
-// unguarded, the scheme's lead over two-way on the tail shape ends at 20 to 45
-// bytes of needle depending on the part, against 82-138 bytes at 512-bit width.
+// A Neoverse N1 (Graviton 2) was also measured and prefers the opposite end,
+// the smallest tau on offer. It has half the vector issue width of every other
+// part here, and it is the only machine on which that reversal appears; taking
+// it in moves the fleet minimax to 64. A deployment targeting N1-class cores
+// should use the smaller value.
+//
+// Robustness does not pick this constant either, and should not be asked to: on
+// the all-'a' block shape no threshold helps, because that needle defeats the
+// anchors exactly as it defeats the prefix filter. The bound comes from the work
+// counter below. What the width does change is how much the counter has to
+// carry: unguarded, the scheme's lead over two-way on the tail shape ends around
+// 20 bytes of needle here against 82-138 bytes at 512-bit width.
 //
 // mu = 512. The mechanism scales with the block -- the guard exists because the
 // wide kernel cannot resolve a match before finishing its B-byte block, and B is
-// a quarter the size here -- so the prediction is 1024/4 = 256, and on the M4
-// the crossing lands exactly there. The Neoverse parts agree below a kilobyte
-// and then diverge: the wide kernel never pulls away on them, topping out 2-5%
-// ahead where the M4 reaches 48%, so their crossings sit between 2 and 8 KB.
-// 512 splits that at a worst-case regret under 2% on every part.
+// a quarter the size here -- so the prediction is 1024/4 = 256, and the M4
+// crossing lands exactly there. The Neoverse parts agree below a kilobyte and
+// then diverge: the wide kernel never pulls away on them, topping out 2-5% ahead
+// where the M4 reaches 48%, so their crossings sit between 2 and 8 KB. 512
+// splits that at a worst-case regret under 2% on every part.
 #ifndef NEON_NH_TAU
-#define NEON_NH_TAU 64
+#define NEON_NH_TAU 4096
 #endif
 #ifndef NEON_NH_MU
 #define NEON_NH_MU 512
