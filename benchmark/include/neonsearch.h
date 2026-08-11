@@ -663,8 +663,23 @@ static inline std::pair<bool, size_t> neon_needle_hammer_t(const char* text, siz
 
 // The shipped constants. Overridable at build time so the sweep harness can
 // re-fit them without editing this file.
+//
+// tau = 16 is set by the adversarial side alone, which is a different argument
+// from the one that sets it at 512-bit width. On benign text at this width the
+// two kernels' curves are close to parallel in m -- which of them wins is
+// decided by the corpus alphabet, not by the needle length -- so the whole
+// candidate range from 4 to 4096 lies within a few percent and there is no
+// benign crossing to sit at. That frees the constant to satisfy the robustness
+// bound instead: below tau the wide kernel runs, and on a needle a^(m-1)b over
+// an all-'a' haystack its cost is linear in m while two-way's is flat, so the
+// two cross at W* ~ 20 bytes. Any tau at or below 16 is adversarially maximal
+// and, at this width, costs essentially nothing benign to be so.
+//
+// mu = 256 is a straight rescaling of the 1024 used at 512-bit width: the guard
+// exists because the wide kernel cannot resolve a match before finishing its
+// B-byte block, and B is a quarter the size here.
 #ifndef NEON_NH_TAU
-#define NEON_NH_TAU 32
+#define NEON_NH_TAU 16
 #endif
 #ifndef NEON_NH_MU
 #define NEON_NH_MU 256
@@ -883,6 +898,15 @@ std::pair<bool, size_t> neon_needle_hammer_guarded(const char* t, size_t n,
 // bound can both be measured instead of assumed. n/32 keeps the free range at
 // m <= 6 (so nearly every needle is counted); n/2 keeps it at m <= 36, matching
 // the free range AVX-512 gets from n/8.
+//
+// Note that with the shipped ARM budget at n/2 the "loose" instance coincides
+// with the default, so the three distinct settings actually measured are n/32
+// (tight), n/8 (the AVX-512 budget, below) and n/2. That coincidence is the
+// point rather than an oversight: the fit moved the shipped value to what would
+// have been the loose end at 512-bit width, because a NEON block is a quarter
+// the size and the same rounds-per-byte budget starts guarding needles three
+// times shorter. Widening "loose" further would measure a budget nothing
+// recommends.
 std::pair<bool, size_t> neon_needle_hammer_guarded_tight(const char* t, size_t n,
                                                          const char* p, size_t m) {
     return neon_needle_hammer_guarded_t<NEON_NH_TAU, 1, 32>(t, n, p, m);
