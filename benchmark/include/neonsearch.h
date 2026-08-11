@@ -75,6 +75,16 @@ static inline uint64_t neon_lane_bits(size_t count) {
 // Used everywhere the answer is needed but the index is not, which on ordinary
 // text is almost every window.
 //
+// Pairing this with neon_lane_mask() on the same vector -- test first, then take
+// the index only if something survived -- does NOT narrow twice. Both spell the
+// identical vshrn_n_u16(v, 4), so the compiler emits one shrn and feeds both the
+// fcmp and the fmov from it; verified in the generated assembly for all three
+// kernels, where every shrn/fcmp is followed by an fmov of the same register
+// with no second shrn in between. The wide kernel is the one exception and
+// deliberately so: it tests the OR of its four chunk masks, which is a fifth
+// vector and a fifth shrn on the survivor path, in exchange for the common path
+// doing one narrow instead of four.
+//
 // The argument MUST be a comparison mask -- every byte 0x00 or 0xFF. Every
 // caller here passes an AND or an OR of vceqq_u8 results, which preserves that.
 //
@@ -529,7 +539,12 @@ static inline simd_guarded_result neon_stringzilla_body(
             // Budget tested after the compare: the candidate is already paid
             // for, so a match is reported rather than thrown away. Overshoot is
             // one verification.
-            if (verified > budget_bytes) return {false, 0, true, i};
+            //
+            // Resume at b + 1, which is what `resume` is documented to mean --
+            // the first position not yet ruled out. Everything below b in this
+            // window is ruled out too: the lanes that are not mask bits failed
+            // the anchors, and the mask bits below b were verified and failed.
+            if (verified > budget_bytes) return {false, 0, true, b + 1};
             mask &= mask - 1;
         }
     }
@@ -546,7 +561,7 @@ static inline simd_guarded_result neon_stringzilla_body(
             if (anchors_cover_needle) return {true, b, false, 0};
             verified += n_len;
             if (equal_at(b)) return {true, b, false, 0};
-            if (verified > budget_bytes) return {false, 0, true, b};
+            if (verified > budget_bytes) return {false, 0, true, b + 1};
         }
     }
 #undef NEON_ANCHORS
@@ -878,7 +893,13 @@ static inline simd_guarded_result neon_naive_search64_guarded(
         if ((r = neon_lane_mask(fB))) return {true, i + 16 + ((size_t)__builtin_ctzll(r) >> 2), false, 0};
         if ((r = neon_lane_mask(fC))) return {true, i + 32 + ((size_t)__builtin_ctzll(r) >> 2), false, 0};
         if ((r = neon_lane_mask(fD))) return {true, i + 48 + ((size_t)__builtin_ctzll(r) >> 2), false, 0};
-        if (rounds > budget_rounds) return {false, 0, true, i};
+        // Resume past this block, not at it. Reaching here means the narrowing
+        // loop ran until either the mask emptied or every needle byte had been
+        // compared, and then all four chunk masks tested clear -- so every one
+        // of the 64 candidate positions in [i, i + kNeonB) has been ruled out.
+        // Handing two-way `i` instead would make it rescan a block this kernel
+        // just paid to clear.
+        if (rounds > budget_rounds) return {false, 0, true, i + kNeonB};
     }
 #undef NEON_CHUNK
 
@@ -953,21 +974,17 @@ std::pair<bool, size_t> neon_needle_hammer_guarded(const char* t, size_t n,
 // m <= 6 (so nearly every needle is counted); n/2 keeps it at m <= 36, matching
 // the free range AVX-512 gets from n/8.
 //
-// Note that with the shipped ARM budget at n/2 the "loose" instance coincides
-// with the default, so the three distinct settings actually measured are n/32
-// (tight), n/8 (the AVX-512 budget, below) and n/2. That coincidence is the
-// point rather than an oversight: the fit moved the shipped value to what would
-// have been the loose end at 512-bit width, because a NEON block is a quarter
-// the size and the same rounds-per-byte budget starts guarding needles three
-// times shorter. Widening "loose" further would measure a budget nothing
-// recommends.
+// There is deliberately no "loose" instance here. The fit moved the shipped
+// budget to n/2 -- what would have been the loose end at 512-bit width, because
+// a NEON block is a quarter the size and the same rounds-per-byte budget starts
+// guarding needles three times shorter -- so a loose variant would be the
+// default under a second name, and a benchmark row reading a flat 1.00x invites
+// exactly the wrong conclusion about whether the budget matters. The three
+// distinct settings measured are n/32 (tight), n/8 (the AVX-512 budget) and the
+// shipped n/2.
 std::pair<bool, size_t> neon_needle_hammer_guarded_tight(const char* t, size_t n,
                                                          const char* p, size_t m) {
     return neon_needle_hammer_guarded_t<NEON_NH_TAU, 1, 32>(t, n, p, m);
-}
-std::pair<bool, size_t> neon_needle_hammer_guarded_loose(const char* t, size_t n,
-                                                         const char* p, size_t m) {
-    return neon_needle_hammer_guarded_t<NEON_NH_TAU, 1, 2>(t, n, p, m);
 }
 // The AVX-512 budget transplanted unchanged, for the comparison the appendix
 // makes: same rounds-per-byte, but a free range that stops at m = 12 instead of

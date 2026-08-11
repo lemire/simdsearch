@@ -235,8 +235,6 @@ static const std::vector<Algo> kAlgos = {
     {"find_neon_needle_hammer_guarded", Kind::Stateless, neon_needle_hammer_guarded},
     {"find_neon_needle_hammer_guarded_tight", Kind::Stateless,
      neon_needle_hammer_guarded_tight},
-    {"find_neon_needle_hammer_guarded_loose", Kind::Stateless,
-     neon_needle_hammer_guarded_loose},
     // The AVX-512 budget transplanted unchanged, to show what copying the
     // constant across register widths costs.
     {"find_neon_needle_hammer_guarded_avx512budget", Kind::Stateless,

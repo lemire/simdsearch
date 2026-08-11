@@ -158,7 +158,6 @@ int main() {
       // the fallback path is only correct if it returns the same index.
       {"neon_needle_hammer_guarded", neon_needle_hammer_guarded},
       {"neon_needle_hammer_guarded_tight", neon_needle_hammer_guarded_tight},
-      {"neon_needle_hammer_guarded_loose", neon_needle_hammer_guarded_loose},
       {"neon_needle_hammer_guarded_avx512budget",
        neon_needle_hammer_guarded_avx512budget},
 #endif
