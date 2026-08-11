@@ -10,8 +10,20 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
-# SIMD flags: the AVX-512 subsets avx512search.h uses (F + BW for masked byte
-# compares, plus VL/DQ). This project targets AVX-512 capable processors only.
+# Needle-Hammer's two constants can be overridden at configure time, which is
+# how the tau/mu sweep harness re-fits them per machine without editing the
+# header. Empty means "use the header's shipped value".
+set(NEON_NH_TAU "" CACHE STRING "NEON Needle-Hammer needle threshold (tau)")
+set(NEON_NH_MU "" CACHE STRING "NEON Needle-Hammer haystack guard (mu)")
+foreach(knob NEON_NH_TAU NEON_NH_MU)
+    if(NOT ${knob} STREQUAL "")
+        add_compile_definitions(${knob}=${${knob}})
+    endif()
+endforeach()
+
+# SIMD flags: on x86-64, the AVX-512 subsets avx512search.h uses (F + BW for
+# masked byte compares, plus VL/DQ) and the AVX2/SSE2 the narrower kernels need.
+# On AArch64 NEON is architectural, so no flag is required.
 # Override with -DSIMDSEARCH_ARCH_FLAGS=... (e.g. "-march=native") if desired.
 set(SIMDSEARCH_ARCH_FLAGS "" CACHE STRING "Architecture SIMD flags")
 if(SIMDSEARCH_ARCH_FLAGS STREQUAL "")

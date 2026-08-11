@@ -1,16 +1,28 @@
 # simdsearch benchmark
 
-SIMD substring search benchmarks for **AVX-512 capable processors**. The build
-requires AVX-512F and AVX-512BW; there is no other backend.
+SIMD substring search benchmarks. Two backends, selected by the host
+architecture: **AVX-512** (requires AVX-512F and AVX-512BW) and **AArch64
+NEON**. A build on anything else stops at a `#error`.
 
-`include/avx512search.h` carries the kernels -- `find_avx512`,
+`include/avx512search.h` carries the x86 kernels -- `find_avx512`,
 `find_avx512_256`, `find_avx512_stringzilla`, `find_avx512_needle_hammer`,
 `find_avx512_stringzilla_256` -- along with 256-bit AVX2 (`find_avx256*`) and
 128-bit SSE2 (`find_avx128*`) builds of the same kernels over a traits struct, so
-one binary measures all three register widths. It also provides the portable
-scalar and library searchers (`strstr`, `memmem`, `std::search` variants,
-Boyer-Moore-Horspool) alongside the linear-time searchers in
-`include/kmp_twoway.h`.
+one binary measures all three register widths.
+
+`include/neonsearch.h` is the same scheme at 128-bit NEON width: `find_neon`
+(single-window), `find_neon_64` (wide), `find_neon_stringzilla` (anchored),
+`find_neon_needle_hammer` and its work-counting `_guarded` variants. Both
+Needle-Hammer constants are template parameters here rather than literals, with
+`find_neon_nh_t*` and `find_neon_nh_m*` sweep instances, because they have to be
+fitted across ARM parts rather than read off one machine -- see
+`NEON_NH_TAU`/`NEON_NH_MU` in the header for what the fit concluded and why the
+answer is not a rescaling of the AVX-512 one.
+
+`include/common_search.h` holds what the two backends share: the three-anchor
+selector and the portable scalar and library searchers (`strstr`, `memmem`,
+`std::search` variants, Boyer-Moore-Horspool), alongside the linear-time
+searchers in `include/kmp_twoway.h`.
 
 `find_memmem` is the C library's length-delimited `memmem`. It is the closest
 library counterpart to the kernels here (no NUL terminator needed, so it is also
@@ -48,10 +60,18 @@ cmake --build build
 ```
 
 On x86-64 the build enables `-mavx512f -mavx512bw -mavx512vl -mavx512dq`
-automatically. Override the SIMD flags if needed, e.g. `-march=native`:
+automatically. On AArch64 NEON is architectural and no flag is needed. Override
+the SIMD flags if desired, e.g. `-march=native`:
 
 ```
 cmake -B build -DSIMDSEARCH_ARCH_FLAGS="-march=native"
+```
+
+The NEON backend's two constants can be overridden at configure time, which is
+how the sweep harness re-fits them per machine without editing the header:
+
+```
+cmake -B build -DNEON_NH_TAU=64 -DNEON_NH_MU=1024
 ```
 
 Modes:

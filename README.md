@@ -4,14 +4,20 @@ Benchmarks and reference kernels for SIMD substring search.
 
 ## Requirements
 
-**An x86-64 processor with AVX-512, specifically AVX-512F and AVX-512BW, running
-Linux with GCC 14 or newer.** That is the only supported configuration: it is
-what Needle-Hammer is designed for and what the switch points are fitted to.
+A C++23 compiler (GCC 14+ or a recent Clang: the driver uses `std::print`) and
+one of two architectures:
 
-There is no other backend: a build without AVX-512F and AVX-512BW stops at a
-`#error`. The AVX2 and SSE2 kernels in the same header exist to show that the
-switch point belongs to the register width rather than to the scheme, not as
-deployment targets.
+- **x86-64 with AVX-512F and AVX-512BW.** This is what Needle-Hammer was
+  designed for and what the shipped switch points are fitted to. The AVX2 and
+  SSE2 kernels in the same header exist to show that the switch point belongs to
+  the register width rather than to the scheme, not as deployment targets.
+- **AArch64 with NEON.** The same scheme at 128-bit width. Its constants are
+  *not* the AVX-512 ones: the haystack guard rescales with the block size, the
+  guard budget is re-fitted to preserve its free range, and the needle threshold
+  turns out to be set by the adversarial bound rather than by a benign crossover.
+  See the header for the argument.
+
+A build on anything else stops at a `#error`.
 
 ## What is here
 
@@ -19,6 +25,11 @@ deployment targets.
   length-dispatched **Needle-Hammer** scheme, plus 256-bit (AVX2) and 128-bit
   (SSE2) builds of the same kernels over a traits struct, so one x86 binary
   measures all three register widths.
+- `benchmark/include/neonsearch.h` — the same three kernels, the same dispatch
+  and the same work-counting guard at 128-bit AArch64 NEON width, with both
+  constants exposed as sweep instances.
+- `benchmark/include/common_search.h` — what both backends share: the anchor
+  selector and the scalar and library baselines.
 - `benchmark/benchmarks/benchmark.cpp` — the driver. Modes: `synthetic` (64 KiB
   random text, 100k short needles), `horspool`, `ashvardanian` (find-all),
   `worstcase`, `findall`.

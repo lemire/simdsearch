@@ -17,11 +17,31 @@
 #include <utility>
 #include <vector>
 
-#if !defined(__AVX512F__) || !defined(__AVX512BW__)
-  #error "This project targets AVX-512 capable processors (AVX-512F + AVX-512BW)."
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+  #include "avx512search.h"
+  #define SIMDSEARCH_AVX512 1
+#elif defined(__aarch64__) || defined(_M_ARM64)
+  #include "neonsearch.h"
+  #define SIMDSEARCH_NEON 1
+#else
+  #error "No SIMD backend: this project targets AVX-512 (F + BW) or AArch64 NEON."
 #endif
-#include "avx512search.h"
-#define SIMDSEARCH_AVX512 1
+
+// The backend-specific names the two structural tests at the bottom of this file
+// need: the find-all enumerator, the guarded wide kernel, and the scheme with
+// and without its work counter. Naming them once here keeps those tests written
+// against the scheme rather than against one architecture.
+#if defined(SIMDSEARCH_AVX512)
+  #define SIMD_NAIVE_SEARCH_ALL avx512_naive_search_all
+  #define SIMD_WIDE_GUARDED avx512_naive_search256_guarded
+  #define SIMD_NEEDLE_HAMMER avx512_needle_hammer
+  #define SIMD_NEEDLE_HAMMER_GUARDED avx512_needle_hammer_guarded
+#else
+  #define SIMD_NAIVE_SEARCH_ALL neon_naive_search_all
+  #define SIMD_WIDE_GUARDED neon_naive_search64_guarded
+  #define SIMD_NEEDLE_HAMMER neon_needle_hammer
+  #define SIMD_NEEDLE_HAMMER_GUARDED neon_needle_hammer_guarded
+#endif
 
 using search_fn = std::pair<bool, size_t> (*)(const char *, size_t,
                                               const char *, size_t);
@@ -113,6 +133,33 @@ int main() {
       {"avx128_needle_hammer", avx128_needle_hammer},
       {"avx128_needle_hammer64", avx128_needle_hammer64},
       {"avx128_needle_hammer512", avx128_needle_hammer512},
+#endif
+#if defined(SIMDSEARCH_NEON)
+      {"neon_naive_search", neon_naive_search},
+      {"neon_naive_search64", neon_naive_search64},
+      {"neon_stringzilla_find", neon_stringzilla_find},
+      // The same kernel with the optional UTF-8 lead-byte anchor rule on. It
+      // picks different anchors, so it exercises a different path through the
+      // selector and must be validated separately.
+      {"neon_stringzilla_find_hifilter", neon_stringzilla_find_hifilter},
+      {"neon_stringzilla64_find", neon_stringzilla64_find},
+      {"neon_needle_hammer", neon_needle_hammer},
+      // Both ends of each sweep, so the dispatch is validated where it always
+      // takes the naive kernels, where it always takes the anchored one, where
+      // the haystack guard is off entirely and where it swallows every haystack
+      // the tests build.
+      {"neon_nh_t4", neon_needle_hammer_t4},
+      {"neon_nh_t16", neon_needle_hammer_t16},
+      {"neon_nh_t4096", neon_needle_hammer_t4096},
+      {"neon_nh_m0", neon_needle_hammer_m0},
+      {"neon_nh_m4096", neon_needle_hammer_m4096},
+      // The guarded variants must agree with everyone else on every input,
+      // including the ones that make them abandon the filter for two-way --
+      // the fallback path is only correct if it returns the same index.
+      {"neon_needle_hammer_guarded", neon_needle_hammer_guarded},
+      {"neon_needle_hammer_guarded_tight", neon_needle_hammer_guarded_tight},
+      {"neon_needle_hammer_guarded_avx512budget",
+       neon_needle_hammer_guarded_avx512budget},
 #endif
   };
 
@@ -319,8 +366,7 @@ int main() {
   for (const char *t : {"", "a", "abcabc"})
     for (auto &fn : fns) check(fn, std::string(t), std::string());
 
-#if defined(SIMDSEARCH_AVX512)
-  // ---- Find-all enumerator (avx512_naive_search_all) ---------------------
+  // ---- Find-all enumerator ------------------------------------------------
   //
   // Overlapping occurrences, short needles, and empty-needle convention must
   // agree with a pos+1 walk of the first-match kernel. ctest only runs this
@@ -343,12 +389,12 @@ int main() {
     };
     auto check_all = [&](const char *t, size_t n, const char *p, size_t m) {
       std::vector<size_t> got;
-      avx512_naive_search_all(t, n, p, m, [&](size_t i) { got.push_back(i); });
+      SIMD_NAIVE_SEARCH_ALL(t, n, p, m, [&](size_t i) { got.push_back(i); });
       auto exp = ref_findall(t, n, p, m);
       ++g_checks;
       if (got != exp) {
         if (g_failures < 20) {
-          std::printf("MISMATCH avx512_naive_search_all text_len=%zu pat_len=%zu "
+          std::printf("MISMATCH naive_search_all text_len=%zu pat_len=%zu "
                       "got %zu hits ref %zu hits\n",
                       n, m, got.size(), exp.size());
         }
@@ -401,8 +447,8 @@ int main() {
     std::string hay(prefix, 'a');
     hay += needle;
 
-    auto r = avx512_naive_search256_guarded(hay.data(), hay.size(),
-                                            needle.data(), m, hay.size() / 8 + 1);
+    auto r = SIMD_WIDE_GUARDED(hay.data(), hay.size(), needle.data(), m,
+                               hay.size() / 8 + 1);
     ++g_checks;
     if (!r.gave_up) {
       std::printf("MISMATCH budget test: wide kernel did not exhaust its "
@@ -416,20 +462,18 @@ int main() {
       ++g_failures;
     }
     // The scheme as a whole must still return the match.
-    for (const NamedFn &nf : {NamedFn{"avx512_needle_hammer_guarded",
-                                      avx512_needle_hammer_guarded},
-                              NamedFn{"avx512_needle_hammer",
-                                      avx512_needle_hammer}})
+    for (const NamedFn &nf : {NamedFn{"needle_hammer_guarded",
+                                      SIMD_NEEDLE_HAMMER_GUARDED},
+                              NamedFn{"needle_hammer", SIMD_NEEDLE_HAMMER}})
       check(nf, hay, needle);
 
     // Same shape with no match at all: the guard must report absence, not a
     // spurious hit, after giving up.
     std::string absent(prefix + m, 'a');
-    for (const NamedFn &nf : {NamedFn{"avx512_needle_hammer_guarded",
-                                      avx512_needle_hammer_guarded}})
+    for (const NamedFn &nf : {NamedFn{"needle_hammer_guarded",
+                                      SIMD_NEEDLE_HAMMER_GUARDED}})
       check(nf, absent, needle);
   }
-#endif
 
   std::printf("ran %zu checks, %zu failures\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;
