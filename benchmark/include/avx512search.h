@@ -421,7 +421,12 @@ static inline simd_guarded_result avx512_stringzilla_body(
             // Budget tested after the compare, for the same reason as the wide
             // kernel: the candidate is already paid for, so a match is reported
             // rather than thrown away. Overshoot is one verification.
-            if (verified > budget_bytes) return {false, 0, true, i};
+            //
+            // Resume at b + 1, which is what `resume` means: the first position
+            // not yet ruled out. Everything below it in this window is ruled out
+            // too -- the lanes that are not mask bits failed the anchors, and
+            // the mask bits below b were verified and failed.
+            if (verified > budget_bytes) return {false, 0, true, i + b + 1};
             mask &= mask - 1;  // clear the lowest set bit and continue
         }
     }
@@ -696,7 +701,12 @@ static inline simd_guarded_result avx512_naive_search256_guarded(
         if (fB) return {true, i +  64 + (size_t)__builtin_ctzll(fB), false, 0};
         if (fC) return {true, i + 128 + (size_t)__builtin_ctzll(fC), false, 0};
         if (fD) return {true, i + 192 + (size_t)__builtin_ctzll(fD), false, 0};
-        if (rounds > budget_rounds) return {false, 0, true, i};
+        // Resume past this block, not at it. Reaching here means the narrowing
+        // loop ran until the mask emptied or every needle byte had been
+        // compared, and then all four chunk masks tested clear -- so all 256
+        // candidate positions in [i, i + 256) are ruled out, and handing two-way
+        // `i` would make it rescan a block this kernel just paid to clear.
+        if (rounds > budget_rounds) return {false, 0, true, i + 256};
     }
 #undef AVX512_CHUNK
 

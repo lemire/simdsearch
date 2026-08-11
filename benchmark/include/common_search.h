@@ -209,6 +209,14 @@ struct simd_guarded_result {
     bool gave_up;    // budget exhausted; caller must fall back
     size_t resume;   // first position not yet ruled out, when gave_up
 };
+// On `resume`: any value at or below the true first-not-ruled-out position is
+// CORRECT, since the fallback merely rescans positions the kernel had already
+// disproved. That makes a loose value invisible to the tests and visible only as
+// wasted work on the give-up path, which is why both backends previously
+// returned the start of the block or window they were in rather than its end. A
+// kernel should return the tightest position it can justify: if it has cleared a
+// whole block, resume past the block, and if it has just disproved a candidate,
+// resume after that candidate.
 
 // Hand the rest of the haystack to Crochemore-Perrin. The kernel has already
 // proved there is no occurrence starting below `from`, so two-way only has to
