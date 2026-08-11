@@ -14,15 +14,21 @@
 
 #include "counters/bench.h"
 
-// Pick the SIMD backend for the host architecture. Each header is
-// self-contained: it also provides the portable scalar and library searchers.
-#if !defined(__AVX512F__) || !defined(__AVX512BW__)
-  #error "This project targets AVX-512 capable processors (AVX-512F + AVX-512BW)."
+// Pick the SIMD backend for the host architecture. Both headers pull the
+// portable scalar and library searchers in from common_search.h.
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+  #include "avx512search.h"
+  #define SIMDSEARCH_AVX512 1
+  #define SIMD_NAIVE_SEARCH avx512_naive_search
+  #define SIMD_NAIVE_SEARCH_ALL avx512_naive_search_all
+#elif defined(__aarch64__) || defined(_M_ARM64)
+  #include "neonsearch.h"
+  #define SIMDSEARCH_NEON 1
+  #define SIMD_NAIVE_SEARCH neon_naive_search
+  #define SIMD_NAIVE_SEARCH_ALL neon_naive_search_all
+#else
+  #error "No SIMD backend: this project targets AVX-512 (F + BW) or AArch64 NEON."
 #endif
-#include "avx512search.h"
-#define SIMDSEARCH_AVX512 1
-#define SIMD_NAIVE_SEARCH avx512_naive_search
-#define SIMD_NAIVE_SEARCH_ALL avx512_naive_search_all
 
 double pretty_print(const std::string &name, size_t num_values,
                     counters::event_aggregate agg) {
@@ -187,6 +193,54 @@ static const std::vector<Algo> kAlgos = {
     {"find_avx128_needle_hammer64", Kind::Stateless, avx128_needle_hammer64},
     {"find_avx128_needle_hammer512", Kind::Stateless, avx128_needle_hammer512},
     {"find_avx128_needle_hammer8192", Kind::Stateless, avx128_needle_hammer8192},
+#endif
+#if defined(SIMDSEARCH_NEON)
+    // Needle-Hammer's component kernels at 128-bit NEON width: the single-window
+    // naive kernel, the 64-byte-stride one it dispatches to, and the anchored
+    // kernel above the threshold.
+    {"find_neon", Kind::Stateless, neon_naive_search},
+    {"find_neon_64", Kind::Stateless, neon_naive_search64},
+    {"find_neon_stringzilla", Kind::Stateless, neon_stringzilla_find},
+    {"find_neon_stringzilla_hifilter", Kind::Stateless,
+     neon_stringzilla_find_hifilter},
+    // The anchored filter run at the wide kernel's 64-byte stride. On a 128-bit
+    // window the per-window fixed cost is spread over a quarter as many
+    // positions as at 512-bit, so this variant matters more here.
+    {"find_neon_stringzilla_64", Kind::Stateless, neon_stringzilla64_find},
+    // The scheme itself, then the two sweeps that fix its constants: tau (the
+    // needle-length switch point) at the shipped mu, and mu (the minimum
+    // haystack for the wide kernel) at the shipped tau.
+    {"find_neon_needle_hammer", Kind::Stateless, neon_needle_hammer},
+    {"find_neon_nh_t4", Kind::Stateless, neon_needle_hammer_t4},
+    {"find_neon_nh_t8", Kind::Stateless, neon_needle_hammer_t8},
+    {"find_neon_nh_t16", Kind::Stateless, neon_needle_hammer_t16},
+    {"find_neon_nh_t32", Kind::Stateless, neon_needle_hammer_t32},
+    {"find_neon_nh_t64", Kind::Stateless, neon_needle_hammer_t64},
+    {"find_neon_nh_t128", Kind::Stateless, neon_needle_hammer_t128},
+    {"find_neon_nh_t256", Kind::Stateless, neon_needle_hammer_t256},
+    {"find_neon_nh_t512", Kind::Stateless, neon_needle_hammer_t512},
+    {"find_neon_nh_t1024", Kind::Stateless, neon_needle_hammer_t1024},
+    {"find_neon_nh_t2048", Kind::Stateless, neon_needle_hammer_t2048},
+    {"find_neon_nh_t4096", Kind::Stateless, neon_needle_hammer_t4096},
+    {"find_neon_nh_m0", Kind::Stateless, neon_needle_hammer_m0},
+    {"find_neon_nh_m64", Kind::Stateless, neon_needle_hammer_m64},
+    {"find_neon_nh_m128", Kind::Stateless, neon_needle_hammer_m128},
+    {"find_neon_nh_m256", Kind::Stateless, neon_needle_hammer_m256},
+    {"find_neon_nh_m512", Kind::Stateless, neon_needle_hammer_m512},
+    {"find_neon_nh_m1024", Kind::Stateless, neon_needle_hammer_m1024},
+    {"find_neon_nh_m2048", Kind::Stateless, neon_needle_hammer_m2048},
+    {"find_neon_nh_m4096", Kind::Stateless, neon_needle_hammer_m4096},
+    // The same scheme with a run-time work counter that abandons the filter for
+    // two-way once verification work exceeds a budget proportional to n.
+    {"find_neon_needle_hammer_guarded", Kind::Stateless, neon_needle_hammer_guarded},
+    {"find_neon_needle_hammer_guarded_tight", Kind::Stateless,
+     neon_needle_hammer_guarded_tight},
+    {"find_neon_needle_hammer_guarded_loose", Kind::Stateless,
+     neon_needle_hammer_guarded_loose},
+    // The AVX-512 budget transplanted unchanged, to show what copying the
+    // constant across register widths costs.
+    {"find_neon_needle_hammer_guarded_avx512budget", Kind::Stateless,
+     neon_needle_hammer_guarded_avx512budget},
 #endif
     {"find_bmh", Kind::Stateless, bmh_search},
     {"find_bmh16", Kind::Stateless, bmh_search16},
@@ -836,8 +890,9 @@ void findall_benchmark(const std::string &text, const std::string &source_desc,
   std::print("source: {}\n", source_desc);
   std::print("text size: {} bytes, {} needles per length\n", text.size(),
              needles_per_len);
-  std::print("loop  = avx512_naive_search called in a loop (restart per match)\n");
-  std::print("block = avx512_naive_search_all (enumerate matches per block)\n\n");
+  std::print("loop  = the backend's single-window kernel called in a loop "
+             "(restart per match)\n");
+  std::print("block = its find-all variant (enumerate matches per block)\n\n");
   std::print("{:>6} {:>13} {:>13} {:>13} {:>9}\n", "len", "avg_matches",
              "loop_ns", "block_ns", "speedup");
 
