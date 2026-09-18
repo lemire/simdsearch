@@ -47,6 +47,16 @@ double pretty_print(const std::string &name, size_t num_values,
                agg.fastest_instructions() / double(agg.fastest_cycles()));
 
   }
+  // Dispersion. Every other column here is a best-of-N figure, which is the
+  // right statistic for a compute-bound kernel but says nothing about run-to-run
+  // stability -- and best-of-N flatters a searcher whose timings are volatile.
+  // Report the mean and the worst sample alongside the count of samples so the
+  // spread behind the headline number is visible.
+  std::print(" {:5.3f} mean {:5.3f} worst {:d} reps ",
+             agg.elapsed_ns() / double(num_values),
+             agg.worst.elapsed_ns() / double(agg.inner_count) /
+                 double(num_values),
+             agg.iterations);
   std::print("\n");
   return double(num_values) / agg.fastest_elapsed_ns();
 }
@@ -570,6 +580,18 @@ void horspool_benchmark(const std::string &text, const std::string &source_desc,
   // ns[algo_index][length_index]
   std::vector<std::vector<double>> ns(
       algos.size(), std::vector<double>(lengths.size(), 0.0));
+  // Mean haystack bytes a search must look at before it can report the first
+  // occurrence: the match index plus the needle itself. Needles are cut from the
+  // text, so short ones match early and long ones match late; without this the
+  // absolute ns columns conflate filter cost with match position and cannot be
+  // compared across lengths.
+  std::vector<double> scanned(lengths.size(), 0.0);
+  // Retired instructions for one first-occurrence search. Time alone cannot say
+  // whether a searcher is fast because it does less work or because the work it
+  // does happens to schedule well; the instruction count separates the two.
+  std::vector<std::vector<double>> instr(
+      algos.size(), std::vector<double>(lengths.size(), 0.0));
+  const bool have_counters = counters::has_performance_counters();
 
   for (size_t li = 0; li < lengths.size(); ++li) {
     size_t L = lengths[li];
@@ -588,8 +610,10 @@ void horspool_benchmark(const std::string &text, const std::string &source_desc,
     // and not timed; the needles are not resampled, so every other row keeps
     // the same inputs.
     std::vector<bool> na(algos.size(), false);
+    double scanned_sum = 0.0;
     for (size_t id = 0; id < pats.size(); ++id) {
       size_t ref = text.find(pats[id]);
+      scanned_sum += double(ref + L);
       for (size_t ai = 0; ai < algos.size(); ++ai) {
         const Algo *a = algos[ai];
         if (na[ai]) continue;
@@ -623,7 +647,10 @@ void horspool_benchmark(const std::string &text, const std::string &source_desc,
       };
       auto agg = counters::bench(run);
       ns[ai][li] = agg.fastest_elapsed_ns() / double(pats.size());
+      if (have_counters)
+        instr[ai][li] = agg.fastest_instructions() / double(pats.size());
     }
+    scanned[li] = scanned_sum / double(pats.size());
     std::print(stderr, "horspool: length {} done\n", L);
   }
 
@@ -637,13 +664,50 @@ void horspool_benchmark(const std::string &text, const std::string &source_desc,
   std::print("{:<48}", "algo");
   for (size_t L : lengths) std::print(" {:>10}", L);
   std::print("\n");
-  for (size_t ai = 0; ai < algos.size(); ++ai) {
-    std::print("{:<48}", algos[ai]->name);
+  auto print_row = [&](const std::vector<double> &row, int decimals) {
     for (size_t li = 0; li < lengths.size(); ++li) {
-      if (std::isnan(ns[ai][li])) std::print(" {:>10}", "n/a");
-      else std::print(" {:>10.1f}", ns[ai][li]);
+      if (std::isnan(row[li])) std::print(" {:>10}", "n/a");
+      else if (decimals == 4) std::print(" {:>10.4f}", row[li]);
+      else std::print(" {:>10.1f}", row[li]);
     }
     std::print("\n");
+  };
+  for (size_t ai = 0; ai < algos.size(); ++ai) {
+    std::print("{:<48}", algos[ai]->name);
+    print_row(ns[ai], 1);
+  }
+
+  if (have_counters) {
+    std::print("\n@@@@@ METRIC instructions\n");
+    std::print("retired instructions per first-occurrence search\n\n");
+    std::print("{:<48}", "algo");
+    for (size_t L : lengths) std::print(" {:>10}", L);
+    std::print("\n");
+    for (size_t ai = 0; ai < algos.size(); ++ai) {
+      std::print("{:<48}", algos[ai]->name);
+      std::vector<double> row(lengths.size());
+      for (size_t li = 0; li < lengths.size(); ++li)
+        row[li] = std::isnan(ns[ai][li]) ? ns[ai][li] : instr[ai][li];
+      print_row(row, 1);
+    }
+  }
+
+  // Same matrix normalised by the mean bytes each search has to reach before it
+  // can answer. This removes the match-position term, so a row is comparable
+  // across lengths and reads as the searcher's steady-state scan rate.
+  std::print("\n@@@@@ METRIC ns_per_scanned_byte\n");
+  std::print("mean bytes scanned per search, by length:");
+  for (size_t li = 0; li < lengths.size(); ++li)
+    std::print(" {}={:.0f}", lengths[li], scanned[li]);
+  std::print("\n\n");
+  std::print("{:<48}", "algo");
+  for (size_t L : lengths) std::print(" {:>10}", L);
+  std::print("\n");
+  for (size_t ai = 0; ai < algos.size(); ++ai) {
+    std::print("{:<48}", algos[ai]->name);
+    std::vector<double> row(lengths.size());
+    for (size_t li = 0; li < lengths.size(); ++li) row[li] = ns[ai][li] / scanned[li];
+    print_row(row, 4);
   }
 }
 
@@ -870,9 +934,13 @@ void worstcase_benchmark(size_t haystack_size, const std::string &needle_shape,
     }
   }
 
-  // ns[algo_index][length_index] — nanoseconds for one full-haystack search.
+  // ns[algo][length] — nanoseconds; instr[algo][length] — retired instructions,
+  // both for one full-haystack search.
   std::vector<std::vector<double>> ns(
       algos.size(), std::vector<double>(lengths.size(), 0.0));
+  std::vector<std::vector<double>> instr(
+      algos.size(), std::vector<double>(lengths.size(), 0.0));
+  const bool have_counters = counters::has_performance_counters();
   for (size_t li = 0; li < lengths.size(); ++li) {
     const std::string &hay = haystacks[li];
     for (size_t ai = 0; ai < algos.size(); ++ai) {
@@ -882,7 +950,9 @@ void worstcase_benchmark(size_t haystack_size, const std::string &needle_shape,
                                 needles[li].data(), needles[li].size());
         sink += f ? idx : needles[li].size();
       };
-      ns[ai][li] = counters::bench(run).fastest_elapsed_ns();
+      auto agg = counters::bench(run);
+      ns[ai][li] = agg.fastest_elapsed_ns();
+      if (have_counters) instr[ai][li] = agg.fastest_instructions();
     }
     std::print(stderr, "worstcase: length {} done\n", lengths[li]);
   }
@@ -897,14 +967,22 @@ void worstcase_benchmark(size_t haystack_size, const std::string &needle_shape,
              "GB/s = {} / ns\n", haystack_size);
   std::print("rows = algorithm, columns = needle length L\n\n");
 
-  std::print("{:<48}", "algo");
-  for (size_t L : lengths) std::print(" {:>12}", L);
-  std::print("\n");
-  for (size_t ai = 0; ai < algos.size(); ++ai) {
-    std::print("{:<48}", algos[ai]->name);
-    for (size_t li = 0; li < lengths.size(); ++li)
-      std::print(" {:>12.1f}", ns[ai][li]);
+  auto print_matrix = [&](const std::vector<std::vector<double>> &mm) {
+    std::print("{:<48}", "algo");
+    for (size_t L : lengths) std::print(" {:>14}", L);
     std::print("\n");
+    for (size_t ai = 0; ai < algos.size(); ++ai) {
+      std::print("{:<48}", algos[ai]->name);
+      for (size_t li = 0; li < lengths.size(); ++li)
+        std::print(" {:>14.1f}", mm[ai][li]);
+      std::print("\n");
+    }
+  };
+  print_matrix(ns);
+  if (have_counters) {
+    std::print("\n@@@@@ METRIC instructions\n");
+    std::print("values are retired instructions per full-haystack search\n\n");
+    print_matrix(instr);
   }
 }
 
