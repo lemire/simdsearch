@@ -7,17 +7,21 @@ NEON**. A build on anything else stops at a `#error`.
 `include/needle_hammer.h` is Needle-Hammer, the featured searcher
 (`find_avx512_needle_hammer`, and `find_avx512_needle_hammer_unguarded` for
 measuring the guard): a single wide kernel that tests every candidate position
-on three or four needle bytes chosen for selectivity -- first, middle and last
-byte, plus a quarter point or, when the needle has one, a byte that is rare in
-it -- 256 positions per iteration, then narrows the survivors byte by byte.
-Three anchors are used while the haystack shows they suffice and a fourth is
-added once survivors become frequent; needles of one to three bytes take a
-dedicated loop with no verification at all; and a work counter bounds the
-narrowing, resuming with the vectorized two-way in `include/twoway_simd.h`
-(`find_twoway_simd`) so every input is searched in linear time. There is no
-needle-length threshold to fit per machine. The constants are documented in
-the header; `NH2_THREE_ANCHOR_MAX` can be set at compile time. AVX-512 only
-for now: the NEON backend still carries the previous scheme.
+on two to four needle bytes chosen for selectivity -- first and last byte,
+then the middle and a quarter point, or, when the needle has one, a byte that
+is rare in it -- 256 positions per iteration, then narrows the survivors byte
+by byte. Two anchors are used while the haystack shows they suffice and a
+third and a fourth are added, one at a time, once survivors become frequent;
+needles of one to three bytes take a dedicated loop with no verification at
+all; and a work counter bounds the narrowing, in the block loop and in the
+windows at the ends of the haystack alike, resuming with the vectorized
+two-way in `include/twoway_simd.h` (`find_twoway_simd`) so every input is
+searched in linear time. There is no needle-length threshold to fit per
+machine. The constants are documented in the header; `NH2_START_ANCHORS` and
+`NH2_THREE_ANCHOR_MAX` can be set at compile time. The same design has an
+AArch64 NEON backend in the same header (`find_neon_needle_hammer`,
+`_unguarded`), with the window and block a quarter as wide and the
+block-derived constants scaled.
 
 `include/avx512search.h` carries the x86 component kernels the featured one is
 read against -- `find_avx512` (single-window naive), `find_avx512_256`
@@ -90,11 +94,11 @@ the SIMD flags if desired, e.g. `-march=native`:
 cmake -B build -DSIMDSEARCH_ARCH_FLAGS="-march=native"
 ```
 
-The NEON backend's two constants can be overridden at configure time, which is
-how the sweep harness re-fits them per machine without editing the header:
+Needle-Hammer's compile-time knobs can be set at configure time without
+editing the header, on either backend:
 
 ```
-cmake -B build -DNEON_NH_TAU=64 -DNEON_NH_MU=1024
+cmake -B build -DNH2_START_ANCHORS=3
 ```
 
 Modes:

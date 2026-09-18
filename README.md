@@ -21,7 +21,7 @@ A build on anything else stops at a `#error`.
 ## What is here
 
 - `benchmark/include/needle_hammer.h` — **Needle-Hammer**: one wide anchored
-  kernel with chosen filter bytes, three or four of them as the haystack
+  kernel with chosen filter bytes, two to four of them as the haystack
   demands, a dedicated loop for needles of one to three bytes, and a work
   counter that resumes with the vectorized two-way in
   `benchmark/include/twoway_simd.h`, so every input is searched in linear time.

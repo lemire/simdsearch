@@ -10,9 +10,13 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
-# Needle-Hammer's three-anchor switch point can be overridden at configure
-# time (NH2_THREE_ANCHOR_MAX); empty means the header's shipped value.
-set(NH2_THREE_ANCHOR_MAX "" CACHE STRING "Needle-Hammer: longest needle that starts with three anchors")
+# Needle-Hammer's anchor-count knobs can be overridden at configure time;
+# empty means the header's shipped value.
+set(NH2_START_ANCHORS "" CACHE STRING "Needle-Hammer: anchors a wide-alphabet needle starts with (2, 3 or 4)")
+if(NOT NH2_START_ANCHORS STREQUAL "")
+    add_compile_definitions(NH2_START_ANCHORS=${NH2_START_ANCHORS})
+endif()
+set(NH2_THREE_ANCHOR_MAX "" CACHE STRING "Needle-Hammer: longest needle that starts with fewer than four anchors")
 if(NOT NH2_THREE_ANCHOR_MAX STREQUAL "")
     add_compile_definitions(NH2_THREE_ANCHOR_MAX=${NH2_THREE_ANCHOR_MAX})
 endif()

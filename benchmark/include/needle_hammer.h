@@ -1,15 +1,17 @@
 #pragma once
 // Needle-Hammer: one wide anchored kernel with a work-counting guard.
 //
-// The filter tests every candidate position on three or four needle bytes
-// chosen for selectivity (first, middle, last, and a quarter point or a byte
-// that is rare in the needle), 256 positions per iteration, then narrows the
-// survivors byte by byte. Three anchors are used while the haystack shows
-// they suffice; a fourth is added when survivors become frequent. Narrowing
-// rounds are counted, and once they exceed a budget proportional to the
-// haystack the search resumes with a linear-time two-way, so every input is
-// searched in linear time. Needles of one to three bytes take a dedicated
-// stride loop with no verification at all.
+// The filter tests every candidate position on two to four needle bytes
+// chosen for selectivity (first and last byte, then the middle and a quarter
+// point, or a byte that is rare in the needle), 256 positions per iteration,
+// then narrows the survivors byte by byte. Two anchors are used while the
+// haystack shows they suffice; a third and a fourth are added, one at a
+// time, when survivors become frequent. Narrowing rounds are counted, in the
+// block loop and in the windows that cover the ends of the haystack alike,
+// and once they exceed a budget proportional to the haystack the search
+// resumes with a linear-time two-way, so every input is searched in linear
+// time. Needles of one to three bytes take a dedicated stride loop with no
+// verification at all.
 //
 // Dispatch, in order:
 //   m == 0                     match at 0
@@ -18,8 +20,8 @@
 //   n < 1024 or n < m + 255    masked 64-byte windows with the anchors (small haystack)
 //   m == 4                     the four anchors are bytes 0..3: avx512_naive_search256_body
 //   m <= 36                    wide kernel, no guard (narrowing bounded by construction)
-//   otherwise                  wide kernel, guard budget n/64 rounds; a three-anchor
-//                              start escalates to four, then resumes with two-way
+//   otherwise                  wide kernel, guard budget n/64 rounds; a two-anchor
+//                              start escalates to three and four, then resumes with two-way
 //
 // Two backends: AVX-512 (F/BW), where a window is 64 positions and a block
 // 256, and AArch64 NEON, where a window is 16 positions and a block 64. The
@@ -62,16 +64,29 @@ static constexpr size_t kFreeBelow = 36;
 // 256-byte stride, whose alignment head and loop bound need room to pay off.
 static constexpr size_t kMinWide = 1024;
 
-// Needles up to this length start with three anchors; longer ones start with
-// four. Measured on Emerald Rapids and Zen 5, a three-anchor start wins or
-// ties at every length once survivors escalate it to four when needed, so
-// there is no cap by default. Overridable at compile time
-// (-DNH2_THREE_ANCHOR_MAX=128, say) so the switch point can be re-fitted
-// per machine rather than trusted.
+// Needles longer than this start with four anchors whatever kStartAnchors
+// says. Measured on Emerald Rapids and Zen 5, a start with fewer anchors wins
+// or ties at every length once survivors escalate it when needed, so there
+// is no cap by default. Overridable at compile time
+// (-DNH2_THREE_ANCHOR_MAX=128, say) so the switch point can be re-fitted per
+// machine rather than trusted.
 #ifndef NH2_THREE_ANCHOR_MAX
 #define NH2_THREE_ANCHOR_MAX SIZE_MAX
 #endif
 static constexpr size_t kThreeAnchorMax = NH2_THREE_ANCHOR_MAX;
+// Anchors a wide-alphabet needle starts with (2, 3 or 4); the escalation
+// rule adds the others one at a time, in the order last, middle, quarter
+// after the first byte. Two: measured on Emerald Rapids, an M4 Max and
+// against the memchr crate's two-byte filter, the third anchor's compare per
+// block costs more than the survivors it removes on every corpus but DNA,
+// where the escalation adds it within the first blocks. A four-byte needle
+// takes the naive kernel instead (its four anchors are the whole needle and
+// the search usually ends in the first window, where the selection would
+// cost more than the search).
+#ifndef NH2_START_ANCHORS
+#define NH2_START_ANCHORS 2
+#endif
+static constexpr int kStartAnchors = NH2_START_ANCHORS;
 
 // Cost of a surviving lane, in filter-compare units, for the escalation rule
 // below: a mispredicted branch plus, for long needles, the restart of the far
@@ -117,9 +132,10 @@ static inline void positional(const unsigned char* s, size_t m, size_t o[4]) {
 // two values (a^k b a^k, or a two-letter text) the anchors on the second
 // value do the work, the fourth anchor would repeat a value already tested
 // and cost a quarter of the filter's throughput, so three are used.
-// Otherwise the alphabet is wide and three anchors -- first, middle, last --
-// are enough to start with; the quarter point is kept as the spare the
-// kernel adds if survivors turn out to be frequent.
+// Otherwise the alphabet is wide and kStartAnchors anchors -- first and last
+// -- are enough to start with; the middle and the quarter point are the
+// spares the kernel adds, in that order, if survivors turn out to be
+// frequent.
 static inline anchors select(const char* pattern, size_t m) {
     const unsigned char* s = (const unsigned char*)pattern;
     anchors a;
@@ -143,19 +159,36 @@ static inline anchors select(const char* pattern, size_t m) {
     }
     const unsigned char b0 = s[a.o[0]], b1 = s[a.o[1]], b2 = s[a.o[2]], b3 = s[a.o[3]];
     const int distinct = 1 + (b1 != b0) + (b2 != b0 && b2 != b1) + (b3 != b0 && b3 != b1 && b3 != b2);
-    if (outside == 0 && distinct != 2) {
+    const int start = kStartAnchors;
+    if (outside == 0 && distinct != 2 && start == 4) {
         a.k = 4;
     } else if (outside != 0 && outside <= limit) {
         a.o[1] = first_out;                   // a rare byte: the best anchor there is
         a.k = 4;
-    } else if (m > kThreeAnchorMax || m <= 8) {
+    } else if (m > kThreeAnchorMax) {
         a.k = 4;
-    } else {
-        // three to start: first, middle, last; the quarter point is the spare
+    } else if (outside == 0 && start == 4) {
+        // two values: first, middle, last carry both; the quarter is the spare
         const size_t quarter = a.o[1];
         a.o[1] = a.o[2]; a.o[2] = a.o[3]; a.o[3] = quarter;
         a.k = 3;
+    } else {
+        // start anchors, then the spares in the order the escalation adds
+        // them: first, last, middle, quarter (first, middle, last when
+        // starting with three).
+        const size_t quarter = a.o[1], middle = a.o[2];
+        a.o[1] = a.o[3]; a.o[2] = middle; a.o[3] = quarter;
+        a.k = start;
+        if (a.k == 3) std::swap(a.o[1], a.o[2]);
+        if (a.k == 4) std::swap(a.o[1], a.o[2]);
     }
+    std::sort(a.o, a.o + a.k);
+    return a;
+}
+
+// One more anchor: the next spare joins the active set, kept sorted.
+static inline anchors escalate(anchors a) {
+    ++a.k;
     std::sort(a.o, a.o + a.k);
     return a;
 }
@@ -167,46 +200,76 @@ static inline anchors select(const char* pattern, size_t m) {
 // and whole small haystacks. Candidate p is live only while p + m <= n, so
 // every load text + p + k with k < m stays inside the buffer.
 // ---------------------------------------------------------------------------
-template <int K>
-static inline __attribute__((always_inline)) std::pair<bool, size_t>
+struct result {
+    bool found;
+    size_t index;
+    int state;       // 0 done; 1 budget exhausted; 2 escalate to one more anchor
+    size_t resume;   // first position not yet ruled out, for states 1 and 2
+    size_t rounds;   // narrowing rounds counted so far (Guarded only)
+    size_t survivors;  // positions that passed the anchors so far (K < 4 only)
+};
+
+// Masked windows over [first, last_exclusive). With fewer than four anchors
+// the survivors of the anchor filter are counted and the escalation rule
+// applies here as in the block loop, with `allowance` standing for the
+// blocks scanned so far: a window whose anchors are common in the haystack
+// would otherwise narrow through the whole needle before the block loop
+// has seen a single block.
+template <bool Guarded, int K>
+static inline __attribute__((always_inline)) result
 masked_windows(const char* text, size_t n, const char* pattern, size_t m,
-               size_t first, size_t last_exclusive, const size_t* o, const __m512i* pv) {
+               size_t first, size_t last_exclusive, const size_t* o, const __m512i* pv,
+               size_t budget_rounds, size_t rounds, size_t survivors, size_t allowance) {
     for (size_t i = first; i < last_exclusive; i += 64) {
         const size_t cand = last_exclusive - i;
         const __mmask64 active = (cand >= 64) ? ~(__mmask64)0 : (((__mmask64)1 << cand) - 1);
+        // Every load is masked by `active`, not by the live mask f: a load
+        // whose mask depends on the previous compare makes each round wait
+        // for the one before (load latency plus compare latency, about eight
+        // cycles), and on an adversarial input a window narrows through the
+        // whole needle. With the constant mask the loads and compares are
+        // independent and only the AND chains, at a cycle a round.
         __mmask64 f = active;
         for (int k = 0; k < K && f != 0; ++k)
-            f = _mm512_mask_cmpeq_epi8_mask(f, _mm512_maskz_loadu_epi8(f, text + i + o[k]), pv[k]);
-        for (size_t k = 0; k < m && f != 0; ++k) {
-            bool is_anchor = false;
-            for (int q = 0; q < K; ++q) is_anchor |= (k == o[q]);
-            if (is_anchor) continue;
-            f = _mm512_mask_cmpeq_epi8_mask(f, _mm512_maskz_loadu_epi8(f, text + i + k),
-                                            _mm512_set1_epi8((char)pattern[k]));
+            f &= _mm512_mask_cmpeq_epi8_mask(active, _mm512_maskz_loadu_epi8(active, text + i + o[k]), pv[k]);
+        if constexpr (K < 4) {
+            if (f != 0) {
+                survivors += (size_t)__builtin_popcountll(f);
+                if (survivors * survivor_cost(m) > allowance) return {false, 0, 2, i, rounds, survivors};
+            }
         }
-        if (f != 0) return {true, i + (size_t)__builtin_ctzll(f)};
+        // The remaining needle bytes in order, as the segments between the
+        // sorted anchor offsets, so no round tests whether it sits on an
+        // anchor. The rounds count against the same budget as the block
+        // loop's: a window is at most 64 positions, but on an adversarial
+        // input it narrows through the whole needle, m rounds.
+        size_t k = 0;
+        for (int q = 0; q <= K && f != 0; ++q) {
+            const size_t end = (q < K) ? o[q] : m;
+            for (; k < end && f != 0; ++k) {
+                f &= _mm512_mask_cmpeq_epi8_mask(active, _mm512_maskz_loadu_epi8(active, text + i + k),
+                                                 _mm512_set1_epi8((char)pattern[k]));
+                if constexpr (Guarded) {
+                    if (++rounds > budget_rounds) return {false, 0, 1, i, rounds, survivors};
+                }
+            }
+            k = end + 1;
+        }
+        if (f != 0) return {true, i + (size_t)__builtin_ctzll(f), 0, 0, rounds, survivors};
     }
-    return {false, 0};
+    return {false, 0, 0, 0, rounds, survivors};
 }
 
 // ---------------------------------------------------------------------------
 // The wide kernel
 // ---------------------------------------------------------------------------
-struct result {
-    bool found;
-    size_t index;
-    int state;       // 0 done; 1 budget exhausted; 2 escalate to four anchors
-    size_t resume;   // first position not yet ruled out, for states 1 and 2
-    size_t rounds;   // narrowing rounds counted so far (Guarded only)
-};
-
 // 256 positions per iteration as four 64-byte chunks; each chunk loads the
 // haystack at the chunk base plus each anchor offset and ANDs the compares.
 // Loads reach text + i + 192 + 63 + o[K-1] <= text + i + 255 + m - 1, inside
 // the buffer by the loop bound. A lone survivor in the block is verified in
 // place; several are narrowed together, one needle byte per round, the rounds
-// counted when Guarded. With K == 3 the block's survivors are also counted
-// and the kernel returns state 2 when they are costing more than a fourth
+// counted when Guarded. With K < 4 the block's survivors are also counted
+// and the kernel returns state 2 when they are costing more than another
 // anchor would (the same rule for K == 4 would only ever say "keep four").
 // Out of line: inlined into the dispatcher, the guarded three-anchor
 // instantiation was register-allocated in the dispatcher's context and
@@ -216,11 +279,11 @@ template <bool Guarded, int K>
 [[gnu::noinline]] static result
 wide(const char* text, size_t n, const char* pattern, size_t m,
      const anchors& a, size_t budget_rounds, size_t rounds, size_t start) {
-    static_assert(K == 3 || K == 4);
+    static_assert(K >= 2 && K <= 4);
     const bool fits = (m <= 64);
     const __mmask64 nmask = fits ? ((m == 64) ? ~(__mmask64)0 : (((__mmask64)1 << m) - 1)) : (__mmask64)0;
     const __m512i nvec = fits ? _mm512_maskz_loadu_epi8(nmask, pattern) : _mm512_setzero_si512();
-    const size_t o0 = a.o[0], o1 = a.o[1], o2 = a.o[2], o3 = a.o[K - 1];
+    const size_t o0 = a.o[0], o1 = a.o[1], o2 = a.o[K > 2 ? 2 : 1], o3 = a.o[K - 1];
     const __m512i p0 = _mm512_set1_epi8((char)pattern[o0]);
     const __m512i p1 = _mm512_set1_epi8((char)pattern[o1]);
     const __m512i p2 = _mm512_set1_epi8((char)pattern[o2]);
@@ -232,23 +295,25 @@ wide(const char* text, size_t n, const char* pattern, size_t m,
     const char* const t0 = text + o0; const char* const t1 = text + o1;
     const char* const t2 = text + o2; const char* const t3 = text + o3;
     size_t i = start;
+    size_t survivors = 0;
     if (start == 0) {
         // Walk to a 64-byte boundary so the offset-0 load of every chunk is
         // aligned (a quarter of the loads; the others split lines whatever
         // the base). One masked window covers the positions skipped.
         const size_t head = avx512_align_head(text, n, m);
         if (head) {
-            auto r = masked_windows<K>(text, n, pattern, m, 0, head, oo, pv);
-            if (r.first) return {true, r.second, 0, 0, rounds};
+            const result r = masked_windows<Guarded, K>(text, n, pattern, m, 0, head, oo, pv, budget_rounds, rounds, 0, 128);
+            if (r.found || r.state != 0) return r;
+            rounds = r.rounds;
+            survivors = r.survivors;
             i = head;
         }
     }
-    // Survivors seen so far with three anchors (K == 3 only). The number of
+    // Survivors seen so far with fewer than four anchors. The number of
     // blocks scanned is not counted: it is (i - first_block) / 256, and a
     // counter incremented every block was spilled to the stack by the
     // compiler and read-modify-written per iteration, which Zen 5 charged
     // 25% of the loop for.
-    size_t survivors = 0;
     const size_t first_block = i;
 #define NH2_CHUNK(OFF)                                                                            \
     (K == 4                                                                                       \
@@ -256,21 +321,24 @@ wide(const char* text, size_t n, const char* pattern, size_t m,
        & _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(t1+i+(OFF))), p1))               \
        & (_mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(t2+i+(OFF))), p2)               \
        & _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(t3+i+(OFF))), p3)))              \
-     : ((_mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(t0+i+(OFF))), p0)                \
+     : K == 3                                                                                     \
+     ? ((_mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(t0+i+(OFF))), p0)                \
        & _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(t1+i+(OFF))), p1))               \
-       & _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(t2+i+(OFF))), p2)))
+       & _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(t2+i+(OFF))), p2))               \
+     : (_mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(t0+i+(OFF))), p0)                 \
+       & _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(t1+i+(OFF))), p1)))
     const size_t last_block = n - m - 255;   // n >= m + 255 here
     for (; i <= last_block; i += 256) {
         __mmask64 fA = NH2_CHUNK(0), fB = NH2_CHUNK(64);
         __mmask64 fC = NH2_CHUNK(128), fD = NH2_CHUNK(192);
         if ((fA | fB | fC | fD) == 0) continue;
-        if constexpr (K == 3) {
+        if constexpr (K < 4) {
             survivors += (size_t)__builtin_popcountll(fA) + (size_t)__builtin_popcountll(fB)
                        + (size_t)__builtin_popcountll(fC) + (size_t)__builtin_popcountll(fD);
-            // Dropping the fourth anchor saves about two cycles per block;
-            // escalate once the survivors it would have removed cost more,
-            // after a short warm-up. blocks = (i - first_block) / 256.
-            if (survivors * survivor_cost(m) > ((i - first_block) >> 7) + 128) return {false, 0, 2, i, rounds};
+            // Each anchor dropped saves about two cycles per block; escalate
+            // once the survivors the next one would remove cost more, after
+            // a short warm-up. blocks = (i - first_block) / 256.
+            if (survivors * survivor_cost(m) > ((i - first_block) >> 7) + 128) return {false, 0, 2, i, rounds, survivors};
         }
         const int nz = (fA != 0) + (fB != 0) + (fC != 0) + (fD != 0);
         const __mmask64 one = fA | fB | fC | fD;
@@ -295,19 +363,23 @@ wide(const char* text, size_t n, const char* pattern, size_t m,
             fB = _mm512_mask_cmpeq_epi8_mask(fB, _mm512_loadu_si512((const void*)(text+i+k+ 64)), pk);
             fC = _mm512_mask_cmpeq_epi8_mask(fC, _mm512_loadu_si512((const void*)(text+i+k+128)), pk);
             fD = _mm512_mask_cmpeq_epi8_mask(fD, _mm512_loadu_si512((const void*)(text+i+k+192)), pk);
-            if constexpr (Guarded) ++rounds;
+            // The budget is tested per round: on ordinary text this loop
+            // runs for a small fraction of the blocks, so the test costs
+            // nothing there, and on an adversarial input a single block can
+            // run m rounds, many times the budget. A give-up resumes at the
+            // block's start, since its positions are not all ruled out.
+            if constexpr (Guarded) {
+                if (++rounds > budget_rounds) return {false, 0, 1, i, rounds};
+            }
         }
         if (fA) return {true, i +   0 + (size_t)__builtin_ctzll(fA), 0, 0, rounds};
         if (fB) return {true, i +  64 + (size_t)__builtin_ctzll(fB), 0, 0, rounds};
         if (fC) return {true, i + 128 + (size_t)__builtin_ctzll(fC), 0, 0, rounds};
         if (fD) return {true, i + 192 + (size_t)__builtin_ctzll(fD), 0, 0, rounds};
-        // Every position in [i, i + 256) is ruled out here, so a give-up
-        // resumes past the block.
-        if constexpr (Guarded) { if (rounds > budget_rounds) return {false, 0, 1, i + 256, rounds}; }
     }
 #undef NH2_CHUNK
-    auto r = masked_windows<K>(text, n, pattern, m, i, n - m + 1, oo, pv);
-    return {r.first, r.second, 0, 0, rounds};
+    return masked_windows<Guarded, K>(text, n, pattern, m, i, n - m + 1, oo, pv, budget_rounds, rounds,
+                                      survivors, ((i - first_block) >> 7) + 128);
 }
 
 // ---------------------------------------------------------------------------
@@ -395,31 +467,52 @@ search_long(const char* text, size_t n, const char* pattern, size_t m) {
     if (n < kMinWide || n < m + 255) {
         if (m == 4) return avx512_naive_search_body(text, n, pattern, m);
         const anchors a = select(pattern, m);
-        __m512i pv[4];
-        for (int k = 0; k < a.k; ++k) pv[k] = _mm512_set1_epi8((char)pattern[a.o[k]]);
-        return a.k == 3 ? masked_windows<3>(text, n, pattern, m, 0, n - m + 1, a.o, pv)
-                        : masked_windows<4>(text, n, pattern, m, 0, n - m + 1, a.o, pv);
+        const size_t budget = Guarded ? n / kBudgetDen + 1 : ~(size_t)0;
+        const bool guarded = Guarded && m > kFreeBelow;
+        auto run = [&](const anchors& an, size_t carried, size_t from) -> result {
+            __m512i pv[4];
+            for (int k = 0; k < an.k; ++k) pv[k] = _mm512_set1_epi8((char)pattern[an.o[k]]);
+            switch (an.k) {
+                case 2: return guarded ? masked_windows<true, 2>(text, n, pattern, m, from, n - m + 1, an.o, pv, budget, carried, 0, 128)
+                                       : masked_windows<false, 2>(text, n, pattern, m, from, n - m + 1, an.o, pv, budget, carried, 0, 128);
+                case 3: return guarded ? masked_windows<true, 3>(text, n, pattern, m, from, n - m + 1, an.o, pv, budget, carried, 0, 128)
+                                       : masked_windows<false, 3>(text, n, pattern, m, from, n - m + 1, an.o, pv, budget, carried, 0, 128);
+                default: return guarded ? masked_windows<true, 4>(text, n, pattern, m, from, n - m + 1, an.o, pv, budget, carried, 0, 128)
+                                        : masked_windows<false, 4>(text, n, pattern, m, from, n - m + 1, an.o, pv, budget, carried, 0, 128);
+            }
+        };
+        anchors an = a;
+        result r = run(an, 0, 0);
+        while (r.state != 0 && an.k < 4) {
+            if (r.state == 1) { an.k = 4; std::sort(an.o, an.o + 4); r = run(an, 0, r.resume); }
+            else              { an = escalate(an); r = run(an, r.rounds, r.resume); }
+        }
+        if (r.state == 0) return {r.found, r.index};
+        return twoway_simd::search_from(text, n, pattern, m, r.resume);
     }
     if (m == 4) return avx512_naive_search256_body(text, n, pattern, m);
     const anchors a = select(pattern, m);
     const size_t budget = Guarded ? n / kBudgetDen + 1 : ~(size_t)0;
     const bool guarded = Guarded && m > kFreeBelow;
-    result r;
-    if (a.k == 4) {
-        r = guarded ? wide<true, 4>(text, n, pattern, m, a, budget, 0, 0)
-                    : wide<false, 4>(text, n, pattern, m, a, budget, 0, 0);
-    } else {
-        r = guarded ? wide<true, 3>(text, n, pattern, m, a, budget, 0, 0)
-                    : wide<false, 3>(text, n, pattern, m, a, budget, 0, 0);
-        if (r.state != 0) {
-            // Survivors too frequent (2), or the budget spent with three
-            // anchors (1): continue with four. A budget give-up gets a fresh
-            // budget, so the bound is 2n/64 rounds plus the two-way pass.
-            anchors a4 = a; a4.k = 4; std::sort(a4.o, a4.o + 4);
-            const size_t carried = (r.state == 1) ? 0 : r.rounds;
-            r = guarded ? wide<true, 4>(text, n, pattern, m, a4, budget, carried, r.resume)
-                        : wide<false, 4>(text, n, pattern, m, a4, budget, carried, r.resume);
+    auto run = [&](const anchors& an, size_t carried, size_t from) -> result {
+        switch (an.k) {
+            case 2: return guarded ? wide<true, 2>(text, n, pattern, m, an, budget, carried, from)
+                                   : wide<false, 2>(text, n, pattern, m, an, budget, carried, from);
+            case 3: return guarded ? wide<true, 3>(text, n, pattern, m, an, budget, carried, from)
+                                   : wide<false, 3>(text, n, pattern, m, an, budget, carried, from);
+            default: return guarded ? wide<true, 4>(text, n, pattern, m, an, budget, carried, from)
+                                    : wide<false, 4>(text, n, pattern, m, an, budget, carried, from);
         }
+    };
+    anchors an = a;
+    result r = run(an, 0, 0);
+    while (r.state != 0 && an.k < 4) {
+        // Survivors too frequent (2): add the next anchor and continue from
+        // the block that showed it. The budget spent with fewer than four
+        // anchors (1): continue with all four and a fresh budget, so the
+        // bound is 2(n/64 + 1) rounds plus the two-way pass.
+        if (r.state == 1) { an.k = 4; std::sort(an.o, an.o + 4); r = run(an, 0, r.resume); }
+        else              { an = escalate(an); r = run(an, r.rounds, r.resume); }
     }
     if (r.state == 0) return {r.found, r.index};
     return twoway_simd::search_from(text, n, pattern, m, r.resume);
@@ -473,6 +566,20 @@ static constexpr size_t kMinWide = 512;
 #define NH2_THREE_ANCHOR_MAX SIZE_MAX
 #endif
 static constexpr size_t kThreeAnchorMax = NH2_THREE_ANCHOR_MAX;
+// Anchors a wide-alphabet needle starts with, as on AVX-512. At 128-bit
+// width the filter's own compares are the cost -- a window is 16 positions,
+// so each anchor is a load, a compare and an AND per 16 positions -- and two
+// anchors (first and last, walked apart) win on text by the same margin
+// three lose by; the escalation rule adds the third and the fourth when
+// survivors show they are needed, one at a time. Measured on an Apple M4 Max
+// against the memchr crate's two-byte NEON filter. Unlike AVX-512, a
+// four-byte needle starts with two anchors here too: there is no separate
+// four-byte kernel, and four anchors on a 16-lane window cost more than the
+// verification they save.
+#ifndef NH2_START_ANCHORS
+#define NH2_START_ANCHORS 2
+#endif
+static constexpr int kStartAnchors = NH2_START_ANCHORS;
 static inline size_t survivor_cost(size_t m) { return 20 + m / 32; }
 
 static inline uint64_t lane_mask(uint8x16_t v) {
@@ -526,17 +633,33 @@ static inline anchors select(const char* pattern, size_t m) {
     }
     const unsigned char b0 = s[a.o[0]], b1 = s[a.o[1]], b2 = s[a.o[2]], b3 = s[a.o[3]];
     const int distinct = 1 + (b1 != b0) + (b2 != b0 && b2 != b1) + (b3 != b0 && b3 != b1 && b3 != b2);
-    if (outside == 0 && distinct != 2) {
+    if (outside == 0 && distinct != 2 && m > 8) {
         a.k = 4;
     } else if (outside != 0 && outside <= limit) {
         a.o[1] = first_out; a.k = 4;
-    } else if (m > kThreeAnchorMax || m <= 8) {
+    } else if (m > kThreeAnchorMax) {
         a.k = 4;
-    } else {
+    } else if (outside == 0 && m > 8) {
+        // two values: first, middle, last carry both; the quarter is the spare
         const size_t quarter = a.o[1];
         a.o[1] = a.o[2]; a.o[2] = a.o[3]; a.o[3] = quarter;
         a.k = 3;
+    } else {
+        // wide alphabet: start with kStartAnchors; the spares follow in the
+        // order the escalation adds them -- first, last, then middle, then
+        // the quarter point.
+        const size_t quarter = a.o[1], middle = a.o[2];
+        a.o[1] = a.o[3]; a.o[2] = middle; a.o[3] = quarter;
+        a.k = kStartAnchors;
+        if (a.k == 3) std::swap(a.o[1], a.o[2]);   // first, middle, last; spare quarter
     }
+    std::sort(a.o, a.o + a.k);
+    return a;
+}
+
+// One more anchor: the next spare joins the active set, kept sorted.
+static inline anchors escalate(anchors a) {
+    ++a.k;
     std::sort(a.o, a.o + a.k);
     return a;
 }
@@ -547,60 +670,83 @@ static inline anchors select(const char* pattern, size_t m) {
 // an overlap window: it starts at the last in-bounds position and lanes below
 // `first` -- already scanned, known not to match -- are ignored.
 // ---------------------------------------------------------------------------
-template <int K>
-static inline std::pair<bool, size_t>
+struct result { bool found; size_t index; int state; size_t resume; size_t rounds; size_t survivors; };
+
+// Windows over [first, n - m]. With fewer than four anchors the survivors
+// of the anchor filter are counted and the escalation rule applies here as
+// in the block loop, `allowance` standing for the blocks scanned so far.
+template <bool Guarded, int K>
+static inline result
 windows(const char* text, size_t n, const char* pattern, size_t m,
-        size_t first, const size_t* o, const uint8x16_t* pv) {
-    if (n < m || first > n - m) return {false, 0};
+        size_t first, const size_t* o, const uint8x16_t* pv, size_t budget_rounds, size_t rounds,
+        size_t survivors, size_t allowance) {
+    if (n < m || first > n - m) return {false, 0, 0, 0, rounds, survivors};
     const size_t positions = n - m + 1;
     if (positions < kW) {
         // fewer than a window of candidates: compare each in place
         for (size_t p = first; p < positions; ++p)
-            if (std::memcmp(text + p, pattern, m) == 0) return {true, p};
-        return {false, 0};
+            if (std::memcmp(text + p, pattern, m) == 0) return {true, p, 0, 0, rounds, survivors};
+        return {false, 0, 0, 0, rounds, survivors};
     }
     const size_t last = positions - kW;   // last window start with every load in bounds
+    // Returns the lane mask of the window's survivors, or 0; sets `stop` to
+    // 1 when the narrowing rounds, counted against the same budget as the
+    // block loop's, ran out, or to 2 when the survivors call for another
+    // anchor (the window is then not resolved).
+    int stop = 0;
     auto window = [&](size_t i) -> uint64_t {
         uint8x16_t f = vceqq_u8(load(text + i + o[0]), pv[0]);
         for (int k = 1; k < K; ++k) f = vandq_u8(f, vceqq_u8(load(text + i + o[k]), pv[k]));
         if (!any_lane(f)) return 0;
-        for (size_t k = 0; k < m; ++k) {
-            bool is_anchor = false;
-            for (int q = 0; q < K; ++q) is_anchor |= (k == o[q]);
-            if (is_anchor) continue;
-            f = vandq_u8(f, vceqq_u8(load(text + i + k), vdupq_n_u8((uint8_t)pattern[k])));
-            if (!any_lane(f)) return 0;
+        if constexpr (K < 4) {
+            survivors += (size_t)__builtin_popcountll(lane_mask(f));
+            if (survivors * survivor_cost(m) > allowance) { stop = 2; return 0; }
+        }
+        // the remaining needle bytes in order, as the segments between the
+        // sorted anchor offsets
+        size_t k = 0;
+        for (int q = 0; q <= K; ++q) {
+            const size_t end = (q < K) ? o[q] : m;
+            for (; k < end; ++k) {
+                f = vandq_u8(f, vceqq_u8(load(text + i + k), vdupq_n_u8((uint8_t)pattern[k])));
+                if (!any_lane(f)) return 0;
+                if constexpr (Guarded) {
+                    if (++rounds > budget_rounds) { stop = 1; return 0; }
+                }
+            }
+            k = end + 1;
         }
         return lane_mask(f);
     };
     size_t i = first;
     for (; i <= last; i += kW) {
         const uint64_t r = window(i);
-        if (r) return {true, i + lane_index(r)};
+        if (r) return {true, i + lane_index(r), 0, 0, rounds, survivors};
+        if (stop) return {false, 0, stop, i, rounds, survivors};
     }
     if (i < positions) {
         uint64_t r = window(last);
+        if (stop) return {false, 0, stop, i, rounds, survivors};
         while (r) {
             const size_t b = last + lane_index(r);
-            if (b >= i) return {true, b};
+            if (b >= i) return {true, b, 0, 0, rounds, survivors};
             r &= r - 1;
         }
     }
-    return {false, 0};
+    return {false, 0, 0, 0, rounds, survivors};
 }
 
 // ---------------------------------------------------------------------------
 // The wide kernel: 64 positions per iteration as four 16-lane windows.
 // ---------------------------------------------------------------------------
-struct result { bool found; size_t index; int state; size_t resume; size_t rounds; };
 
 template <bool Guarded, int K>
 [[gnu::noinline]] static result
 wide(const char* text, size_t n, const char* pattern, size_t m,
      const anchors& a, size_t budget_rounds, size_t rounds, size_t start) {
-    static_assert(K == 3 || K == 4);
+    static_assert(K >= 2 && K <= 4);
     const bool fits = (m <= kW);
-    const size_t o0 = a.o[0], o1 = a.o[1], o2 = a.o[2], o3 = a.o[K - 1];
+    const size_t o0 = a.o[0], o1 = a.o[1], o2 = a.o[K > 2 ? 2 : 1], o3 = a.o[K - 1];
     const uint8x16_t p0 = vdupq_n_u8((uint8_t)pattern[o0]), p1 = vdupq_n_u8((uint8_t)pattern[o1]);
     const uint8x16_t p2 = vdupq_n_u8((uint8_t)pattern[o2]), p3 = vdupq_n_u8((uint8_t)pattern[o3]);
     const size_t oo[4] = {o0, o1, o2, o3};
@@ -622,18 +768,19 @@ wide(const char* text, size_t n, const char* pattern, size_t m,
 #define NH2N_CHUNK(OFF)                                                                       \
     (K == 4 ? vandq_u8(vandq_u8(vceqq_u8(load(t0 + i + (OFF)), p0), vceqq_u8(load(t1 + i + (OFF)), p1)),  \
                        vandq_u8(vceqq_u8(load(t2 + i + (OFF)), p2), vceqq_u8(load(t3 + i + (OFF)), p3)))  \
-            : vandq_u8(vandq_u8(vceqq_u8(load(t0 + i + (OFF)), p0), vceqq_u8(load(t1 + i + (OFF)), p1)),  \
-                       vceqq_u8(load(t2 + i + (OFF)), p2)))
+     : K == 3 ? vandq_u8(vandq_u8(vceqq_u8(load(t0 + i + (OFF)), p0), vceqq_u8(load(t1 + i + (OFF)), p1)),  \
+                       vceqq_u8(load(t2 + i + (OFF)), p2))                                          \
+              : vandq_u8(vceqq_u8(load(t0 + i + (OFF)), p0), vceqq_u8(load(t1 + i + (OFF)), p1)))
     for (; i + m + kB - 1 <= n; i += kB) {
         uint8x16_t fA = NH2N_CHUNK(0),  fB = NH2N_CHUNK(16);
         uint8x16_t fC = NH2N_CHUNK(32), fD = NH2N_CHUNK(48);
         uint8x16_t any = vorrq_u8(vorrq_u8(fA, fB), vorrq_u8(fC, fD));
         if (!any_lane(any)) continue;
         const uint64_t mA = lane_mask(fA), mB = lane_mask(fB), mC = lane_mask(fC), mD = lane_mask(fD);
-        if constexpr (K == 3) {
+        if constexpr (K < 4) {
             survivors += (size_t)__builtin_popcountll(mA) + (size_t)__builtin_popcountll(mB)
                        + (size_t)__builtin_popcountll(mC) + (size_t)__builtin_popcountll(mD);
-            if (survivors * survivor_cost(m) > ((i - first_block) >> 5) + 128) return {false, 0, 2, i, rounds};
+            if (survivors * survivor_cost(m) > ((i - first_block) >> 5) + 128) return {false, 0, 2, i, rounds, survivors};
         }
         const int nz = (mA != 0) + (mB != 0) + (mC != 0) + (mD != 0);
         const uint64_t one = mA | mB | mC | mD;
@@ -652,18 +799,21 @@ wide(const char* text, size_t n, const char* pattern, size_t m,
             fB = vandq_u8(fB, vceqq_u8(load(text + i + k + 16), pk));
             fC = vandq_u8(fC, vceqq_u8(load(text + i + k + 32), pk));
             fD = vandq_u8(fD, vceqq_u8(load(text + i + k + 48), pk));
-            if constexpr (Guarded) ++rounds;
+            // Budget tested per round; a give-up resumes at the block's
+            // start, since its positions are not all ruled out.
+            if constexpr (Guarded) {
+                if (++rounds > budget_rounds) return {false, 0, 1, i, rounds};
+            }
         }
         uint64_t r;
         if ((r = lane_mask(fA))) return {true, i +  0 + lane_index(r), 0, 0, rounds};
         if ((r = lane_mask(fB))) return {true, i + 16 + lane_index(r), 0, 0, rounds};
         if ((r = lane_mask(fC))) return {true, i + 32 + lane_index(r), 0, 0, rounds};
         if ((r = lane_mask(fD))) return {true, i + 48 + lane_index(r), 0, 0, rounds};
-        if constexpr (Guarded) { if (rounds > budget_rounds) return {false, 0, 1, i + kB, rounds}; }
     }
 #undef NH2N_CHUNK
-    auto r = windows<K>(text, n, pattern, m, i, oo, pv);
-    return {r.first, r.second, 0, 0, rounds};
+    return windows<Guarded, K>(text, n, pattern, m, i, oo, pv, budget_rounds, rounds,
+                               survivors, ((i - first_block) >> 5) + 128);
 }
 
 // ---------------------------------------------------------------------------
@@ -725,27 +875,49 @@ template <bool Guarded>
 search_long(const char* text, size_t n, const char* pattern, size_t m) {
     if (n < m) return {false, 0};
     const anchors a = select(pattern, m);
-    if (n < kMinWide || n < m + kB - 1) {
-        uint8x16_t pv[4];
-        for (int k = 0; k < a.k; ++k) pv[k] = vdupq_n_u8((uint8_t)pattern[a.o[k]]);
-        return a.k == 3 ? windows<3>(text, n, pattern, m, 0, a.o, pv)
-                        : windows<4>(text, n, pattern, m, 0, a.o, pv);
-    }
     const size_t budget = Guarded ? n / kBudgetDen + 1 : ~(size_t)0;
     const bool guarded = Guarded && m > kFreeBelow;
-    result r;
-    if (a.k == 4) {
-        r = guarded ? wide<true, 4>(text, n, pattern, m, a, budget, 0, 0)
-                    : wide<false, 4>(text, n, pattern, m, a, budget, 0, 0);
-    } else {
-        r = guarded ? wide<true, 3>(text, n, pattern, m, a, budget, 0, 0)
-                    : wide<false, 3>(text, n, pattern, m, a, budget, 0, 0);
-        if (r.state != 0) {
-            anchors a4 = a; a4.k = 4; std::sort(a4.o, a4.o + 4);
-            const size_t carried = (r.state == 1) ? 0 : r.rounds;
-            r = guarded ? wide<true, 4>(text, n, pattern, m, a4, budget, carried, r.resume)
-                        : wide<false, 4>(text, n, pattern, m, a4, budget, carried, r.resume);
+    if (n < kMinWide || n < m + kB - 1) {
+        auto run = [&](const anchors& an, size_t carried, size_t from) -> result {
+            uint8x16_t pv[4];
+            for (int k = 0; k < an.k; ++k) pv[k] = vdupq_n_u8((uint8_t)pattern[an.o[k]]);
+            switch (an.k) {
+                case 2: return guarded ? windows<true, 2>(text, n, pattern, m, from, an.o, pv, budget, carried, 0, 128)
+                                       : windows<false, 2>(text, n, pattern, m, from, an.o, pv, budget, carried, 0, 128);
+                case 3: return guarded ? windows<true, 3>(text, n, pattern, m, from, an.o, pv, budget, carried, 0, 128)
+                                       : windows<false, 3>(text, n, pattern, m, from, an.o, pv, budget, carried, 0, 128);
+                default: return guarded ? windows<true, 4>(text, n, pattern, m, from, an.o, pv, budget, carried, 0, 128)
+                                        : windows<false, 4>(text, n, pattern, m, from, an.o, pv, budget, carried, 0, 128);
+            }
+        };
+        anchors an = a;
+        result r = run(an, 0, 0);
+        while (r.state != 0 && an.k < 4) {
+            if (r.state == 1) { an.k = 4; std::sort(an.o, an.o + 4); r = run(an, 0, r.resume); }
+            else              { an = escalate(an); r = run(an, r.rounds, r.resume); }
         }
+        if (r.state == 0) return {r.found, r.index};
+        return twoway_simd::search_from(text, n, pattern, m, r.resume);
+    }
+    auto run = [&](const anchors& an, size_t carried, size_t from) -> result {
+        switch (an.k) {
+            case 2: return guarded ? wide<true, 2>(text, n, pattern, m, an, budget, carried, from)
+                                   : wide<false, 2>(text, n, pattern, m, an, budget, carried, from);
+            case 3: return guarded ? wide<true, 3>(text, n, pattern, m, an, budget, carried, from)
+                                   : wide<false, 3>(text, n, pattern, m, an, budget, carried, from);
+            default: return guarded ? wide<true, 4>(text, n, pattern, m, an, budget, carried, from)
+                                    : wide<false, 4>(text, n, pattern, m, an, budget, carried, from);
+        }
+    };
+    anchors an = a;
+    result r = run(an, 0, 0);
+    while (r.state != 0 && an.k < 4) {
+        // Survivors too frequent (2): add the next anchor and continue from
+        // the block that showed it. The budget spent with fewer than four
+        // anchors (1): continue with all four and a fresh budget, so the
+        // bound is 2(n/16 + 1) rounds plus the two-way pass.
+        if (r.state == 1) { an.k = 4; std::sort(an.o, an.o + 4); r = run(an, 0, r.resume); }
+        else              { an = escalate(an); r = run(an, r.rounds, r.resume); }
     }
     if (r.state == 0) return {r.found, r.index};
     return twoway_simd::search_from(text, n, pattern, m, r.resume);
