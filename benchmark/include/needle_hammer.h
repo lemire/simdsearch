@@ -196,8 +196,12 @@ struct result {
 // counted when Guarded. With K == 3 the block's survivors are also counted
 // and the kernel returns state 2 when they are costing more than a fourth
 // anchor would (the same rule for K == 4 would only ever say "keep four").
+// Out of line: inlined into the dispatcher, the guarded three-anchor
+// instantiation was register-allocated in the dispatcher's context and
+// reloaded a broadcast from the stack on every block, which cost 25% on
+// Zen 5. As a function of its own it gets the same code as the unguarded one.
 template <bool Guarded, int K>
-static inline result
+[[gnu::noinline]] static result
 wide(const char* text, size_t n, const char* pattern, size_t m,
      const anchors& a, size_t budget_rounds, size_t rounds, size_t start) {
     static_assert(K == 3 || K == 4);
@@ -227,7 +231,13 @@ wide(const char* text, size_t n, const char* pattern, size_t m,
             i = head;
         }
     }
-    size_t blocks = 0, survivors = 0;
+    // Survivors seen so far with three anchors (K == 3 only). The number of
+    // blocks scanned is not counted: it is (i - first_block) / 256, and a
+    // counter incremented every block was spilled to the stack by the
+    // compiler and read-modify-written per iteration, which Zen 5 charged
+    // 25% of the loop for.
+    size_t survivors = 0;
+    const size_t first_block = i;
 #define NH2_CHUNK(OFF)                                                                            \
     (K == 4                                                                                       \
      ? ((_mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(t0+i+(OFF))), p0)                \
@@ -241,15 +251,14 @@ wide(const char* text, size_t n, const char* pattern, size_t m,
     for (; i <= last_block; i += 256) {
         __mmask64 fA = NH2_CHUNK(0), fB = NH2_CHUNK(64);
         __mmask64 fC = NH2_CHUNK(128), fD = NH2_CHUNK(192);
-        if constexpr (K == 3) ++blocks;
         if ((fA | fB | fC | fD) == 0) continue;
         if constexpr (K == 3) {
             survivors += (size_t)__builtin_popcountll(fA) + (size_t)__builtin_popcountll(fB)
                        + (size_t)__builtin_popcountll(fC) + (size_t)__builtin_popcountll(fD);
             // Dropping the fourth anchor saves about two cycles per block;
             // escalate once the survivors it would have removed cost more,
-            // after a short warm-up.
-            if (survivors * survivor_cost(m) > 2 * blocks + 128) return {false, 0, 2, i, rounds};
+            // after a short warm-up. blocks = (i - first_block) / 256.
+            if (survivors * survivor_cost(m) > ((i - first_block) >> 7) + 128) return {false, 0, 2, i, rounds};
         }
         const int nz = (fA != 0) + (fB != 0) + (fC != 0) + (fD != 0);
         const __mmask64 one = fA | fB | fC | fD;
