@@ -27,13 +27,9 @@ read against -- `find_avx512` (single-window naive), `find_avx512_256`
 128-bit SSE2 (`find_avx128*`) builds of the same kernels over a traits struct,
 so one binary measures all three register widths.
 
-`include/neonsearch.h` is the previous scheme at 128-bit NEON width: `find_neon`
-(single-window), `find_neon_64` (wide), `find_neon_stringzilla` (anchored),
-`find_neon_needle_hammer` (the length-dispatched pair) and its work-counting
-`_guarded` variants. Both of its constants are template parameters, with
-`find_neon_nh_t*` and `find_neon_nh_m*` sweep instances, because they have to be
-fitted across ARM parts rather than read off one machine -- see
-`NEON_NH_TAU`/`NEON_NH_MU` in the header.
+`include/neonsearch.h` carries the component kernels at 128-bit NEON width:
+`find_neon` (single-window naive), `find_neon_64` (64-byte-stride naive),
+`find_neon_stringzilla` (three-anchor filter) and `find_neon_stringzilla_64`.
 
 `include/common_search.h` holds what the two backends share: the three-anchor
 selector and the portable scalar and library searchers (`strstr`, `memmem`,

@@ -26,6 +26,7 @@
   #define SIMD_NAIVE_SEARCH_ALL avx512_naive_search_all
 #elif defined(__aarch64__) || defined(_M_ARM64)
   #include "neonsearch.h"
+  #include "needle_hammer.h"
   #define SIMDSEARCH_NEON 1
   #define SIMD_NAIVE_SEARCH neon_naive_search
   #define SIMD_NAIVE_SEARCH_ALL neon_naive_search_all
@@ -149,6 +150,7 @@ enum class Kind {
   AmortKMP,
   AmortTwoWay,
   AmortTwoWayBC,
+  AmortTwoWaySimd,  // twoway_simd::prep built once per needle
   AmortRustFinder   // memchr::memmem::Finder built once per needle
 };
 
@@ -219,8 +221,10 @@ static const std::vector<Algo> kAlgos = {
     // same kernel with the counter compiled out, to measure the guard.
     {"find_avx512_needle_hammer", Kind::Stateless, avx512_needle_hammer},
     {"find_avx512_needle_hammer_unguarded", Kind::Stateless, avx512_needle_hammer_unguarded},
-    // The fallback on its own: two-way with 64-byte comparison loops.
+    // The fallback on its own: two-way with 64-byte comparison loops, with the
+    // critical factorization rebuilt per call and built once per needle.
     {"find_twoway_simd", Kind::Stateless, twoway_simd_search},
+    {"find_twoway_simd_amortized", Kind::AmortTwoWaySimd, nullptr},
     // The component kernels at 256-bit (AVX2) and 128-bit (SSE2) register
     // width, so the AVX-512 kernels can be read against the same designs at
     // narrower widths.
@@ -244,38 +248,12 @@ static const std::vector<Algo> kAlgos = {
     // window the per-window fixed cost is spread over a quarter as many
     // positions as at 512-bit, so this variant matters more here.
     {"find_neon_stringzilla_64", Kind::Stateless, neon_stringzilla64_find},
-    // The scheme itself, then the two sweeps that fix its constants: tau (the
-    // needle-length switch point) at the shipped mu, and mu (the minimum
-    // haystack for the wide kernel) at the shipped tau.
+    // Needle-Hammer's NEON backend (needle_hammer.h) and the same kernel
+    // without its work counter.
     {"find_neon_needle_hammer", Kind::Stateless, neon_needle_hammer},
-    {"find_neon_nh_t4", Kind::Stateless, neon_needle_hammer_t4},
-    {"find_neon_nh_t8", Kind::Stateless, neon_needle_hammer_t8},
-    {"find_neon_nh_t16", Kind::Stateless, neon_needle_hammer_t16},
-    {"find_neon_nh_t32", Kind::Stateless, neon_needle_hammer_t32},
-    {"find_neon_nh_t64", Kind::Stateless, neon_needle_hammer_t64},
-    {"find_neon_nh_t128", Kind::Stateless, neon_needle_hammer_t128},
-    {"find_neon_nh_t256", Kind::Stateless, neon_needle_hammer_t256},
-    {"find_neon_nh_t512", Kind::Stateless, neon_needle_hammer_t512},
-    {"find_neon_nh_t1024", Kind::Stateless, neon_needle_hammer_t1024},
-    {"find_neon_nh_t2048", Kind::Stateless, neon_needle_hammer_t2048},
-    {"find_neon_nh_t4096", Kind::Stateless, neon_needle_hammer_t4096},
-    {"find_neon_nh_m0", Kind::Stateless, neon_needle_hammer_m0},
-    {"find_neon_nh_m64", Kind::Stateless, neon_needle_hammer_m64},
-    {"find_neon_nh_m128", Kind::Stateless, neon_needle_hammer_m128},
-    {"find_neon_nh_m256", Kind::Stateless, neon_needle_hammer_m256},
-    {"find_neon_nh_m512", Kind::Stateless, neon_needle_hammer_m512},
-    {"find_neon_nh_m1024", Kind::Stateless, neon_needle_hammer_m1024},
-    {"find_neon_nh_m2048", Kind::Stateless, neon_needle_hammer_m2048},
-    {"find_neon_nh_m4096", Kind::Stateless, neon_needle_hammer_m4096},
-    // The same scheme with a run-time work counter that abandons the filter for
-    // two-way once verification work exceeds a budget proportional to n.
-    {"find_neon_needle_hammer_guarded", Kind::Stateless, neon_needle_hammer_guarded},
-    {"find_neon_needle_hammer_guarded_tight", Kind::Stateless,
-     neon_needle_hammer_guarded_tight},
-    // The AVX-512 budget transplanted unchanged, to show what copying the
-    // constant across register widths costs.
-    {"find_neon_needle_hammer_guarded_avx512budget", Kind::Stateless,
-     neon_needle_hammer_guarded_avx512budget},
+    {"find_neon_needle_hammer_unguarded", Kind::Stateless, neon_needle_hammer_unguarded},
+    {"find_twoway_simd", Kind::Stateless, twoway_simd_search},
+    {"find_twoway_simd_amortized", Kind::AmortTwoWaySimd, nullptr},
 #endif
     {"find_bmh", Kind::Stateless, bmh_search},
     {"find_bmh16", Kind::Stateless, bmh_search16},
@@ -317,6 +295,7 @@ struct AmortState {
   std::vector<kmp_prep> kmp;
   std::vector<twoway_prep> tw;
   std::vector<twoway_bc_prep> twbc;
+  std::vector<twoway_simd::prep> tws;
 
 #if defined(SIMDSEARCH_RUST)
   std::vector<void *> rust;  // memchr::memmem::Finder per needle
@@ -349,6 +328,7 @@ struct AmortState {
       kmp[i].build(s.data(), s.size());
       tw[i].build(s.data(), s.size());
       twbc[i].build(s.data(), s.size());
+      tws[i].build(s.data(), s.size());
     }
   }
 };
@@ -368,6 +348,12 @@ struct AmortState {
     const twoway_prep &tw, const char *text, size_t n, const char *pat,
     size_t m) {
   return twoway_search_with(tw, text, n, pat, m);
+}
+
+[[gnu::noinline]] static std::pair<bool, size_t> twoway_simd_amortized(
+    const twoway_simd::prep &tw, const char *text, size_t n, const char *pat,
+    size_t m) {
+  return twoway_simd::search(tw, text, n, pat, m);
 }
 
 [[gnu::noinline]] static std::pair<bool, size_t> twoway_bc_amortized(
@@ -410,6 +396,8 @@ static inline std::pair<bool, size_t> do_find(const Algo &a,
       return twoway_amortized(am.tw[id], text, n, pat, m);
     case Kind::AmortTwoWayBC:
       return twoway_bc_amortized(am.twbc[id], text, n, pat, m);
+    case Kind::AmortTwoWaySimd:
+      return twoway_simd_amortized(am.tws[id], text, n, pat, m);
     case Kind::AmortRustFinder:
 #if defined(SIMDSEARCH_RUST)
       (void)pat; (void)m;

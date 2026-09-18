@@ -11,8 +11,10 @@ one of two architectures:
   written for. The AVX2 and SSE2 builds of the component kernels in
   `avx512search.h` exist to read the AVX-512 kernels against the same designs
   at narrower widths, not as deployment targets.
-- **AArch64 with NEON.** Currently the previous, length-dispatched scheme at
-  128-bit width, with its constants re-fitted for ARM; see the header.
+- **AArch64 with NEON.** The same kernel at 128-bit width: a window is 16
+  positions and a block 64, candidates live in 0x00/0xFF lane vectors rather
+  than mask registers, and the ends of the haystack are covered by overlap
+  windows rather than masked loads.
 
 A build on anything else stops at a `#error`.
 
@@ -28,8 +30,8 @@ A build on anything else stops at a `#error`.
   three-anchor StringZilla-style filter), plus 256-bit (AVX2) and 128-bit
   (SSE2) builds of the same kernels over a traits struct, so one x86 binary
   measures all three register widths.
-- `benchmark/include/neonsearch.h` — the previous scheme at 128-bit AArch64
-  NEON width, with both of its constants exposed as sweep instances.
+- `benchmark/include/neonsearch.h` — the component kernels at 128-bit AArch64
+  NEON width.
 - `benchmark/include/common_search.h` — what both backends share: the anchor
   selector and the scalar and library baselines.
 - `benchmark/benchmarks/benchmark.cpp` — the driver. Modes: `synthetic` (64 KiB
@@ -55,5 +57,5 @@ cmake -B benchmark/build -S benchmark -DCMAKE_BUILD_TYPE=Release
 cmake --build benchmark/build -j
 benchmark/build/benchmark horspool benchmark/data/43-0.txt
 benchmark/build/test_search        # validation
-benchmark/build/test_needle_hammer # the featured kernel's battery (x86-64)
+benchmark/build/test_needle_hammer # the featured kernel's battery
 ```

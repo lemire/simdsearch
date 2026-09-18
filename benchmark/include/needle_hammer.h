@@ -21,17 +21,22 @@
 //   otherwise                  wide kernel, guard budget n/64 rounds; a three-anchor
 //                              start escalates to four, then resumes with two-way
 //
-// Requires AVX-512F/BW/VL/DQ and BMI2. Shares avx512_align_head,
-// avx512_naive_search_body and avx512_naive_search256_body with the earlier
-// kernels in avx512search.h.
-#include <immintrin.h>
+// Two backends: AVX-512 (F/BW), where a window is 64 positions and a block
+// 256, and AArch64 NEON, where a window is 16 positions and a block 64. The
+// NEON kernel keeps candidates as 0x00/0xFF lanes, tests "any lane alive"
+// with shrn + fcmp, and covers the ends of the haystack with overlap windows
+// instead of masked loads, as neonsearch.h does; the design is otherwise the
+// same, with the block-derived constants scaled.
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <utility>
-#include "avx512search.h"
 #include "twoway_simd.h"
+
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+#include <immintrin.h>
+#include "avx512search.h"
 
 namespace needle_hammer {
 
@@ -437,3 +442,327 @@ std::pair<bool, size_t> avx512_needle_hammer(const char* text, size_t n, const c
 std::pair<bool, size_t> avx512_needle_hammer_unguarded(const char* text, size_t n, const char* pattern, size_t m) {
     return needle_hammer::search<false>(text, n, pattern, m);
 }
+
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#include <arm_neon.h>
+
+namespace needle_hammer {
+
+// ---------------------------------------------------------------------------
+// Constants (NEON: window W = 16, block B = 64)
+// ---------------------------------------------------------------------------
+static constexpr size_t kW = 16;
+static constexpr size_t kB = 64;
+// A narrowing round covers 64 positions here, a quarter of the AVX-512 block,
+// so the same instruction budget is four times as many rounds: n/16.
+static constexpr size_t kBudgetDen = 16;
+// Below this needle length the guard is absent: a block admits at most m - 4
+// rounds, so the haystack admits at most n(m - 4)/64, which is at most the
+// budget for m <= 8.
+static constexpr size_t kFreeBelow = 8;
+// Small haystacks take single windows rather than the block loop.
+static constexpr size_t kMinWide = 512;
+#ifndef NH2_THREE_ANCHOR_MAX
+#define NH2_THREE_ANCHOR_MAX SIZE_MAX
+#endif
+static constexpr size_t kThreeAnchorMax = NH2_THREE_ANCHOR_MAX;
+static inline size_t survivor_cost(size_t m) { return 20 + m / 32; }
+
+static inline uint64_t lane_mask(uint8x16_t v) {
+    return vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(v), 4)), 0) & 0x8888888888888888ull;
+}
+static inline bool any_lane(uint8x16_t v) {
+    return vget_lane_f64(vreinterpret_f64_u8(vshrn_n_u16(vreinterpretq_u16_u8(v), 4)), 0) != 0.0;
+}
+static inline uint8x16_t load(const char* p) { return vld1q_u8((const uint8_t*)p); }
+static inline size_t lane_index(uint64_t mask) { return (size_t)__builtin_ctzll(mask) >> 2; }
+
+// ---------------------------------------------------------------------------
+// Anchor selection: identical to the AVX-512 selector; the rarity pass runs
+// sixteen needle bytes at a time, the last partial block through a padded copy.
+// ---------------------------------------------------------------------------
+struct anchors { size_t o[4]; int k; };
+
+static inline void positional(const unsigned char* s, size_t m, size_t o[4]) {
+    o[0] = 0; o[1] = m / 4; o[2] = m / 2; o[3] = m - 1;
+    { int w = 64; while (w-- && s[o[1]] == s[o[0]] && o[1] + 1 < o[2]) ++o[1]; }
+    { int w = 64; while (w-- && s[o[2]] == s[o[0]] && o[2] + 1 < o[3]) ++o[2]; }
+    { int w = 64; while (w-- && (s[o[3]] == s[o[2]] || s[o[3]] == s[o[0]]) && o[3] > o[2] + 1) --o[3]; }
+}
+
+static inline anchors select(const char* pattern, size_t m) {
+    const unsigned char* s = (const unsigned char*)pattern;
+    anchors a;
+    positional(s, m, a.o);
+    const uint8x16_t v0 = vdupq_n_u8(s[a.o[0]]), v1 = vdupq_n_u8(s[a.o[1]]);
+    const uint8x16_t v2 = vdupq_n_u8(s[a.o[2]]), v3 = vdupq_n_u8(s[a.o[3]]);
+    const size_t limit = m / 8 > 1 ? m / 8 : 1;
+    size_t outside = 0, first_out = m;
+    for (size_t k = 0; k < m; k += 16) {
+        uint8x16_t x;
+        if (k + 16 <= m) {
+            x = load(pattern + k);
+        } else {
+            alignas(16) unsigned char buf[16];
+            std::memset(buf, s[a.o[0]], 16);     // padding counts as "inside"
+            std::memcpy(buf, s + k, m - k);
+            x = vld1q_u8(buf);
+        }
+        const uint8x16_t in = vorrq_u8(vorrq_u8(vceqq_u8(x, v0), vceqq_u8(x, v1)),
+                                       vorrq_u8(vceqq_u8(x, v2), vceqq_u8(x, v3)));
+        const uint64_t out = lane_mask(vmvnq_u8(in));
+        if (out) {
+            if (first_out == m) first_out = k + lane_index(out);
+            outside += (size_t)__builtin_popcountll(out);
+            if (outside > limit) break;
+        }
+    }
+    if (outside == 0) {
+        a.k = 4;
+    } else if (outside <= limit) {
+        a.o[1] = first_out; a.k = 4;
+    } else if (m > kThreeAnchorMax || m <= 8) {
+        a.k = 4;
+    } else {
+        const size_t quarter = a.o[1];
+        a.o[1] = a.o[2]; a.o[2] = a.o[3]; a.o[3] = quarter;
+        a.k = 3;
+    }
+    std::sort(a.o, a.o + a.k);
+    return a;
+}
+
+// ---------------------------------------------------------------------------
+// Single windows with the anchors, for the remainder past the block loop and
+// for whole small haystacks. NEON has no masked load, so the last window is
+// an overlap window: it starts at the last in-bounds position and lanes below
+// `first` -- already scanned, known not to match -- are ignored.
+// ---------------------------------------------------------------------------
+template <int K>
+static inline std::pair<bool, size_t>
+windows(const char* text, size_t n, const char* pattern, size_t m,
+        size_t first, const size_t* o, const uint8x16_t* pv) {
+    if (n < m || first > n - m) return {false, 0};
+    const size_t positions = n - m + 1;
+    if (positions < kW) {
+        // fewer than a window of candidates: compare each in place
+        for (size_t p = first; p < positions; ++p)
+            if (std::memcmp(text + p, pattern, m) == 0) return {true, p};
+        return {false, 0};
+    }
+    const size_t last = positions - kW;   // last window start with every load in bounds
+    auto window = [&](size_t i) -> uint64_t {
+        uint8x16_t f = vceqq_u8(load(text + i + o[0]), pv[0]);
+        for (int k = 1; k < K; ++k) f = vandq_u8(f, vceqq_u8(load(text + i + o[k]), pv[k]));
+        if (!any_lane(f)) return 0;
+        for (size_t k = 0; k < m; ++k) {
+            bool is_anchor = false;
+            for (int q = 0; q < K; ++q) is_anchor |= (k == o[q]);
+            if (is_anchor) continue;
+            f = vandq_u8(f, vceqq_u8(load(text + i + k), vdupq_n_u8((uint8_t)pattern[k])));
+            if (!any_lane(f)) return 0;
+        }
+        return lane_mask(f);
+    };
+    size_t i = first;
+    for (; i <= last; i += kW) {
+        const uint64_t r = window(i);
+        if (r) return {true, i + lane_index(r)};
+    }
+    if (i < positions) {
+        uint64_t r = window(last);
+        while (r) {
+            const size_t b = last + lane_index(r);
+            if (b >= i) return {true, b};
+            r &= r - 1;
+        }
+    }
+    return {false, 0};
+}
+
+// ---------------------------------------------------------------------------
+// The wide kernel: 64 positions per iteration as four 16-lane windows.
+// ---------------------------------------------------------------------------
+struct result { bool found; size_t index; int state; size_t resume; size_t rounds; };
+
+template <bool Guarded, int K>
+[[gnu::noinline]] static result
+wide(const char* text, size_t n, const char* pattern, size_t m,
+     const anchors& a, size_t budget_rounds, size_t rounds, size_t start) {
+    static_assert(K == 3 || K == 4);
+    const bool fits = (m <= kW);
+    const size_t o0 = a.o[0], o1 = a.o[1], o2 = a.o[2], o3 = a.o[K - 1];
+    const uint8x16_t p0 = vdupq_n_u8((uint8_t)pattern[o0]), p1 = vdupq_n_u8((uint8_t)pattern[o1]);
+    const uint8x16_t p2 = vdupq_n_u8((uint8_t)pattern[o2]), p3 = vdupq_n_u8((uint8_t)pattern[o3]);
+    const size_t oo[4] = {o0, o1, o2, o3};
+    const uint8x16_t pv[4] = {p0, p1, p2, p3};
+    const char* const t0 = text + o0; const char* const t1 = text + o1;
+    const char* const t2 = text + o2; const char* const t3 = text + o3;
+    // needle staged once for m <= 16
+    alignas(16) uint8_t nbuf[16] = {};
+    if (fits) std::memcpy(nbuf, pattern, m);
+    const uint8x16_t nvec = vld1q_u8(nbuf);
+    const uint64_t nbits = 0x8888888888888888ull & ((m >= 16) ? ~(uint64_t)0 : (((uint64_t)1 << (4 * m)) - 1));
+    auto verify = [&](size_t pos) -> bool {
+        if (fits && pos + kW <= n) return (lane_mask(vceqq_u8(load(text + pos), nvec)) & nbits) == nbits;
+        return std::memcmp(text + pos, pattern, m) == 0;
+    };
+    size_t i = start;
+    const size_t first_block = i;
+    size_t survivors = 0;
+#define NH2N_CHUNK(OFF)                                                                       \
+    (K == 4 ? vandq_u8(vandq_u8(vceqq_u8(load(t0 + i + (OFF)), p0), vceqq_u8(load(t1 + i + (OFF)), p1)),  \
+                       vandq_u8(vceqq_u8(load(t2 + i + (OFF)), p2), vceqq_u8(load(t3 + i + (OFF)), p3)))  \
+            : vandq_u8(vandq_u8(vceqq_u8(load(t0 + i + (OFF)), p0), vceqq_u8(load(t1 + i + (OFF)), p1)),  \
+                       vceqq_u8(load(t2 + i + (OFF)), p2)))
+    for (; i + m + kB - 1 <= n; i += kB) {
+        uint8x16_t fA = NH2N_CHUNK(0),  fB = NH2N_CHUNK(16);
+        uint8x16_t fC = NH2N_CHUNK(32), fD = NH2N_CHUNK(48);
+        uint8x16_t any = vorrq_u8(vorrq_u8(fA, fB), vorrq_u8(fC, fD));
+        if (!any_lane(any)) continue;
+        const uint64_t mA = lane_mask(fA), mB = lane_mask(fB), mC = lane_mask(fC), mD = lane_mask(fD);
+        if constexpr (K == 3) {
+            survivors += (size_t)__builtin_popcountll(mA) + (size_t)__builtin_popcountll(mB)
+                       + (size_t)__builtin_popcountll(mC) + (size_t)__builtin_popcountll(mD);
+            if (survivors * survivor_cost(m) > ((i - first_block) >> 5) + 128) return {false, 0, 2, i, rounds};
+        }
+        const int nz = (mA != 0) + (mB != 0) + (mC != 0) + (mD != 0);
+        const uint64_t one = mA | mB | mC | mD;
+        if (nz == 1 && (one & (one - 1)) == 0) {
+            const size_t off = (mA != 0) ? 0 : (mB != 0) ? 16 : (mC != 0) ? 32 : 48;
+            const size_t b = i + off + lane_index(one);
+            if (verify(b)) return {true, b, 0, 0, rounds};
+            continue;
+        }
+        for (size_t k = 0; k < m; ++k) {
+            if (k == o0 || k == o1 || k == o2 || k == o3) continue;
+            any = vorrq_u8(vorrq_u8(fA, fB), vorrq_u8(fC, fD));
+            if (!any_lane(any)) break;
+            const uint8x16_t pk = vdupq_n_u8((uint8_t)pattern[k]);
+            fA = vandq_u8(fA, vceqq_u8(load(text + i + k +  0), pk));
+            fB = vandq_u8(fB, vceqq_u8(load(text + i + k + 16), pk));
+            fC = vandq_u8(fC, vceqq_u8(load(text + i + k + 32), pk));
+            fD = vandq_u8(fD, vceqq_u8(load(text + i + k + 48), pk));
+            if constexpr (Guarded) ++rounds;
+        }
+        uint64_t r;
+        if ((r = lane_mask(fA))) return {true, i +  0 + lane_index(r), 0, 0, rounds};
+        if ((r = lane_mask(fB))) return {true, i + 16 + lane_index(r), 0, 0, rounds};
+        if ((r = lane_mask(fC))) return {true, i + 32 + lane_index(r), 0, 0, rounds};
+        if ((r = lane_mask(fD))) return {true, i + 48 + lane_index(r), 0, 0, rounds};
+        if constexpr (Guarded) { if (rounds > budget_rounds) return {false, 0, 1, i + kB, rounds}; }
+    }
+#undef NH2N_CHUNK
+    auto r = windows<K>(text, n, pattern, m, i, oo, pv);
+    return {r.first, r.second, 0, 0, rounds};
+}
+
+// ---------------------------------------------------------------------------
+// Short needles, m in {1, 2, 3}: the filter is the whole needle.
+// ---------------------------------------------------------------------------
+template <int M>
+static inline std::pair<bool, size_t>
+short_search(const char* text, size_t n, const char* pattern) {
+    static_assert(M >= 1 && M <= 3);
+    const size_t m = M;
+    if (n < m) return {false, 0};
+    const size_t positions = n - m + 1;
+    const uint8x16_t q0 = vdupq_n_u8((uint8_t)pattern[0]);
+    const uint8x16_t q1 = vdupq_n_u8((uint8_t)pattern[M > 1 ? 1 : 0]);
+    const uint8x16_t q2 = vdupq_n_u8((uint8_t)pattern[M > 2 ? 2 : 0]);
+    if (positions < kW) {
+        for (size_t p = 0; p < positions; ++p)
+            if (std::memcmp(text + p, pattern, m) == 0) return {true, p};
+        return {false, 0};
+    }
+#define NH2N_SHORT(BASE)                                                                    \
+    (M == 1 ? vceqq_u8(load(BASE), q0)                                                      \
+     : M == 2 ? vandq_u8(vceqq_u8(load(BASE), q0), vceqq_u8(load((BASE) + 1), q1))          \
+              : vandq_u8(vandq_u8(vceqq_u8(load(BASE), q0), vceqq_u8(load((BASE) + 1), q1)), \
+                         vceqq_u8(load((BASE) + 2), q2)))
+    const size_t last = positions - kW;
+    size_t i = 0;
+    for (; i + kB - 1 <= last; i += kB) {
+        const uint8x16_t fA = NH2N_SHORT(text + i), fB = NH2N_SHORT(text + i + 16);
+        const uint8x16_t fC = NH2N_SHORT(text + i + 32), fD = NH2N_SHORT(text + i + 48);
+        if (!any_lane(vorrq_u8(vorrq_u8(fA, fB), vorrq_u8(fC, fD)))) continue;
+        uint64_t r;
+        if ((r = lane_mask(fA))) return {true, i +  0 + lane_index(r)};
+        if ((r = lane_mask(fB))) return {true, i + 16 + lane_index(r)};
+        if ((r = lane_mask(fC))) return {true, i + 32 + lane_index(r)};
+        r = lane_mask(fD);       return {true, i + 48 + lane_index(r)};
+    }
+    for (; i <= last; i += kW) {
+        const uint8x16_t f = NH2N_SHORT(text + i);
+        if (any_lane(f)) return {true, i + lane_index(lane_mask(f))};
+    }
+    if (i < positions) {
+        uint64_t r = lane_mask(NH2N_SHORT(text + last));
+        while (r) {
+            const size_t b = last + lane_index(r);
+            if (b >= i) return {true, b};
+            r &= r - 1;
+        }
+    }
+#undef NH2N_SHORT
+    return {false, 0};
+}
+
+// ---------------------------------------------------------------------------
+// Dispatcher
+// ---------------------------------------------------------------------------
+template <bool Guarded>
+[[gnu::noinline]] static std::pair<bool, size_t>
+search_long(const char* text, size_t n, const char* pattern, size_t m) {
+    if (n < m) return {false, 0};
+    const anchors a = select(pattern, m);
+    if (n < kMinWide || n < m + kB - 1) {
+        uint8x16_t pv[4];
+        for (int k = 0; k < a.k; ++k) pv[k] = vdupq_n_u8((uint8_t)pattern[a.o[k]]);
+        return a.k == 3 ? windows<3>(text, n, pattern, m, 0, a.o, pv)
+                        : windows<4>(text, n, pattern, m, 0, a.o, pv);
+    }
+    const size_t budget = Guarded ? n / kBudgetDen + 1 : ~(size_t)0;
+    const bool guarded = Guarded && m > kFreeBelow;
+    result r;
+    if (a.k == 4) {
+        r = guarded ? wide<true, 4>(text, n, pattern, m, a, budget, 0, 0)
+                    : wide<false, 4>(text, n, pattern, m, a, budget, 0, 0);
+    } else {
+        r = guarded ? wide<true, 3>(text, n, pattern, m, a, budget, 0, 0)
+                    : wide<false, 3>(text, n, pattern, m, a, budget, 0, 0);
+        if (r.state != 0) {
+            anchors a4 = a; a4.k = 4; std::sort(a4.o, a4.o + 4);
+            const size_t carried = (r.state == 1) ? 0 : r.rounds;
+            r = guarded ? wide<true, 4>(text, n, pattern, m, a4, budget, carried, r.resume)
+                        : wide<false, 4>(text, n, pattern, m, a4, budget, carried, r.resume);
+        }
+    }
+    if (r.state == 0) return {r.found, r.index};
+    return twoway_simd::search_from(text, n, pattern, m, r.resume);
+}
+
+template <bool Guarded = true>
+[[gnu::always_inline]] static inline std::pair<bool, size_t>
+search(const char* text, size_t n, const char* pattern, size_t m) {
+    switch (m) {
+        case 0: return {true, 0};
+        case 1: return short_search<1>(text, n, pattern);
+        case 2: return short_search<2>(text, n, pattern);
+        case 3: return short_search<3>(text, n, pattern);
+        default: return search_long<Guarded>(text, n, pattern, m);
+    }
+}
+
+}  // namespace needle_hammer
+
+std::pair<bool, size_t> neon_needle_hammer(const char* text, size_t n, const char* pattern, size_t m) {
+    return needle_hammer::search<true>(text, n, pattern, m);
+}
+std::pair<bool, size_t> neon_needle_hammer_unguarded(const char* text, size_t n, const char* pattern, size_t m) {
+    return needle_hammer::search<false>(text, n, pattern, m);
+}
+
+#else
+#error "needle_hammer.h: no SIMD backend (needs AVX-512F+BW or AArch64 NEON)"
+#endif

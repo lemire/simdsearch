@@ -7,12 +7,20 @@
 #include <cmath>
 #include "needle_hammer.h"
 
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+  #define NH_GUARDED avx512_needle_hammer
+  #define NH_UNGUARDED avx512_needle_hammer_unguarded
+#else
+  #define NH_GUARDED neon_needle_hammer
+  #define NH_UNGUARDED neon_needle_hammer_unguarded
+#endif
+
 static int fails = 0;
 static void check(const std::string& t, const std::string& p, const char* what) {
     size_t ref = t.find(p);
     std::pair<bool, size_t> want{ref != std::string::npos, ref == std::string::npos ? 0 : ref};
-    auto g = avx512_needle_hammer(t.data(), t.size(), p.data(), p.size());
-    auto u = avx512_needle_hammer_unguarded(t.data(), t.size(), p.data(), p.size());
+    auto g = NH_GUARDED(t.data(), t.size(), p.data(), p.size());
+    auto u = NH_UNGUARDED(t.data(), t.size(), p.data(), p.size());
     if (g != want || u != want) {
         if (fails < 20)
             std::fprintf(stderr, "FAIL %s: n=%zu m=%zu want (%d,%zu) guarded (%d,%zu) unguarded (%d,%zu)\n",

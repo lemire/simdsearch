@@ -1,5 +1,6 @@
 #pragma once
-// Crochemore-Perrin two-way with AVX-512BW comparison loops.
+// Crochemore-Perrin two-way with vectorized comparison loops (AVX-512BW, or
+// NEON on AArch64).
 //
 // The scalar two-way (kmp_twoway.h) spends its time in two byte loops,
 //     while (i < m && nd[i] == hay[i + j]) ++i;          // right half, forward
@@ -15,11 +16,13 @@
 // No filter: this is the linear-time fallback a filtering kernel resumes with
 // once its work budget is spent, and it must stay linear on every input. The
 // shift logic is exactly the scalar algorithm's.
-#include <immintrin.h>
 #include <cstddef>
 #include <cstdint>
 #include <utility>
 #include "kmp_twoway.h"
+
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+#include <immintrin.h>
 
 namespace twoway_simd {
 
@@ -225,6 +228,107 @@ search_from(const char* text, size_t n, const char* pat, size_t m, size_t from) 
 }
 
 }  // namespace twoway_simd
+
+#elif defined(__aarch64__) || defined(_M_ARM64)
+#include <arm_neon.h>
+
+namespace twoway_simd {
+
+// Lane bits of a 0x00/0xFF vector, one bit per byte lane at bit 4k+3.
+static inline uint64_t lane_mask(uint8x16_t v) {
+    return vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(v), 4)), 0) & 0x8888888888888888ull;
+}
+
+// Leading equal bytes of a[0..len) vs b[0..len): 16 bytes per compare, the
+// first differing lane by ctz of the mismatch mask; the last partial block
+// byte by byte.
+static inline size_t lcp(const uint8_t* a, const uint8_t* b, size_t len) {
+    size_t k = 0;
+    for (; k + 16 <= len; k += 16) {
+        const uint64_t ne = lane_mask(vmvnq_u8(vceqq_u8(vld1q_u8(a + k), vld1q_u8(b + k))));
+        if (ne) return k + ((size_t)__builtin_ctzll(ne) >> 2);
+    }
+    while (k < len && a[k] == b[k]) ++k;
+    return k;
+}
+
+// Trailing equal bytes of a[0..len) vs b[0..len), scanning from the end.
+static inline size_t lcs(const uint8_t* a, const uint8_t* b, size_t len) {
+    size_t k = len;
+    while (k >= 16) {
+        const uint64_t ne = lane_mask(vmvnq_u8(vceqq_u8(vld1q_u8(a + k - 16), vld1q_u8(b + k - 16))));
+        if (ne) {
+            const size_t lane = (size_t)(63 - __builtin_clzll(ne)) >> 2;   // highest differing lane
+            return (len - k) + (15 - lane);
+        }
+        k -= 16;
+    }
+    size_t t = 0;
+    while (t < k && a[k - 1 - t] == b[k - 1 - t]) ++t;
+    return (len - k) + t;
+}
+
+struct prep {
+    twoway_prep tw;
+    void build(const char* needle, size_t m) { tw.build(needle, m); }
+};
+
+// Verify window j in two-way order: m on a full match, the index of the first
+// right-half mismatch when < m, or LEFT_FAIL when the right half matched but
+// the left half did not. The first four bytes of the right half are compared
+// scalar-ly, as in the AVX-512 version: on inputs where nearly every window
+// mismatches at once a vector compare is pure per-window overhead.
+static constexpr size_t LEFT_FAIL = SIZE_MAX;
+
+static inline size_t verify(const prep& P, const uint8_t* hay, const uint8_t* nd, size_t m,
+                            size_t j, size_t memory) {
+    const size_t crit = P.tw.crit;
+    size_t i = memory > crit ? memory : crit;
+    const size_t lim = i + 4 < m ? i + 4 : m;
+    while (i < lim && nd[i] == hay[j + i]) ++i;
+    if (i < lim) return i;
+    if (i < m) i += lcp(nd + i, hay + j + i, m - i);
+    if (i < m) return i;
+    if (memory >= crit) return m;
+    const size_t need = crit - memory;
+    return lcs(nd + memory, hay + j + memory, need) == need ? m : LEFT_FAIL;
+}
+
+static inline std::pair<bool, size_t>
+search(const prep& P, const char* text, size_t n, const char* pat, size_t m) {
+    if (m == 0) return {true, 0};
+    if (n < m) return {false, 0};
+    const uint8_t* hay = (const uint8_t*)text;
+    const uint8_t* nd = (const uint8_t*)pat;
+    const size_t crit = P.tw.crit, period = P.tw.period;
+    const bool periodic = P.tw.periodic;
+    const size_t last = n - m;
+    size_t j = 0, memory = 0;
+    while (j <= last) {
+        const size_t i0 = memory > crit ? memory : crit;
+        if (hay[j + i0] != nd[i0]) { j += i0 - crit + 1; memory = 0; continue; }
+        const size_t i = verify(P, hay, nd, m, j, memory);
+        if (i == m) return {true, j};
+        if (i == LEFT_FAIL) { j += period; memory = periodic ? m - period : 0; }
+        else { j += i - crit + 1; memory = 0; }
+    }
+    return {false, 0};
+}
+
+static inline std::pair<bool, size_t>
+search_from(const char* text, size_t n, const char* pat, size_t m, size_t from) {
+    if (from + m > n) return {false, 0};
+    prep P; P.build(pat, m);
+    auto [f, idx] = search(P, text + from, n - from, pat, m);
+    if (!f) return {false, 0};
+    return {true, from + idx};
+}
+
+}  // namespace twoway_simd
+
+#else
+#error "twoway_simd.h: no SIMD backend (needs AVX-512F+BW or AArch64 NEON)"
+#endif
 
 // Stateless entry point in the style of the other searchers.
 std::pair<bool, size_t> twoway_simd_search(const char* text, size_t n, const char* pattern, size_t m) {

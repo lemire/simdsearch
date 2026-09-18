@@ -10,16 +10,12 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
-# Needle-Hammer's two constants can be overridden at configure time, which is
-# how the tau/mu sweep harness re-fits them per machine without editing the
-# header. Empty means "use the header's shipped value".
-set(NEON_NH_TAU "" CACHE STRING "NEON Needle-Hammer needle threshold (tau)")
-set(NEON_NH_MU "" CACHE STRING "NEON Needle-Hammer haystack guard (mu)")
-foreach(knob NEON_NH_TAU NEON_NH_MU)
-    if(NOT ${knob} STREQUAL "")
-        add_compile_definitions(${knob}=${${knob}})
-    endif()
-endforeach()
+# Needle-Hammer's three-anchor switch point can be overridden at configure
+# time (NH2_THREE_ANCHOR_MAX); empty means the header's shipped value.
+set(NH2_THREE_ANCHOR_MAX "" CACHE STRING "Needle-Hammer: longest needle that starts with three anchors")
+if(NOT NH2_THREE_ANCHOR_MAX STREQUAL "")
+    add_compile_definitions(NH2_THREE_ANCHOR_MAX=${NH2_THREE_ANCHOR_MAX})
+endif()
 
 # SIMD flags: on x86-64, the AVX-512 subsets avx512search.h uses (F + BW for
 # masked byte compares, plus VL/DQ) and the AVX2/SSE2 the narrower kernels need.
@@ -76,12 +72,10 @@ target_include_directories(test_search PRIVATE include)
 target_compile_options(test_search PRIVATE ${SIMDSEARCH_ARCH_FLAGS})
 add_test(NAME test_search COMMAND test_search)
 
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
-    # Needle-Hammer's own battery: block boundaries at every alignment,
-    # small haystacks, periodic needles, escalation and guard give-up, fuzz.
-    add_executable(test_needle_hammer tests/test_needle_hammer.cpp)
-    target_include_directories(test_needle_hammer PRIVATE include)
-    target_compile_options(test_needle_hammer PRIVATE ${SIMDSEARCH_ARCH_FLAGS})
-    add_test(NAME test_needle_hammer COMMAND test_needle_hammer)
-endif()
+# Needle-Hammer's own battery: block boundaries at every alignment, small
+# haystacks, periodic needles, escalation and guard give-up, fuzz.
+add_executable(test_needle_hammer tests/test_needle_hammer.cpp)
+target_include_directories(test_needle_hammer PRIVATE include)
+target_compile_options(test_needle_hammer PRIVATE ${SIMDSEARCH_ARCH_FLAGS})
+add_test(NAME test_needle_hammer COMMAND test_needle_hammer)
 
