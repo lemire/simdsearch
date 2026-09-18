@@ -4,20 +4,36 @@ SIMD substring search benchmarks. Two backends, selected by the host
 architecture: **AVX-512** (requires AVX-512F and AVX-512BW) and **AArch64
 NEON**. A build on anything else stops at a `#error`.
 
-`include/avx512search.h` carries the x86 kernels -- `find_avx512`,
-`find_avx512_256`, `find_avx512_stringzilla`, `find_avx512_needle_hammer`,
-`find_avx512_stringzilla_256` -- along with 256-bit AVX2 (`find_avx256*`) and
-128-bit SSE2 (`find_avx128*`) builds of the same kernels over a traits struct, so
-one binary measures all three register widths.
+`include/needle_hammer.h` is Needle-Hammer, the featured searcher
+(`find_avx512_needle_hammer`, and `find_avx512_needle_hammer_unguarded` for
+measuring the guard): a single wide kernel that tests every candidate position
+on three or four needle bytes chosen for selectivity -- first, middle and last
+byte, plus a quarter point or, when the needle has one, a byte that is rare in
+it -- 256 positions per iteration, then narrows the survivors byte by byte.
+Three anchors are used while the haystack shows they suffice and a fourth is
+added once survivors become frequent; needles of one to three bytes take a
+dedicated loop with no verification at all; and a work counter bounds the
+narrowing, resuming with the vectorized two-way in `include/twoway_simd.h`
+(`find_twoway_simd`) so every input is searched in linear time. There is no
+needle-length threshold to fit per machine. The constants are documented in
+the header; `NH2_THREE_ANCHOR_MAX` can be set at compile time. AVX-512 only
+for now: the NEON backend still carries the previous scheme.
 
-`include/neonsearch.h` is the same scheme at 128-bit NEON width: `find_neon`
+`include/avx512search.h` carries the x86 component kernels the featured one is
+read against -- `find_avx512` (single-window naive), `find_avx512_256`
+(256-byte-stride naive, the loop Needle-Hammer's is built on),
+`find_avx512_stringzilla` (three-anchor filter, StringZilla's design) and
+`find_avx512_stringzilla_256` -- along with 256-bit AVX2 (`find_avx256*`) and
+128-bit SSE2 (`find_avx128*`) builds of the same kernels over a traits struct,
+so one binary measures all three register widths.
+
+`include/neonsearch.h` is the previous scheme at 128-bit NEON width: `find_neon`
 (single-window), `find_neon_64` (wide), `find_neon_stringzilla` (anchored),
-`find_neon_needle_hammer` and its work-counting `_guarded` variants. Both
-Needle-Hammer constants are template parameters here rather than literals, with
+`find_neon_needle_hammer` (the length-dispatched pair) and its work-counting
+`_guarded` variants. Both of its constants are template parameters, with
 `find_neon_nh_t*` and `find_neon_nh_m*` sweep instances, because they have to be
 fitted across ARM parts rather than read off one machine -- see
-`NEON_NH_TAU`/`NEON_NH_MU` in the header for what the fit concluded and why the
-answer is not a rescaling of the AVX-512 one.
+`NEON_NH_TAU`/`NEON_NH_MU` in the header.
 
 `include/common_search.h` holds what the two backends share: the three-anchor
 selector and the portable scalar and library searchers (`strstr`, `memmem`,

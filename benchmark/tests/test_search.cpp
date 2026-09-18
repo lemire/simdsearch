@@ -19,6 +19,7 @@
 
 #if defined(__AVX512F__) && defined(__AVX512BW__)
   #include "avx512search.h"
+  #include "needle_hammer.h"
   #define SIMDSEARCH_AVX512 1
 #elif defined(__aarch64__) || defined(_M_ARM64)
   #include "neonsearch.h"
@@ -33,9 +34,8 @@
 // against the scheme rather than against one architecture.
 #if defined(SIMDSEARCH_AVX512)
   #define SIMD_NAIVE_SEARCH_ALL avx512_naive_search_all
-  #define SIMD_WIDE_GUARDED avx512_naive_search256_guarded
-  #define SIMD_NEEDLE_HAMMER avx512_needle_hammer
-  #define SIMD_NEEDLE_HAMMER_GUARDED avx512_needle_hammer_guarded
+  #define SIMD_NEEDLE_HAMMER avx512_needle_hammer_unguarded
+  #define SIMD_NEEDLE_HAMMER_GUARDED avx512_needle_hammer
 #else
   #define SIMD_NAIVE_SEARCH_ALL neon_naive_search_all
   #define SIMD_WIDE_GUARDED neon_naive_search64_guarded
@@ -107,32 +107,20 @@ int main() {
       // picks different anchors, so it exercises a different path through the
       // selector and must be validated separately.
       {"avx512_stringzilla_find_hifilter", avx512_stringzilla_find_hifilter},
+      // Needle-Hammer must agree with everyone else on every input, including
+      // the ones that make it abandon the filter for two-way -- the fallback
+      // path is only correct if it returns the same index -- and so must the
+      // same kernel with the counter compiled out.
       {"avx512_needle_hammer", avx512_needle_hammer},
-      {"avx512_needle_hammer16", avx512_needle_hammer16},
-      {"avx512_needle_hammer32", avx512_needle_hammer32},
-      {"avx512_needle_hammer64", avx512_needle_hammer64},
-      {"avx512_needle_hammer128", avx512_needle_hammer128},
-      {"avx512_needle_hammer256", avx512_needle_hammer256},
-      {"avx512_needle_hammer512", avx512_needle_hammer512},
-      // The guarded variants must agree with everyone else on every input,
-      // including the ones that make them abandon the filter for two-way --
-      // the fallback path is only correct if it returns the same index.
-      {"avx512_needle_hammer_guarded", avx512_needle_hammer_guarded},
-      {"avx512_needle_hammer_guarded_tight", avx512_needle_hammer_guarded_tight},
-      {"avx512_needle_hammer_guarded_loose", avx512_needle_hammer_guarded_loose},
+      {"avx512_needle_hammer_unguarded", avx512_needle_hammer_unguarded},
+      {"twoway_simd_search", twoway_simd_search},
       {"avx512_stringzilla256_find", avx512_stringzilla256_find},
       {"avx256_naive_search", avx256_naive_search},
       {"avx256_naive_search128", avx256_naive_search128},
       {"avx256_stringzilla_find", avx256_stringzilla_find},
-      {"avx256_needle_hammer", avx256_needle_hammer},
-      {"avx256_needle_hammer64", avx256_needle_hammer64},
-      {"avx256_needle_hammer512", avx256_needle_hammer512},
       {"avx128_naive_search", avx128_naive_search},
       {"avx128_naive_search64", avx128_naive_search64},
       {"avx128_stringzilla_find", avx128_stringzilla_find},
-      {"avx128_needle_hammer", avx128_needle_hammer},
-      {"avx128_needle_hammer64", avx128_needle_hammer64},
-      {"avx128_needle_hammer512", avx128_needle_hammer512},
 #endif
 #if defined(SIMDSEARCH_NEON)
       {"neon_naive_search", neon_naive_search},
@@ -435,30 +423,51 @@ int main() {
   // the answer is a real match, so it fails if the resume is dropped, if it
   // resumes at the wrong offset, or if the budget stops firing at all.
   //
-  // Haystack is all 'a' with the needle appended, needle is a^(m-1) then 'b'.
-  // Every position survives the four-byte filter, so the wide kernel narrows
-  // m-4 rounds per 256-byte block: n(m-4)/256 rounds against a budget of n/8,
-  // which at m = 64 is 4x over. The single match sits at the very end, past the
-  // give-up point, and only the two-way resume can find it.
+  // The input has to defeat the kernel's filter, and the two backends have
+  // different filters. For the NEON scheme (first-bytes filter) the haystack
+  // is all 'a' with the needle a^(m-1)b appended: every position survives the
+  // four-byte filter. Needle-Hammer's selector would anchor that needle on its
+  // 'b' and reject everything, so it gets the block shape instead: an all-'a'
+  // needle over a haystack of (a^(m-1) b) repeated, which offers no
+  // distinctive byte at all, with a run of m 'a's appended as the only match.
+  // Either way the narrowing exceeds the budget long before the match, and only
+  // the two-way resume can find it.
   {
     const size_t m = 64, prefix = 20000;
+#if defined(SIMDSEARCH_AVX512)
+    std::string needle(m, 'a');
+    std::string hay(prefix, 'a');
+    for (size_t i = 0; i < prefix; ++i) if (i % m == m - 1) hay[i] = 'b';
+    hay += needle;
+    const size_t match = hay.find(needle);
+    const needle_hammer::anchors a = needle_hammer::select(needle.data(), m);
+    needle_hammer::result r = a.k == 3
+        ? needle_hammer::wide<true, 3>(hay.data(), hay.size(), needle.data(), m, a,
+                                       hay.size() / needle_hammer::kBudgetDen + 1, 0, 0)
+        : needle_hammer::wide<true, 4>(hay.data(), hay.size(), needle.data(), m, a,
+                                       hay.size() / needle_hammer::kBudgetDen + 1, 0, 0);
+    const bool gave_up = (r.state == 1);
+#else
     std::string needle(m - 1, 'a');
     needle += 'b';
     std::string hay(prefix, 'a');
     hay += needle;
-
-    auto r = SIMD_WIDE_GUARDED(hay.data(), hay.size(), needle.data(), m,
-                               hay.size() / 8 + 1);
+    const size_t match = prefix;
+    auto r0 = SIMD_WIDE_GUARDED(hay.data(), hay.size(), needle.data(), m,
+                                hay.size() / 8 + 1);
+    struct { bool found; size_t index; bool gave_up; size_t resume; } r{r0.found, r0.index, r0.gave_up, r0.resume};
+    const bool gave_up = r.gave_up;
+#endif
     ++g_checks;
-    if (!r.gave_up) {
+    if (!gave_up) {
       std::printf("MISMATCH budget test: wide kernel did not exhaust its "
                   "budget (found=%d index=%zu)\n", (int)r.found, r.index);
       ++g_failures;
     }
     ++g_checks;
-    if (r.gave_up && r.resume > prefix) {
+    if (gave_up && r.resume > match) {
       std::printf("MISMATCH budget test: resumed at %zu, past the match at "
-                  "%zu\n", r.resume, prefix);
+                  "%zu\n", r.resume, match);
       ++g_failures;
     }
     // The scheme as a whole must still return the match.
@@ -469,7 +478,7 @@ int main() {
 
     // Same shape with no match at all: the guard must report absence, not a
     // spurious hit, after giving up.
-    std::string absent(prefix + m, 'a');
+    std::string absent = hay.substr(0, prefix);
     for (const NamedFn &nf : {NamedFn{"needle_hammer_guarded",
                                       SIMD_NEEDLE_HAMMER_GUARDED}})
       check(nf, absent, needle);

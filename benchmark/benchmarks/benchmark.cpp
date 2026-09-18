@@ -18,6 +18,7 @@
 // portable scalar and library searchers in from common_search.h.
 #if defined(__AVX512F__) && defined(__AVX512BW__)
   #include "avx512search.h"
+  #include "needle_hammer.h"
   #define SIMDSEARCH_AVX512 1
   #define SIMD_NAIVE_SEARCH avx512_naive_search
   #define SIMD_NAIVE_SEARCH_ALL avx512_naive_search_all
@@ -160,39 +161,26 @@ static const std::vector<Algo> kAlgos = {
     // default in the kernel; carried here so its cost can be measured.
     {"find_avx512_stringzilla_hifilter", Kind::Stateless,
      avx512_stringzilla_find_hifilter},
-    // The needle-hammer scheme: 256-byte-stride naive kernel up to a needle-length
-    // threshold, StringZilla's anchored kernel above it.
-    {"find_avx512_needle_hammer", Kind::Stateless, avx512_needle_hammer},
-    {"find_avx512_needle_hammer16", Kind::Stateless, avx512_needle_hammer16},
-    {"find_avx512_needle_hammer32", Kind::Stateless, avx512_needle_hammer32},
-    {"find_avx512_needle_hammer64", Kind::Stateless, avx512_needle_hammer64},
-    {"find_avx512_needle_hammer128", Kind::Stateless, avx512_needle_hammer128},
-    {"find_avx512_needle_hammer256", Kind::Stateless, avx512_needle_hammer256},
-    {"find_avx512_needle_hammer512", Kind::Stateless, avx512_needle_hammer512},
     {"find_avx512_stringzilla_256", Kind::Stateless, avx512_stringzilla256_find},
-    // The same scheme with a run-time work counter that abandons the filter for
-    // two-way once verification work exceeds a budget proportional to n, so the
-    // searcher is linear-time on every input rather than only on benign ones.
-    {"find_avx512_needle_hammer_guarded", Kind::Stateless, avx512_needle_hammer_guarded},
-    {"find_avx512_needle_hammer_guarded_tight", Kind::Stateless, avx512_needle_hammer_guarded_tight},
-    {"find_avx512_needle_hammer_guarded_loose", Kind::Stateless, avx512_needle_hammer_guarded_loose},
-    // The same needle-hammer scheme at 256-bit (AVX2) and 128-bit (SSE2)
-    // register width, each with its own three component kernels so the scheme
-    // can be read against its own parents at that width.
+    // Needle-Hammer (needle_hammer.h): one wide kernel whose filter bytes are
+    // chosen (first, middle, last, a quarter point or a byte rare in the
+    // needle), three of them until the haystack shows that four are needed, a
+    // dedicated loop for needles of 1-3 bytes, and a work counter that resumes
+    // with the vectorized two-way in twoway_simd.h. The _unguarded row is the
+    // same kernel with the counter compiled out, to measure the guard.
+    {"find_avx512_needle_hammer", Kind::Stateless, avx512_needle_hammer},
+    {"find_avx512_needle_hammer_unguarded", Kind::Stateless, avx512_needle_hammer_unguarded},
+    // The fallback on its own: two-way with 64-byte comparison loops.
+    {"find_twoway_simd", Kind::Stateless, twoway_simd_search},
+    // The component kernels at 256-bit (AVX2) and 128-bit (SSE2) register
+    // width, so the AVX-512 kernels can be read against the same designs at
+    // narrower widths.
     {"find_avx256", Kind::Stateless, avx256_naive_search},
     {"find_avx256_128", Kind::Stateless, avx256_naive_search128},
     {"find_avx256_stringzilla", Kind::Stateless, avx256_stringzilla_find},
-    {"find_avx256_needle_hammer", Kind::Stateless, avx256_needle_hammer},
-    {"find_avx256_needle_hammer64", Kind::Stateless, avx256_needle_hammer64},
-    {"find_avx256_needle_hammer512", Kind::Stateless, avx256_needle_hammer512},
-    {"find_avx256_needle_hammer8192", Kind::Stateless, avx256_needle_hammer8192},
     {"find_avx128", Kind::Stateless, avx128_naive_search},
     {"find_avx128_64", Kind::Stateless, avx128_naive_search64},
     {"find_avx128_stringzilla", Kind::Stateless, avx128_stringzilla_find},
-    {"find_avx128_needle_hammer", Kind::Stateless, avx128_needle_hammer},
-    {"find_avx128_needle_hammer64", Kind::Stateless, avx128_needle_hammer64},
-    {"find_avx128_needle_hammer512", Kind::Stateless, avx128_needle_hammer512},
-    {"find_avx128_needle_hammer8192", Kind::Stateless, avx128_needle_hammer8192},
 #endif
 #if defined(SIMDSEARCH_NEON)
     // Needle-Hammer's component kernels at 128-bit NEON width: the single-window

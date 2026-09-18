@@ -52,3 +52,12 @@ target_include_directories(test_search PRIVATE include)
 target_compile_options(test_search PRIVATE ${SIMDSEARCH_ARCH_FLAGS})
 add_test(NAME test_search COMMAND test_search)
 
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+    # Needle-Hammer's own battery: block boundaries at every alignment,
+    # small haystacks, periodic needles, escalation and guard give-up, fuzz.
+    add_executable(test_needle_hammer tests/test_needle_hammer.cpp)
+    target_include_directories(test_needle_hammer PRIVATE include)
+    target_compile_options(test_needle_hammer PRIVATE ${SIMDSEARCH_ARCH_FLAGS})
+    add_test(NAME test_needle_hammer COMMAND test_needle_hammer)
+endif()
+
