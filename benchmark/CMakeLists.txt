@@ -46,6 +46,30 @@ target_include_directories(benchmark PRIVATE benchmarks include)
 target_compile_options(benchmark PRIVATE ${SIMDSEARCH_ARCH_FLAGS})
 target_link_libraries(benchmark PRIVATE counters)
 
+# The Rust searchers (memchr crate, std::str::find) as extra rows, built from
+# rust/ with cargo and linked statically. Off by default so the benchmark
+# builds without a Rust toolchain; the rows appear in --list only when on.
+option(SIMDSEARCH_RUST "Link the Rust searchers (memchr crate, std) via cargo" OFF)
+if(SIMDSEARCH_RUST)
+    find_program(CARGO_EXECUTABLE cargo REQUIRED)
+    set(RUST_DIR ${CMAKE_CURRENT_SOURCE_DIR}/rust)
+    set(RUST_LIB ${RUST_DIR}/target/release/libsimdsearch_rust.a)
+    add_custom_command(
+        OUTPUT ${RUST_LIB}
+        COMMAND ${CARGO_EXECUTABLE} build --release --quiet
+        WORKING_DIRECTORY ${RUST_DIR}
+        DEPENDS ${RUST_DIR}/Cargo.toml ${RUST_DIR}/src/lib.rs ${RUST_DIR}/build.rs
+        COMMENT "cargo build --release (rust/)"
+        VERBATIM)
+    add_custom_target(simdsearch_rust DEPENDS ${RUST_LIB})
+    add_dependencies(benchmark simdsearch_rust)
+    target_compile_definitions(benchmark PRIVATE SIMDSEARCH_RUST=1)
+    target_link_libraries(benchmark PRIVATE ${RUST_LIB})
+    if(NOT APPLE)
+        target_link_libraries(benchmark PRIVATE pthread dl m)
+    endif()
+endif()
+
 enable_testing()
 add_executable(test_search tests/test_search.cpp)
 target_include_directories(test_search PRIVATE include)

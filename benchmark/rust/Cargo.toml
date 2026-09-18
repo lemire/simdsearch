@@ -1,0 +1,19 @@
+[package]
+name = "simdsearch_rust"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# The Rust searchers the benchmark compares against, exposed through a C ABI.
+# Built by CMake when SIMDSEARCH_RUST=ON; not needed otherwise.
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+memchr = "2.7"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+debug = false

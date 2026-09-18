@@ -67,6 +67,17 @@ naive searchers degrade to O(n·m) but the linear-time ones do not. KMP and
 two-way are flat in the needle length -- that is the guarantee they buy -- and
 several times slower than the SIMD kernels on ordinary text, which is the trade.
 
+## Rust searchers (optional)
+
+Configuring with `-DSIMDSEARCH_RUST=ON` builds `rust/` with cargo and links
+it, adding three rows: `find_rust_memchr` (the `memchr` crate's
+`memmem::find`, searcher built per call), `find_rust_memchr_finder_amortized`
+(its `Finder`, built once per needle) and `find_rust_std` (the standard
+library's `str::find`, a two-way; it takes UTF-8 only, so on a needle cut
+through a multi-byte character the horspool mode reports the cell as `n/a`
+without resampling). `benchmark rust-version` prints the crate version the
+rows were built with.
+
 ## Build and run
 
 ```

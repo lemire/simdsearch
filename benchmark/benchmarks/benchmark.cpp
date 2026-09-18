@@ -1,4 +1,6 @@
 #include <algorithm>
+#include <cmath>
+#include <limits>
 #include <chrono>
 #include <cstdint>
 #include <format>
@@ -136,8 +138,45 @@ enum class Kind {
   AmortBMH,
   AmortKMP,
   AmortTwoWay,
-  AmortTwoWayBC
+  AmortTwoWayBC,
+  AmortRustFinder   // memchr::memmem::Finder built once per needle
 };
+
+// A searcher that cannot take the input at hand (str::find on bytes that are
+// not UTF-8) reports this instead of an answer. The horspool mode then marks
+// the cell n/a rather than failing validation; the other modes only ever feed
+// ASCII to such a searcher.
+static constexpr std::pair<bool, size_t> kNotApplicable{false, SIZE_MAX};
+static inline bool not_applicable(std::pair<bool, size_t> r) {
+  return !r.first && r.second == SIZE_MAX;
+}
+
+#if defined(SIMDSEARCH_RUST)
+// The Rust searchers (rust/src/lib.rs), linked as a static library when the
+// build is configured with SIMDSEARCH_RUST=ON. Offsets come back as -1 for no
+// match and -2 for "cannot take this input".
+extern "C" {
+ptrdiff_t simdsearch_rust_memchr_find(const char *hay, size_t n, const char *needle, size_t m);
+void *simdsearch_rust_finder_new(const char *needle, size_t m);
+ptrdiff_t simdsearch_rust_finder_find(const void *finder, const char *hay, size_t n);
+void simdsearch_rust_finder_free(void *finder);
+ptrdiff_t simdsearch_rust_std_find(const char *hay, size_t n, const char *needle, size_t m);
+const char *simdsearch_rust_memchr_version();
+}
+static inline std::pair<bool, size_t> from_rust(ptrdiff_t r) {
+  if (r == -2) return kNotApplicable;
+  if (r < 0) return {false, 0};
+  return {true, (size_t)r};
+}
+// memchr::memmem::find: searcher chosen and built on every call.
+static std::pair<bool, size_t> rust_memchr_search(const char *text, size_t n, const char *pat, size_t m) {
+  return from_rust(simdsearch_rust_memchr_find(text, n, pat, m));
+}
+// std::str::find: the standard library's two-way, on UTF-8 only.
+static std::pair<bool, size_t> rust_std_search(const char *text, size_t n, const char *pat, size_t m) {
+  return from_rust(simdsearch_rust_std_find(text, n, pat, m));
+}
+#endif
 
 struct Algo {
   const char *name;
@@ -238,6 +277,17 @@ static const std::vector<Algo> kAlgos = {
     {"find_twoway_bc_amortized", Kind::AmortTwoWayBC, nullptr},
     {"find_strstr", Kind::Stateless, strstr_search},
     {"find_memmem", Kind::Stateless, memmem_search},
+#if defined(SIMDSEARCH_RUST)
+    // The Rust searchers, through the C ABI in rust/src/lib.rs. memchr's
+    // memmem is the crate the Rust ecosystem reaches for (a two-rarest-bytes
+    // SIMD filter for needles up to 32 bytes, two-way with that filter above);
+    // the one-shot find rebuilds its searcher per call, the Finder row reuses
+    // it per needle like the other _amortized rows. str::find is the standard
+    // library's two-way and takes UTF-8 only, so it is n/a on some inputs.
+    {"find_rust_memchr", Kind::Stateless, rust_memchr_search},
+    {"find_rust_memchr_finder_amortized", Kind::AmortRustFinder, nullptr},
+    {"find_rust_std", Kind::Stateless, rust_std_search},
+#endif
     {"find_std_default_searcher", Kind::Stateless, std_default_searcher},
     {"find_std_boyer_moore_searcher", Kind::Stateless, std_boyer_moore_searcher},
     {"find_std_boyer_moore_horspool_searcher", Kind::Stateless,
@@ -258,6 +308,10 @@ struct AmortState {
   std::vector<twoway_prep> tw;
   std::vector<twoway_bc_prep> twbc;
 
+#if defined(SIMDSEARCH_RUST)
+  std::vector<void *> rust;  // memchr::memmem::Finder per needle
+  ~AmortState() { for (void *f : rust) simdsearch_rust_finder_free(f); }
+#endif
   void prepare(const std::vector<std::string> &needles) {
     def.clear();
     bm.clear();
@@ -271,6 +325,12 @@ struct AmortState {
     kmp.resize(needles.size());
     tw.resize(needles.size());
     twbc.resize(needles.size());
+#if defined(SIMDSEARCH_RUST)
+    for (void *f : rust) simdsearch_rust_finder_free(f);
+    rust.clear();
+    rust.reserve(needles.size());
+    for (const auto &s : needles) rust.push_back(simdsearch_rust_finder_new(s.data(), s.size()));
+#endif
     for (size_t i = 0; i < needles.size(); ++i) {
       const auto &s = needles[i];
       def.emplace_back(s.data(), s.data() + s.size());
@@ -340,6 +400,13 @@ static inline std::pair<bool, size_t> do_find(const Algo &a,
       return twoway_amortized(am.tw[id], text, n, pat, m);
     case Kind::AmortTwoWayBC:
       return twoway_bc_amortized(am.twbc[id], text, n, pat, m);
+    case Kind::AmortRustFinder:
+#if defined(SIMDSEARCH_RUST)
+      (void)pat; (void)m;
+      return from_rust(simdsearch_rust_finder_find(am.rust[id], text, n));
+#else
+      break;
+#endif
   }
   return {false, 0};
 }
@@ -416,8 +483,13 @@ void collect_benchmark_results(size_t input_size, size_t number_strings,
       exit(1);
     }
     for (const Algo *a : algos) {
-      auto [f, idx] = do_find(*a, am, id, source.data(), source.size(),
-                              str.data(), str.size());
+      auto r = do_find(*a, am, id, source.data(), source.size(),
+                       str.data(), str.size());
+      if (not_applicable(r)) {
+        std::cerr << "Error: " << a->name << " cannot take this input\n";
+        exit(1);
+      }
+      auto [f, idx] = r;
       if (!f || idx != p) {
         std::cerr << "Error: " << a->name << " index mismatch (got " << idx
                   << ", expected " << p << ")\n";
@@ -511,11 +583,20 @@ void horspool_benchmark(const std::string &text, const std::string &source_desc,
     if (needs_amort(algos)) am.prepare(pats);
 
     // Validate every selected algorithm against std::string::find before timing.
+    // A searcher that cannot take one of this length's needles (str::find on a
+    // needle cut through a multi-byte character) is marked n/a for the length
+    // and not timed; the needles are not resampled, so every other row keeps
+    // the same inputs.
+    std::vector<bool> na(algos.size(), false);
     for (size_t id = 0; id < pats.size(); ++id) {
       size_t ref = text.find(pats[id]);
-      for (const Algo *a : algos) {
-        auto [f, idx] = do_find(*a, am, id, text.data(), text.size(),
-                                pats[id].data(), pats[id].size());
+      for (size_t ai = 0; ai < algos.size(); ++ai) {
+        const Algo *a = algos[ai];
+        if (na[ai]) continue;
+        auto r = do_find(*a, am, id, text.data(), text.size(),
+                         pats[id].data(), pats[id].size());
+        if (not_applicable(r)) { na[ai] = true; continue; }
+        auto [f, idx] = r;
         if (!f || idx != ref) {
           std::cerr << "Error: horspool mismatch in " << a->name << " at length "
                     << L << " (got " << idx << ", expected " << ref << ")\n";
@@ -526,6 +607,11 @@ void horspool_benchmark(const std::string &text, const std::string &source_desc,
 
     for (size_t ai = 0; ai < algos.size(); ++ai) {
       const Algo &a = *algos[ai];
+      if (na[ai]) {
+        ns[ai][li] = std::numeric_limits<double>::quiet_NaN();
+        std::print(stderr, "horspool: {} not applicable at length {} (n/a)\n", a.name, L);
+        continue;
+      }
       auto run = [&]() {
         size_t c = 0;
         for (size_t id = 0; id < pats.size(); ++id) {
@@ -553,8 +639,10 @@ void horspool_benchmark(const std::string &text, const std::string &source_desc,
   std::print("\n");
   for (size_t ai = 0; ai < algos.size(); ++ai) {
     std::print("{:<48}", algos[ai]->name);
-    for (size_t li = 0; li < lengths.size(); ++li)
-      std::print(" {:>10.1f}", ns[ai][li]);
+    for (size_t li = 0; li < lengths.size(); ++li) {
+      if (std::isnan(ns[ai][li])) std::print(" {:>10}", "n/a");
+      else std::print(" {:>10.1f}", ns[ai][li]);
+    }
     std::print("\n");
   }
 }
@@ -930,6 +1018,16 @@ void findall_benchmark(const std::string &text, const std::string &source_desc,
 
 int main(int argc, char **argv) {
   std::string mode = (argc > 1) ? argv[1] : "";
+
+  // Provenance for the results: which memchr the Rust rows were built with.
+  if (mode == "rust-version") {
+#if defined(SIMDSEARCH_RUST)
+    std::print("memchr {}\n", simdsearch_rust_memchr_version());
+#else
+    std::print("not built\n");
+#endif
+    return 0;
+  }
 
   if (mode == "synthetic" || mode == "horspool" || mode == "ashvardanian" ||
       mode == "worstcase" || mode == "findall") {
