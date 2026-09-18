@@ -110,11 +110,16 @@ static inline void positional(const unsigned char* s, size_t m, size_t o[4]) {
 // the text it matches, rare at that offset in any window that could match --
 // so it replaces the quarter point and all four anchors are used. That
 // catches a single odd byte wherever it sits. If there are none, the needle
-// is made of the anchor values alone (a tiny alphabet, or a run of one byte):
-// four anchors, since each cuts candidates by little. Otherwise the alphabet
-// is wide and three anchors -- first, middle, last -- are enough to start
-// with; the quarter point is kept as the spare the kernel adds if survivors
-// turn out to be frequent.
+// is made of the anchor values alone. With three or four distinct values
+// among them (a tiny alphabet such as DNA) every anchor cuts the candidates
+// and all four are used; with one value (a run of one byte) no anchor cuts
+// anything and the four are used as the plain narrowing kernel; with exactly
+// two values (a^k b a^k, or a two-letter text) the anchors on the second
+// value do the work, the fourth anchor would repeat a value already tested
+// and cost a quarter of the filter's throughput, so three are used.
+// Otherwise the alphabet is wide and three anchors -- first, middle, last --
+// are enough to start with; the quarter point is kept as the spare the
+// kernel adds if survivors turn out to be frequent.
 static inline anchors select(const char* pattern, size_t m) {
     const unsigned char* s = (const unsigned char*)pattern;
     anchors a;
@@ -136,9 +141,11 @@ static inline anchors select(const char* pattern, size_t m) {
             if (outside > limit) break;
         }
     }
-    if (outside == 0) {
-        a.k = 4;                              // needle made of the anchor values alone
-    } else if (outside <= limit) {
+    const unsigned char b0 = s[a.o[0]], b1 = s[a.o[1]], b2 = s[a.o[2]], b3 = s[a.o[3]];
+    const int distinct = 1 + (b1 != b0) + (b2 != b0 && b2 != b1) + (b3 != b0 && b3 != b1 && b3 != b2);
+    if (outside == 0 && distinct != 2) {
+        a.k = 4;
+    } else if (outside != 0 && outside <= limit) {
         a.o[1] = first_out;                   // a rare byte: the best anchor there is
         a.k = 4;
     } else if (m > kThreeAnchorMax || m <= 8) {
@@ -517,9 +524,11 @@ static inline anchors select(const char* pattern, size_t m) {
             if (outside > limit) break;
         }
     }
-    if (outside == 0) {
+    const unsigned char b0 = s[a.o[0]], b1 = s[a.o[1]], b2 = s[a.o[2]], b3 = s[a.o[3]];
+    const int distinct = 1 + (b1 != b0) + (b2 != b0 && b2 != b1) + (b3 != b0 && b3 != b1 && b3 != b2);
+    if (outside == 0 && distinct != 2) {
         a.k = 4;
-    } else if (outside <= limit) {
+    } else if (outside != 0 && outside <= limit) {
         a.o[1] = first_out; a.k = 4;
     } else if (m > kThreeAnchorMax || m <= 8) {
         a.k = 4;

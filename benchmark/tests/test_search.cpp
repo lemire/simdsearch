@@ -7,6 +7,7 @@
 // early-out logic. The test is self-contained: it returns non-zero on the first
 // mismatch so CTest reports a clean pass/fail.
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -421,12 +422,19 @@ int main() {
     for (size_t i = 0; i < prefix; ++i) if (i % m == m - 1) hay[i] = 'b';
     hay += needle;
     const size_t match = hay.find(needle);
-    const needle_hammer::anchors a = needle_hammer::select(needle.data(), m);
+    const size_t budget = hay.size() / needle_hammer::kBudgetDen + 1;
+    needle_hammer::anchors a = needle_hammer::select(needle.data(), m);
     needle_hammer::result r = a.k == 3
-        ? needle_hammer::wide<true, 3>(hay.data(), hay.size(), needle.data(), m, a,
-                                       hay.size() / needle_hammer::kBudgetDen + 1, 0, 0)
-        : needle_hammer::wide<true, 4>(hay.data(), hay.size(), needle.data(), m, a,
-                                       hay.size() / needle_hammer::kBudgetDen + 1, 0, 0);
+        ? needle_hammer::wide<true, 3>(hay.data(), hay.size(), needle.data(), m, a, budget, 0, 0)
+        : needle_hammer::wide<true, 4>(hay.data(), hay.size(), needle.data(), m, a, budget, 0, 0);
+    if (r.state == 2) {
+      // Three anchors found the survivors too frequent, as the dispatcher
+      // would: continue with four from where it stopped.
+      a.k = 4;
+      std::sort(a.o, a.o + 4);
+      r = needle_hammer::wide<true, 4>(hay.data(), hay.size(), needle.data(), m, a,
+                                       budget, r.rounds, r.resume);
+    }
     const bool gave_up = (r.state == 1);
     ++g_checks;
     if (!gave_up) {
