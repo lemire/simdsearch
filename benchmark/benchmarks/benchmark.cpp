@@ -308,12 +308,14 @@ struct AmortState {
     kmp.clear();
     tw.clear();
     twbc.clear();
+    tws.clear();
     def.reserve(needles.size());
     bm.reserve(needles.size());
     bmh.reserve(needles.size());
     kmp.resize(needles.size());
     tw.resize(needles.size());
     twbc.resize(needles.size());
+    tws.resize(needles.size());
 #if defined(SIMDSEARCH_RUST)
     for (void *f : rust) simdsearch_rust_finder_free(f);
     rust.clear();
