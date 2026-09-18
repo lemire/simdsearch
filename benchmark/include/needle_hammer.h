@@ -313,17 +313,21 @@ short_search(const char* text, size_t n, const char* pattern) {
         const __m512i p0 = _mm512_set1_epi8((char)pattern[0]);
         const __m512i p1 = _mm512_set1_epi8((char)pattern[1]);
         const __m512i p2 = _mm512_set1_epi8((char)pattern[M > 2 ? 2 : 1]);
-        auto chunk = [&](size_t off) -> __mmask64 {
-            __mmask64 f = _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(text+i+off)), p0)
-                        & _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(text+i+off+1)), p1);
-            if constexpr (M > 2) f &= _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(text+i+off+2)), p2);
-            return f;
-        };
+        // A macro, not a lambda: GCC outlined the lambda for M == 3, and a
+        // call per chunk with the broadcasts passed through memory cost the
+        // three-byte needle 3x.
+#define NH_SHORT_CHUNK(OFF)                                                                    \
+        (M > 2                                                                                 \
+         ? (_mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(text+i+(OFF))), p0)        \
+            & _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(text+i+(OFF)+1)), p1)    \
+            & _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(text+i+(OFF)+2)), p2))   \
+         : (_mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(text+i+(OFF))), p0)        \
+            & _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(text+i+(OFF)+1)), p1)))
         if (n >= m + 255) {
             // Most short-needle searches on text end within the first 64
             // bytes: look there first with one unaligned window, then align.
             {
-                const __mmask64 f = chunk(0);
+                const __mmask64 f = NH_SHORT_CHUNK(0);
                 if (f) return {true, (size_t)__builtin_ctzll(f)};
                 i = 64;
             }
@@ -334,7 +338,8 @@ short_search(const char* text, size_t n, const char* pattern) {
                 i += head;
             }
             for (; i + m + 255 <= n; i += 256) {
-                const __mmask64 fA = chunk(0), fB = chunk(64), fC = chunk(128), fD = chunk(192);
+                const __mmask64 fA = NH_SHORT_CHUNK(0), fB = NH_SHORT_CHUNK(64);
+                const __mmask64 fC = NH_SHORT_CHUNK(128), fD = NH_SHORT_CHUNK(192);
                 if ((fA | fB | fC | fD) == 0) continue;
                 if (fA) return {true, i +   0 + (size_t)__builtin_ctzll(fA)};
                 if (fB) return {true, i +  64 + (size_t)__builtin_ctzll(fB)};
@@ -342,6 +347,7 @@ short_search(const char* text, size_t n, const char* pattern) {
                 return {true, i + 192 + (size_t)__builtin_ctzll(fD)};
             }
         }
+#undef NH_SHORT_CHUNK
         for (; i + m <= n; i += 64) {
             const size_t cand = n - m - i + 1;
             __mmask64 f = (cand >= 64) ? ~(__mmask64)0 : (((__mmask64)1 << cand) - 1);
