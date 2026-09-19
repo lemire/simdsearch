@@ -53,9 +53,9 @@ namespace needle_hammer {
 // a search that gives up within a small factor of the fallback alone.
 static constexpr size_t kBudgetDen = 64;
 
-// Below this needle length the guard is absent. A block admits at most m - 4
-// narrowing rounds, so the whole haystack admits at most n(m - 4)/256 rounds,
-// which for m <= 36 is at most n/8: bounded by construction, and cheaper than
+// Below this needle length the guard is absent. A block admits at most m - 2
+// narrowing rounds, so the whole haystack admits at most n(m - 2)/256 rounds,
+// about n/7.5 for m = 36: bounded by construction, and cheaper than
 // what two-way costs on the short periodic needles that would trip a guard
 // (8 GB/s of narrowing against 2 GB/s of two-way on the block shape at L=16).
 static constexpr size_t kFreeBelow = 36;
@@ -556,9 +556,9 @@ static constexpr size_t kB = 64;
 // A narrowing round covers 64 positions here, a quarter of the AVX-512 block,
 // so the same instruction budget is four times as many rounds: n/16.
 static constexpr size_t kBudgetDen = 16;
-// Below this needle length the guard is absent: a block admits at most m - 4
-// rounds, so the haystack admits at most n(m - 4)/64, which is at most the
-// budget for m <= 8.
+// Below this needle length the guard is absent: a block admits at most m - 2
+// rounds, so the haystack admits at most n(m - 2)/64, under n/10 for m <= 8
+// and bounded by construction.
 static constexpr size_t kFreeBelow = 8;
 // Small haystacks take single windows rather than the block loop.
 static constexpr size_t kMinWide = 512;
