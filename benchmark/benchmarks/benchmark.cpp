@@ -859,6 +859,15 @@ static std::string make_worstcase_needle(const std::string &shape, size_t L) {
     nd[L / 2] = (L / 2 % 2 == 0) ? 'b' : 'a';
   }
   else if (shape == "block") { /* all 'a' — no distinctive byte at all */ }
+  else if (shape == "near") {
+    // A 'b' every p = min(256, L) bytes: (a^(p-1) b)^(L/p). With the
+    // haystack below, exactly one position per 256-byte block passes a
+    // first-and-last anchor filter, and its verification runs deep into the
+    // needle before failing. This is the input that an uncounted in-place
+    // verification turns into O(nm): one near-match per block.
+    const size_t p = std::min<size_t>(256, L);
+    for (size_t i = 0; i < L; ++i) nd[i] = (i % p == p - 1) ? 'b' : 'a';
+  }
   else { std::cerr << "unknown --needle shape: " << shape << "\n"; exit(1); }
   return nd;
 }
@@ -879,6 +888,14 @@ static std::string make_worstcase_haystack(const std::string &shape, size_t n,
     for (size_t i = 0; i < n; ++i) hay[i] = (i % 2 == 0) ? 'a' : 'b';
   else if (shape == "block")
     for (size_t i = 0; i < n; ++i) hay[i] = (i % L == L - 1) ? 'b' : 'a';
+  else if (shape == "near") {
+    // The needle, with its second-to-last byte changed, tiled: every window
+    // of L bytes contains one 'c', so the needle never occurs, while the
+    // anchors first and last match once per period of the 'b's.
+    std::string q = make_worstcase_needle("near", L);
+    q[L - 2] = 'c';
+    for (size_t i = 0; i < n; ++i) hay[i] = q[i % L];
+  }
   return hay;
 }
 
@@ -1411,7 +1428,7 @@ int main(int argc, char **argv) {
   std::print("    --size N          haystack size in bytes when no datafile "
              "(default 65536)\n");
   std::print("\n  worstcase only:\n");
-  std::print("    --needle shape    tail|aba|mid|high|ab|block (default tail); "
+  std::print("    --needle shape    tail|aba|mid|high|ab|block|near (default tail); "
              "'block' (all-'a' needle) is the only shape that defeats "
              "StringZilla\n");
   return 1;

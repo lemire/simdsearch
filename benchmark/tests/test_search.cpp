@@ -462,6 +462,54 @@ int main() {
       check(nf, absent, needle);
   }
 
+  // ---- One near-match per block: the verification is charged -------------
+  //
+  // Needle (a^255 b)^k, haystack the needle with its second-to-last byte
+  // changed, tiled. Exactly one position per 256-byte block passes the
+  // anchors, and its in-place verification matches the first 64 bytes and
+  // runs deep before failing; no narrowing round ever runs. The verification
+  // must be charged to the budget, so that the guarded kernel gives up on
+  // this input instead of comparing m bytes per block for the whole
+  // haystack. Driven as the dispatcher drives it: escalation, then a fresh
+  // budget with four anchors, then the give-up.
+  {
+    const size_t m = 2048, n = 1 << 20;
+    std::string needle(m, 'a');
+    for (size_t i = 0; i < m; ++i) needle[i] = (i % 256 == 255) ? 'b' : 'a';
+    std::string q = needle; q[m - 2] = 'c';
+    std::string hay(n, 'a');
+    for (size_t i = 0; i < n; ++i) hay[i] = q[i % m];
+    const size_t budget = n / needle_hammer::kBudgetDen + 1;
+    needle_hammer::anchors a = needle_hammer::select(needle.data(), m);
+    auto run = [&](const needle_hammer::anchors &an, size_t carried, size_t from) {
+      switch (an.k) {
+        case 2: return needle_hammer::wide<true, 2>(hay.data(), n, needle.data(), m, an, budget, carried, from);
+        case 3: return needle_hammer::wide<true, 3>(hay.data(), n, needle.data(), m, an, budget, carried, from);
+        default: return needle_hammer::wide<true, 4>(hay.data(), n, needle.data(), m, an, budget, carried, from);
+      }
+    };
+    needle_hammer::result r = run(a, 0, 0);
+    while (r.state != 0 && a.k < 4) {
+      if (r.state == 1) { a.k = 4; std::sort(a.o, a.o + 4); r = run(a, 0, r.resume); }
+      else { a = needle_hammer::escalate(a); r = run(a, r.rounds, r.resume); }
+    }
+    ++g_checks;
+    if (r.state != 1) {
+      std::printf("MISMATCH near-match test: the guarded kernel did not give up "
+                  "(state=%d found=%d rounds=%zu)\n", r.state, (int)r.found, r.rounds);
+      ++g_failures;
+    }
+    ++g_checks;
+    if (r.state == 1 && r.rounds <= budget) {
+      std::printf("MISMATCH near-match test: gave up with %zu rounds under a budget of %zu\n",
+                  r.rounds, budget);
+      ++g_failures;
+    }
+    for (const NamedFn &nf : {NamedFn{"needle_hammer_guarded", SIMD_NEEDLE_HAMMER_GUARDED},
+                              NamedFn{"needle_hammer", SIMD_NEEDLE_HAMMER}})
+      check(nf, hay, needle);
+  }
+
   std::printf("ran %zu checks, %zu failures\n", g_checks, g_failures);
   return g_failures == 0 ? 0 : 1;
 }

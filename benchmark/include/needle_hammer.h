@@ -329,9 +329,21 @@ wide(const char* text, size_t n, const char* pattern, size_t m,
                 if (_mm512_mask_cmpneq_epi8_mask(nmask, _mm512_maskz_loadu_epi8(nmask, text + i + b), nvec) == 0)
                     return {true, i + b, 0, 0, rounds};
             } else if (_mm512_cmpneq_epi8_mask(_mm512_loadu_si512((const void*)(text + i + b)),
-                                               _mm512_loadu_si512((const void*)pattern)) == 0
-                       && std::memcmp(text + i + b + 64, pattern + 64, m - 64) == 0) {
-                return {true, i + b, 0, 0, rounds};
+                                               _mm512_loadu_si512((const void*)pattern)) == 0) {
+                // The first 64 bytes match: compare the rest 64 bytes at a
+                // time and charge the bytes compared to the budget, at one
+                // round per 256 (a round is four 64-byte compares). Without
+                // the charge, one late-failing near-match per block -- the
+                // needle's period placed once per block -- costs m bytes of
+                // comparison per block that no counter sees. On ordinary
+                // text a lone survivor that matches 64 bytes is the match.
+                const size_t k = 64 + twoway_simd::lcp((const uint8_t*)text + i + b + 64,
+                                                       (const uint8_t*)pattern + 64, m - 64);
+                if (k == m) return {true, i + b, 0, 0, rounds};
+                if constexpr (Guarded) {
+                    rounds += (k + 255) >> 8;
+                    if (rounds > budget_rounds) return {false, 0, 1, i + 256, rounds};
+                }
             }
             continue;
         }
@@ -745,9 +757,14 @@ wide(const char* text, size_t n, const char* pattern, size_t m,
     if (fits) std::memcpy(nbuf, pattern, m);
     const uint8x16_t nvec = vld1q_u8(nbuf);
     const uint64_t nbits = 0x8888888888888888ull & ((m >= 16) ? ~(uint64_t)0 : (((uint64_t)1 << (4 * m)) - 1));
+    // For a needle past one register the comparison runs 16 bytes at a time
+    // and the bytes compared are charged to the budget, one round per 64 (a
+    // round is four 16-byte compares): see the AVX-512 kernel.
     auto verify = [&](size_t pos) -> bool {
         if (fits && pos + kW <= n) return (lane_mask(vceqq_u8(load(text + pos), nvec)) & nbits) == nbits;
-        return std::memcmp(text + pos, pattern, m) == 0;
+        const size_t k = twoway_simd::lcp((const uint8_t*)text + pos, (const uint8_t*)pattern, m);
+        if constexpr (Guarded) rounds += (k + 63) >> 6;
+        return k == m;
     };
     size_t i = start;
     const size_t first_block = i;
@@ -775,6 +792,7 @@ wide(const char* text, size_t n, const char* pattern, size_t m,
             const size_t off = (mA != 0) ? 0 : (mB != 0) ? 16 : (mC != 0) ? 32 : 48;
             const size_t b = i + off + lane_index(one);
             if (verify(b)) return {true, b, 0, 0, rounds};
+            if constexpr (Guarded) { if (rounds > budget_rounds) return {false, 0, 1, i + kB, rounds}; }
             continue;
         }
         for (size_t k = 0; k < m; ++k) {
