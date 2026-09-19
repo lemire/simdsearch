@@ -74,15 +74,10 @@ static constexpr size_t kMinWide = 1024;
 #define NH2_THREE_ANCHOR_MAX SIZE_MAX
 #endif
 static constexpr size_t kThreeAnchorMax = NH2_THREE_ANCHOR_MAX;
-// Anchors a wide-alphabet needle starts with (2, 3 or 4); the escalation
-// rule adds the others one at a time, in the order last, middle, quarter
-// after the first byte. Two: measured on Emerald Rapids, an M4 Max and
-// against the memchr crate's two-byte filter, the third anchor's compare per
-// block costs more than the survivors it removes on every corpus but DNA,
+// Anchors a wide-alphabet needle starts with (2, 3 or 4). Default 2: a third
+// compare per block costs more than the survivors it removes except on DNA,
 // where the escalation adds it within the first blocks. A four-byte needle
-// takes the naive kernel instead (its four anchors are the whole needle and
-// the search usually ends in the first window, where the selection would
-// cost more than the search).
+// takes the naive kernel instead.
 #ifndef NH2_START_ANCHORS
 #define NH2_START_ANCHORS 2
 #endif
@@ -98,8 +93,8 @@ static inline size_t survivor_cost(size_t m) { return 20 + m / 32; }
 // ---------------------------------------------------------------------------
 
 struct anchors {
-    size_t o[4];   // offsets into the needle, ascending; o[3] is the spare when k == 3
-    int k;         // anchors in use: 3 or 4
+    size_t o[4];   // offsets into the needle, ascending; unused slots are spares
+    int k;         // anchors in use: 2, 3 or 4
 };
 
 // Positional anchors: first, quarter, middle and last byte, each walked
@@ -119,23 +114,16 @@ static inline void positional(const unsigned char* s, size_t m, size_t o[4]) {
 // Select the anchors for a needle of m >= 5 bytes.
 //
 // After the positional choice, one pass over the needle (four vector compares
-// per 64 bytes) counts the bytes whose value is NOT one of the four anchor
+// per 64 bytes) counts the bytes whose value is NOT one of the four positional
 // values. If those are few (at most max(1, m/8)) but not none, the first of
 // them is a byte rare in the needle -- and, the needle being a substring of
 // the text it matches, rare at that offset in any window that could match --
 // so it replaces the quarter point and all four anchors are used. That
-// catches a single odd byte wherever it sits. If there are none, the needle
-// is made of the anchor values alone. With three or four distinct values
-// among them (a tiny alphabet such as DNA) every anchor cuts the candidates
-// and all four are used; with one value (a run of one byte) no anchor cuts
-// anything and the four are used as the plain narrowing kernel; with exactly
-// two values (a^k b a^k, or a two-letter text) the anchors on the second
-// value do the work, the fourth anchor would repeat a value already tested
-// and cost a quarter of the filter's throughput, so three are used.
-// Otherwise the alphabet is wide and kStartAnchors anchors -- first and last
-// -- are enough to start with; the middle and the quarter point are the
-// spares the kernel adds, in that order, if survivors turn out to be
-// frequent.
+// catches a single odd byte wherever it sits. Otherwise the kernel starts
+// with kStartAnchors (default 2: first and last); the middle and the quarter
+// point are the spares it adds, in that order, if survivors turn out to be
+// frequent. DNA, a unary run and a two-letter needle take that same start:
+// the first blocks escalate when the two anchors do not cut.
 static inline anchors select(const char* pattern, size_t m) {
     const unsigned char* s = (const unsigned char*)pattern;
     anchors a;
@@ -157,21 +145,12 @@ static inline anchors select(const char* pattern, size_t m) {
             if (outside > limit) break;
         }
     }
-    const unsigned char b0 = s[a.o[0]], b1 = s[a.o[1]], b2 = s[a.o[2]], b3 = s[a.o[3]];
-    const int distinct = 1 + (b1 != b0) + (b2 != b0 && b2 != b1) + (b3 != b0 && b3 != b1 && b3 != b2);
     const int start = kStartAnchors;
-    if (outside == 0 && distinct != 2 && start == 4) {
-        a.k = 4;
-    } else if (outside != 0 && outside <= limit) {
+    if (outside != 0 && outside <= limit) {
         a.o[1] = first_out;                   // a rare byte: the best anchor there is
         a.k = 4;
     } else if (m > kThreeAnchorMax) {
         a.k = 4;
-    } else if (outside == 0 && start == 4) {
-        // two values: first, middle, last carry both; the quarter is the spare
-        const size_t quarter = a.o[1];
-        a.o[1] = a.o[2]; a.o[2] = a.o[3]; a.o[3] = quarter;
-        a.k = 3;
     } else {
         // start anchors, then the spares in the order the escalation adds
         // them: first, last, middle, quarter (first, middle, last when
@@ -271,10 +250,8 @@ masked_windows(const char* text, size_t n, const char* pattern, size_t m,
 // counted when Guarded. With K < 4 the block's survivors are also counted
 // and the kernel returns state 2 when they are costing more than another
 // anchor would (the same rule for K == 4 would only ever say "keep four").
-// Out of line: inlined into the dispatcher, the guarded three-anchor
-// instantiation was register-allocated in the dispatcher's context and
-// reloaded a broadcast from the stack on every block, which cost 25% on
-// Zen 5. As a function of its own it gets the same code as the unguarded one.
+// Out of line so the broadcasts stay in registers; inlined into the
+// dispatcher, GCC reloads them from the stack each block.
 template <bool Guarded, int K>
 [[gnu::noinline]] static result
 wide(const char* text, size_t n, const char* pattern, size_t m,
@@ -592,8 +569,12 @@ static inline uint8x16_t load(const char* p) { return vld1q_u8((const uint8_t*)p
 static inline size_t lane_index(uint64_t mask) { return (size_t)__builtin_ctzll(mask) >> 2; }
 
 // ---------------------------------------------------------------------------
-// Anchor selection: identical to the AVX-512 selector; the rarity pass runs
-// sixteen needle bytes at a time, the last partial block through a padded copy.
+// Anchor selection. Same rarity pass as AVX-512 (sixteen bytes at a time,
+// last partial block through a padded copy), but a needle made only of the
+// positional values starts with four anchors when m > 8 (three when those
+// values are exactly two) rather than escalating from two. At 16 lanes the
+// extra compares are cheap relative to verifying DNA-like survivors. A wide
+// alphabet still starts with kStartAnchors (default 2).
 // ---------------------------------------------------------------------------
 struct anchors { size_t o[4]; int k; };
 

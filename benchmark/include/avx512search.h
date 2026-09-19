@@ -128,10 +128,10 @@ std::pair<bool, size_t> avx512_naive_search(const char* text, size_t n,
     return avx512_naive_search_body(text, n, pattern, m);
 }
 
-// Wide-stride kernel, same three ideas as v3. The single-survivor guard is on the
-// WHOLE block, not per chunk: resolving chunks independently duplicates the
-// pattern broadcasts that the shared narrowing loop exists to amortise, and
-// measures worse on the adversarial shapes.
+// Wide-stride kernel. The single-survivor guard is on the whole block, not
+// per chunk: resolving chunks independently duplicates the pattern broadcasts
+// that the shared narrowing loop exists to amortise, and measures worse on
+// the adversarial shapes.
 static inline __attribute__((always_inline)) std::pair<bool, size_t>
 avx512_naive_search256_body(const char* text, size_t n,
                                const char* pattern, size_t m) {
