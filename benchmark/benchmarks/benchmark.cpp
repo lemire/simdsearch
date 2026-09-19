@@ -15,12 +15,16 @@
 #include <vector>
 
 #include "counters/bench.h"
+// StringZilla, the library, header-only: sz_find dispatches at compile time
+// to its AVX-512 (Skylake) or NEON kernel from the flags this build uses.
+#include <stringzilla/find.h>
 
 // Pick the SIMD backend for the host architecture. Both headers pull the
 // portable scalar and library searchers in from common_search.h.
 #if defined(__AVX512F__) && defined(__AVX512BW__)
   #include "avx512search.h"
   #include "needle_hammer.h"
+  #include "ssef.h"
   #define SIMDSEARCH_AVX512 1
   #define SIMD_NAIVE_SEARCH avx512_naive_search
   #define SIMD_NAIVE_SEARCH_ALL avx512_naive_search_all
@@ -151,8 +155,19 @@ enum class Kind {
   AmortTwoWay,
   AmortTwoWayBC,
   AmortTwoWaySimd,  // twoway_simd::prep built once per needle
+  AmortSSEF,        // SSEF's fingerprint table built once per needle
   AmortRustFinder   // memchr::memmem::Finder built once per needle
 };
+
+// StringZilla's sz_find, the library as shipped (v5), for the row named after
+// it; find_avx512_stringzilla and find_neon_stringzilla are our ports of its
+// anchored kernel, read against it.
+static std::pair<bool, size_t> stringzilla_search(const char *text, size_t n, const char *pat, size_t m) {
+  if (m == 0) return {true, 0};
+  const char *r = sz_find(text, n, pat, m);
+  if (!r) return {false, 0};
+  return {true, (size_t)(r - text)};
+}
 
 // A searcher that cannot take the input at hand (str::find on bytes that are
 // not UTF-8) reports this instead of an answer. The horspool mode then marks
@@ -225,6 +240,11 @@ static const std::vector<Algo> kAlgos = {
     // critical factorization rebuilt per call and built once per needle.
     {"find_twoway_simd", Kind::Stateless, twoway_simd_search},
     {"find_twoway_simd_amortized", Kind::AmortTwoWaySimd, nullptr},
+    // SSEF (ssef.h): Külekci's sublinear block-skipping filter for m >= 32,
+    // n/a below; the fingerprint table is rebuilt per call in the stateless
+    // row and built once per needle in the _amortized row.
+    {"find_ssef", Kind::Stateless, ssef_search},
+    {"find_ssef_amortized", Kind::AmortSSEF, nullptr},
     // The component kernels at 256-bit (AVX2) and 128-bit (SSE2) register
     // width, so the AVX-512 kernels can be read against the same designs at
     // narrower widths.
@@ -255,6 +275,8 @@ static const std::vector<Algo> kAlgos = {
     {"find_twoway_simd", Kind::Stateless, twoway_simd_search},
     {"find_twoway_simd_amortized", Kind::AmortTwoWaySimd, nullptr},
 #endif
+    // StringZilla, the library (sz_find).
+    {"find_stringzilla", Kind::Stateless, stringzilla_search},
     {"find_bmh", Kind::Stateless, bmh_search},
     {"find_bmh16", Kind::Stateless, bmh_search16},
     {"find_kmp", Kind::Stateless, kmp_search},
@@ -296,6 +318,9 @@ struct AmortState {
   std::vector<twoway_prep> tw;
   std::vector<twoway_bc_prep> twbc;
   std::vector<twoway_simd::prep> tws;
+#if defined(SIMDSEARCH_AVX512)
+  std::vector<ssef_prep> ssef;
+#endif
 
 #if defined(SIMDSEARCH_RUST)
   std::vector<void *> rust;  // memchr::memmem::Finder per needle
@@ -309,6 +334,10 @@ struct AmortState {
     tw.clear();
     twbc.clear();
     tws.clear();
+#if defined(SIMDSEARCH_AVX512)
+    ssef.clear();
+    ssef.resize(needles.size());
+#endif
     def.reserve(needles.size());
     bm.reserve(needles.size());
     bmh.reserve(needles.size());
@@ -331,6 +360,9 @@ struct AmortState {
       tw[i].build(s.data(), s.size());
       twbc[i].build(s.data(), s.size());
       tws[i].build(s.data(), s.size());
+#if defined(SIMDSEARCH_AVX512)
+      ssef[i].build(s.data(), s.size());
+#endif
     }
   }
 };
@@ -400,6 +432,13 @@ static inline std::pair<bool, size_t> do_find(const Algo &a,
       return twoway_bc_amortized(am.twbc[id], text, n, pat, m);
     case Kind::AmortTwoWaySimd:
       return twoway_simd_amortized(am.tws[id], text, n, pat, m);
+    case Kind::AmortSSEF:
+#if defined(SIMDSEARCH_AVX512)
+      if (!am.ssef[id].applicable()) return kNotApplicable;
+      return am.ssef[id].search(text, n, pat);
+#else
+      return kNotApplicable;
+#endif
     case Kind::AmortRustFinder:
 #if defined(SIMDSEARCH_RUST)
       (void)pat; (void)m;
@@ -914,9 +953,10 @@ void worstcase_benchmark(size_t haystack_size, const std::string &needle_shape,
       exit(1);
     }
     for (const Algo *a : algos) {
-      auto [f, idx] = do_find(*a, am, li, hay.data(), hay.size(),
-                              needles[li].data(), needles[li].size());
-      if (f) {
+      auto r = do_find(*a, am, li, hay.data(), hay.size(),
+                       needles[li].data(), needles[li].size());
+      if (not_applicable(r)) continue;   // marked n/a below
+      if (r.first) {
         std::cerr << "Error: worstcase false match in " << a->name
                   << " at length " << lengths[li] << "\n";
         exit(1);
@@ -935,6 +975,14 @@ void worstcase_benchmark(size_t haystack_size, const std::string &needle_shape,
     const std::string &hay = haystacks[li];
     for (size_t ai = 0; ai < algos.size(); ++ai) {
       const Algo &a = *algos[ai];
+      // A searcher outside its domain at this length (SSEF below 32 bytes)
+      // is marked n/a rather than timed on a trivial return.
+      if (not_applicable(do_find(a, am, li, hay.data(), hay.size(),
+                                 needles[li].data(), needles[li].size()))) {
+        ns[ai][li] = std::numeric_limits<double>::quiet_NaN();
+        instr[ai][li] = std::numeric_limits<double>::quiet_NaN();
+        continue;
+      }
       auto run = [&]() {
         auto [f, idx] = do_find(a, am, li, hay.data(), hay.size(),
                                 needles[li].data(), needles[li].size());
@@ -963,8 +1011,10 @@ void worstcase_benchmark(size_t haystack_size, const std::string &needle_shape,
     std::print("\n");
     for (size_t ai = 0; ai < algos.size(); ++ai) {
       std::print("{:<48}", algos[ai]->name);
-      for (size_t li = 0; li < lengths.size(); ++li)
-        std::print(" {:>14.1f}", mm[ai][li]);
+      for (size_t li = 0; li < lengths.size(); ++li) {
+        if (std::isnan(mm[ai][li])) std::print(" {:>14}", "n/a");
+        else std::print(" {:>14.1f}", mm[ai][li]);
+      }
       std::print("\n");
     }
   };
@@ -973,6 +1023,83 @@ void worstcase_benchmark(size_t haystack_size, const std::string &needle_shape,
     std::print("\n@@@@@ METRIC instructions\n");
     std::print("values are retired instructions per full-haystack search\n\n");
     print_matrix(instr);
+  }
+}
+
+// Large-haystack mode: the datafile tiled to each requested size (a mebibyte
+// to a gibibyte), searched end to end for needles that never occur, so a
+// search reads the whole haystack once. Reports gigabytes scanned per second,
+// which for a haystack past the last-level cache is the searcher against the
+// memory system: a kernel that is compute-bound in cache either stays where
+// it was, or drops to the rate at which one core can be fed from DRAM.
+//
+// The needles are random substrings of the text with their bytes reversed,
+// so they keep the text's byte statistics (the filters see ordinary text)
+// but do not occur; each is checked against the text concatenated with itself,
+// which covers every window of the tiled haystack.
+void bigscan_benchmark(const std::string &text, const std::string &text_desc,
+                       const std::vector<size_t> &sizes,
+                       const std::vector<size_t> &lengths, size_t needles_per_len,
+                       const std::vector<const Algo *> &algos) {
+  volatile uint64_t sink = 0;
+  std::mt19937_64 gen(g_rng_seed);
+  const std::string doubled = text + text;
+  std::vector<std::vector<std::string>> needles(lengths.size());
+  for (size_t li = 0; li < lengths.size(); ++li) {
+    const size_t L = lengths[li];
+    if (L > text.size()) { std::cerr << "bigscan: needle longer than the text\n"; exit(1); }
+    std::uniform_int_distribution<size_t> dist(0, text.size() - L);
+    size_t tries = 0;
+    while (needles[li].size() < needles_per_len) {
+      std::string nd = text.substr(dist(gen), L);
+      std::reverse(nd.begin(), nd.end());
+      if (doubled.find(nd) != std::string::npos) {
+        if (++tries > 10000) { std::cerr << "bigscan: cannot draw an absent needle of length " << L << "\n"; exit(1); }
+        continue;
+      }
+      needles[li].push_back(std::move(nd));
+    }
+  }
+  std::print("# bigscan mode\n");
+  std::print("text: {} ({} bytes), tiled to each haystack size; {} absent needles per length\n",
+             text_desc, text.size(), needles_per_len);
+  std::print("values are GB/s scanned (haystack bytes per search / ns), one full-haystack search per needle\n");
+  std::print("rows = algorithm, columns = needle length\n");
+  for (size_t S : sizes) {
+    std::string hay;
+    hay.reserve(S);
+    while (hay.size() < S) hay.append(text, 0, std::min(text.size(), S - hay.size()));
+    std::print("\n@@@@@ SIZE {}\n", S);
+    std::print("{:<48}", "algo");
+    for (size_t L : lengths) std::print(" {:>10}", L);
+    std::print("\n");
+    for (const Algo *a : algos) {
+      std::print("{:<48}", a->name);
+      for (size_t li = 0; li < lengths.size(); ++li) {
+        AmortState am;
+        if (a->kind != Kind::Stateless) am.prepare(needles[li]);
+        // The needles must be absent for every searcher.
+        bool na = false;
+        for (size_t q = 0; q < needles[li].size(); ++q) {
+          auto r = do_find(*a, am, q, hay.data(), hay.size(), needles[li][q].data(), needles[li][q].size());
+          if (not_applicable(r)) { na = true; break; }
+          if (r.first) { std::cerr << "bigscan: false match in " << a->name << "\n"; exit(1); }
+        }
+        if (na) { std::print(" {:>10}", "n/a"); continue; }
+        auto run = [&]() {
+          for (size_t q = 0; q < needles[li].size(); ++q) {
+            auto [f, idx] = do_find(*a, am, q, hay.data(), hay.size(), needles[li][q].data(), needles[li][q].size());
+            sink += f ? idx : q;
+          }
+        };
+        auto agg = counters::bench(run);
+        const double gbps = (double)hay.size() * needles[li].size() / agg.fastest_elapsed_ns();
+        std::print(" {:>10.2f}", gbps);
+        std::fflush(stdout);
+      }
+      std::print("\n");
+    }
+    std::print(stderr, "bigscan: size {} done\n", S);
   }
 }
 
@@ -1098,7 +1225,7 @@ int main(int argc, char **argv) {
   }
 
   if (mode == "synthetic" || mode == "horspool" || mode == "ashvardanian" ||
-      mode == "worstcase" || mode == "findall") {
+      mode == "worstcase" || mode == "findall" || mode == "bigscan") {
     std::string path = "./data/43-0.txt";
     bool path_given = false;
     std::vector<size_t> lengths;       // horspool / worstcase only
@@ -1112,6 +1239,7 @@ int main(int argc, char **argv) {
     // ashvardanian 1000 cap.
     size_t max_needles = 0;
     std::string needle_shape = "tail"; // worstcase only: tail|aba|mid|high
+    std::vector<size_t> sizes;         // bigscan only: haystack sizes in bytes
 
     // Helper: value of an option given either as "--opt val" or "--opt=val".
     auto take_value = [&](const std::string &arg, int &k) -> std::string {
@@ -1157,6 +1285,16 @@ int main(int argc, char **argv) {
         g_rng_seed = std::stoull(take_value(arg, k));
       } else if (arg == "--needle" || arg.rfind("--needle=", 0) == 0) {
         needle_shape = take_value(arg, k);
+      } else if (arg == "--sizes" || arg.rfind("--sizes=", 0) == 0) {
+        // bytes, with an optional K/M/G suffix (binary)
+        for (auto t : split_csv(take_value(arg, k))) {
+          size_t mult = 1;
+          if (!t.empty() && (t.back() == 'K' || t.back() == 'M' || t.back() == 'G')) {
+            mult = t.back() == 'K' ? (1ull << 10) : t.back() == 'M' ? (1ull << 20) : (1ull << 30);
+            t.pop_back();
+          }
+          sizes.push_back(std::stoull(t) * mult);
+        }
       } else if (arg.rfind("--", 0) == 0) {
         std::cerr << "unknown option: " << arg << "\n";
         return 1;
@@ -1199,6 +1337,11 @@ int main(int argc, char **argv) {
     } else if (mode == "ashvardanian") {
       ashvardanian_benchmark(load_file(path), algos,
                              max_needles ? max_needles : 1000);
+    } else if (mode == "bigscan") {
+      if (lengths.empty()) for (size_t L : {8u, 32u, 256u}) lengths.push_back(L);
+      if (sizes.empty()) for (size_t S : {1ull << 20, 1ull << 24, 1ull << 28, 1ull << 30}) sizes.push_back(S);
+      bigscan_benchmark(load_file(path), path, sizes, lengths,
+                        max_needles ? max_needles : 5, algos);
     } else if (mode == "worstcase") {
       if (lengths.empty())
         for (size_t L : {4u, 8u, 16u, 32u, 64u, 128u, 256u, 512u})
@@ -1233,6 +1376,8 @@ int main(int argc, char **argv) {
              "(never matches), ns-per-search matrix\n");
   std::print("    findall       enumerate ALL matches: first-match-in-a-loop "
              "vs block-enumerate\n");
+  std::print("    bigscan       the datafile tiled to 1 MiB .. 1 GiB, absent needles, "
+             "GB/s per full scan (--sizes, --lengths, --needles)\n");
   std::print("  datafile is optional for horspool and findall (random text if "
              "omitted); ashvardanian\n"
              "  defaults to ./data/43-0.txt (run from benchmark/ or pass an "

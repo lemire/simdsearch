@@ -23,6 +23,14 @@ AArch64 NEON backend in the same header (`find_neon_needle_hammer`,
 `_unguarded`), with the window and block a quarter as wide and the
 block-derived constants scaled.
 
+`include/ssef.h` is SSEF (Külekci, 2009), the sublinear block-skipping filter
+for needles of at least 32 bytes, after SMART's implementation with the
+fingerprint bit chosen from the needle: `find_ssef_amortized` (table built
+once per needle, the setting the classical searchers get) and `find_ssef`
+(rebuilt per call). Both report n/a below 32 bytes. `find_stringzilla` is
+the StringZilla library itself (`sz_find`, v5.1.2, fetched at configure time),
+beside our ports of its anchored kernel.
+
 `include/avx512search.h` carries the x86 component kernels the featured one is
 read against -- `find_avx512` (single-window naive), `find_avx512_256`
 (256-byte-stride naive, the loop Needle-Hammer's is built on),

@@ -20,6 +20,10 @@ set(NH2_THREE_ANCHOR_MAX "" CACHE STRING "Needle-Hammer: longest needle that sta
 if(NOT NH2_THREE_ANCHOR_MAX STREQUAL "")
     add_compile_definitions(NH2_THREE_ANCHOR_MAX=${NH2_THREE_ANCHOR_MAX})
 endif()
+set(NH2_BUDGET_DEN "" CACHE STRING "Needle-Hammer: guard budget denominator (rounds = n / this + 1)")
+if(NOT NH2_BUDGET_DEN STREQUAL "")
+    add_compile_definitions(NH2_BUDGET_DEN=${NH2_BUDGET_DEN})
+endif()
 
 # SIMD flags: on x86-64, the AVX-512 subsets avx512search.h uses (F + BW for
 # masked byte compares, plus VL/DQ) and the AVX2/SSE2 the narrower kernels need.
@@ -40,9 +44,12 @@ if(SIMDSEARCH_ARCH_FLAGS STREQUAL "")
 endif()
 
 CPMAddPackage("gh:lemire/counters#v3.1.0")
+# StringZilla, header-only, for the find_stringzilla row (the library as
+# shipped, beside our ports of its anchored kernel).
+CPMAddPackage(NAME stringzilla GITHUB_REPOSITORY ashvardanian/StringZilla GIT_TAG v5.1.2 DOWNLOAD_ONLY YES)
 
 add_executable(benchmark benchmarks/benchmark.cpp)
-target_include_directories(benchmark PRIVATE benchmarks include)
+target_include_directories(benchmark PRIVATE benchmarks include ${stringzilla_SOURCE_DIR}/include)
 target_compile_options(benchmark PRIVATE ${SIMDSEARCH_ARCH_FLAGS})
 target_link_libraries(benchmark PRIVATE counters)
 

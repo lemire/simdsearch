@@ -51,7 +51,10 @@ namespace needle_hammer {
 // 256-byte block, about five cycles; the fallback two-way runs at 2-40 GB/s
 // depending on the input, so n/64 rounds (~0.1 cycle per haystack byte) keeps
 // a search that gives up within a small factor of the fallback alone.
-static constexpr size_t kBudgetDen = 64;
+#ifndef NH2_BUDGET_DEN
+#define NH2_BUDGET_DEN 64
+#endif
+static constexpr size_t kBudgetDen = NH2_BUDGET_DEN;
 
 // Below this needle length the guard is absent. A block admits at most m - 2
 // narrowing rounds, so the whole haystack admits at most n(m - 2)/256 rounds,
@@ -532,7 +535,10 @@ static constexpr size_t kW = 16;
 static constexpr size_t kB = 64;
 // A narrowing round covers 64 positions here, a quarter of the AVX-512 block,
 // so the same instruction budget is four times as many rounds: n/16.
-static constexpr size_t kBudgetDen = 16;
+#ifndef NH2_BUDGET_DEN
+#define NH2_BUDGET_DEN 16
+#endif
+static constexpr size_t kBudgetDen = NH2_BUDGET_DEN;
 // Below this needle length the guard is absent: a block admits at most m - 2
 // rounds, so the haystack admits at most n(m - 2)/64, under n/10 for m <= 8
 // and bounded by construction.
