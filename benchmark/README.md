@@ -117,6 +117,9 @@ Modes:
   `./data/43-0.txt` when cwd is `benchmark/`; pass an explicit path from the
   repo root)
 - `worstcase` — adversarial haystack/needle shapes
+- `bigscan` — the datafile tiled to 1 MiB .. 1 GiB (`--sizes`), absent
+  needles (`--needles` per length), GB/s per full-haystack scan: the searcher
+  against the memory system once the haystack no longer fits in cache
 - `findall` — overlapping find-all: first-match loop vs block enumerator
 
 Synthetic and horspool draws use a fixed RNG seed (override with `--seed`).
