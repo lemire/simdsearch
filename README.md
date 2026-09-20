@@ -109,11 +109,11 @@ target_link_libraries(app PRIVATE simdsearch::simdsearch)
 **Single header from a release** (no git, no CMake): every release on the
 [releases page](https://github.com/lemire/simdsearch/releases) attaches the
 library amalgamated into one file, `simdsearch.h`, and its checksum. The
-latest release is **v0.0.0**.
+latest release is **v0.1.0**.
 
 ```sh
-curl -LO https://github.com/lemire/simdsearch/releases/download/v0.0.0/simdsearch.h
-curl -LO https://github.com/lemire/simdsearch/releases/download/v0.0.0/SHA256SUMS
+curl -LO https://github.com/lemire/simdsearch/releases/download/v0.1.0/simdsearch.h
+curl -LO https://github.com/lemire/simdsearch/releases/download/v0.1.0/SHA256SUMS
 sha256sum -c SHA256SUMS            # shasum -a 256 -c SHA256SUMS on macOS
 ```
 
