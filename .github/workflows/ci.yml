@@ -27,7 +27,7 @@ jobs:
     name: NEON (Linux ARM64, GCC 14)
     runs-on: ubuntu-24.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install GCC 14
         run: sudo apt-get update && sudo apt-get install -y g++-14
       - name: Build
@@ -53,7 +53,7 @@ jobs:
     name: NEON (macOS, Apple clang)
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build
         run: |
           cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="$WARNINGS"
@@ -71,7 +71,7 @@ jobs:
     name: AVX-512 (Linux x86-64, GCC 14, Intel SDE)
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Install GCC 14
         run: sudo apt-get update && sudo apt-get install -y g++-14
       - name: Install Intel SDE

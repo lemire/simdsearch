@@ -4,10 +4,9 @@
 // Function for function this mirrors avx512search.h: a single-window naive
 // kernel, a wide-stride naive kernel built from four of those windows, and the
 // three-anchor (StringZilla) kernel. Needle-Hammer itself is in
-// needle_hammer.h, with a NEON backend built from the same idioms. Reading the
-// two headers side by side is meant to be possible.
+// needle_hammer.h, with a NEON backend built from the same idioms.
 //
-// Three things do not carry over from AVX-512:
+// What does not carry over from AVX-512:
 //
 //   register width   NEON is 128-bit, so one window covers 16 candidate
 //                    positions rather than 64 and a wide block covers 64 rather
@@ -158,8 +157,8 @@ static inline bool neon_needle_eq(const char* p, const neon_needle_reg& nr) {
 // Naive prefix-filter kernels
 // ===========================================================================
 
-// Single-window kernel, 16 candidate positions per iteration. The same three
-// ideas as the AVX-512 single-window kernel:
+// Single-window kernel, 16 candidate positions per iteration. Same as the
+// AVX-512 single-window kernel:
 //
 //   independent compares  the four peeled compares do not chain through one
 //                         register, so they issue in parallel.
@@ -220,12 +219,12 @@ neon_naive_search_body(const char* text, size_t n, const char* pattern, size_t m
             if (!neon_any_lane_set(f)) continue;
             uint64_t mask = neon_lane_mask(f);
 
-            if ((mask & (mask - 1)) == 0) {              // one survivor
+            if ((mask & (mask - 1)) == 0) {
                 const size_t b = i + ((size_t)__builtin_ctzll(mask) >> 2);
                 if (verify(b)) return {true, b};
                 continue;
             }
-            for (size_t k = 4; k < m; ++k) {             // many: narrow
+            for (size_t k = 4; k < m; ++k) {
                 if (!neon_any_lane_set(f)) break;
                 f = vandq_u8(f, vceqq_u8(neon_load(text + i + k),
                                          vdupq_n_u8((uint8_t)pattern[k])));
@@ -332,7 +331,7 @@ neon_naive_search64_body(const char* text, size_t n, const char* pattern, size_t
             const uint64_t mC = neon_lane_mask(fC), mD = neon_lane_mask(fD);
             const int nz = (mA != 0) + (mB != 0) + (mC != 0) + (mD != 0);
             const uint64_t one = mA | mB | mC | mD;
-            if (nz == 1 && (one & (one - 1)) == 0) {     // one survivor in the block
+            if (nz == 1 && (one & (one - 1)) == 0) {
                 const size_t off = (mA != 0) ? 0 : (mB != 0) ? 16 : (mC != 0) ? 32 : 48;
                 const size_t b = i + off + ((size_t)__builtin_ctzll(one) >> 2);
                 if (verify(b)) return {true, b};

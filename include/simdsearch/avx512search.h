@@ -51,8 +51,6 @@ inline void avx512_naive_search_all(const char* text, size_t n, const char* patt
     // SIMD chunk reads bytes [i, i + 63 + (m - 1)], so require i + m + 63 <= n.
     if (n >= m + 63) {
         if (m >= 4) {
-            // Broadcasts of the first four pattern bytes are loop-invariant, so
-            // hoist them out of the block loop (amortized across all blocks).
             const __m512i p0 = _mm512_set1_epi8((char)pattern[0]);
             const __m512i p1 = _mm512_set1_epi8((char)pattern[1]);
             const __m512i p2 = _mm512_set1_epi8((char)pattern[2]);
@@ -74,7 +72,7 @@ inline void avx512_naive_search_all(const char* text, size_t n, const char* patt
                 // Enumerate every match in this block, lowest index first.
                 while (found) {
                     callback(i + (size_t)__builtin_ctzll(found));
-                    found &= found - 1;  // clear the lowest set bit
+                    found &= found - 1;
                 }
             }
         } else {
@@ -242,7 +240,7 @@ static inline simd_guarded_result avx512_stringzilla_body(
             // too -- the lanes that are not mask bits failed the anchors, and
             // the mask bits below b were verified and failed.
             if (verified > budget_bytes) return {false, 0, true, i + b + 1};
-            mask &= mask - 1;  // clear the lowest set bit and continue
+            mask &= mask - 1;
         }
     }
 
@@ -651,7 +649,7 @@ static inline std::pair<bool, size_t> x86_stringzilla_find_t(const char* text, s
                 equal = x86_equal_t<Ops>(text + i + b, pattern, m);
             }
             if (equal) return {true, i + b};
-            mask &= mask - 1;  // clear the lowest set bit and continue
+            mask &= mask - 1;
         }
     }
 

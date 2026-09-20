@@ -6,11 +6,11 @@
 // point, or a byte that is rare in the needle), 256 positions per iteration,
 // then narrows the survivors byte by byte. Two anchors are used while the
 // haystack shows they suffice; a third and a fourth are added, one at a
-// time, when survivors become frequent. Narrowing rounds are counted, in the
-// block loop and in the windows that cover the ends of the haystack alike,
-// and once they exceed a budget proportional to the haystack the search
-// resumes with a linear-time two-way, so every input is searched in linear
-// time. Needles of one to three bytes take a dedicated stride loop with no
+// time, when survivors become frequent. Narrowing rounds are counted in the
+// block loop and in the windows that cover the ends of the haystack, and
+// once they exceed a budget proportional to the haystack the search resumes
+// with a linear-time two-way, so every input is searched in linear time.
+// Needles of one to three bytes take a dedicated stride loop with no
 // verification at all.
 //
 // Dispatch, in order:
@@ -27,8 +27,8 @@
 // 256, and AArch64 NEON, where a window is 16 positions and a block 64. The
 // NEON kernel keeps candidates as 0x00/0xFF lanes, tests "any lane alive"
 // with shrn + fcmp, and covers the ends of the haystack with overlap windows
-// instead of masked loads, as neonsearch.h does; the design is otherwise the
-// same, with the block-derived constants scaled. What does not depend on the
+// instead of masked loads, as neonsearch.h does. Block-derived constants are
+// scaled to the narrower window. What does not depend on the
 // register width -- the anchor structure and its positional choice, the
 // kernel result, the escalation driver and the public entry points -- is
 // written once, above and below the two backends.

@@ -1,7 +1,7 @@
 // Correctness tests for the SIMD and scalar string searchers.
 //
-// Every searcher is checked against a std::string::find reference across a
-// battery of deterministic edge cases plus a large randomized fuzz sweep. The
+// Every searcher is checked against a std::string::find reference across
+// deterministic edge cases plus a large randomized fuzz sweep. The
 // randomized inputs use a small alphabet so partial matches (shared prefixes,
 // repeated anchor bytes) occur constantly, exercising the SIMD verify paths and
 // early-out logic. The test is self-contained: it returns non-zero on the first

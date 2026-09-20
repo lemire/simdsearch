@@ -10,7 +10,7 @@ if(SIMDSEARCH_TESTS)
     target_link_libraries(test_search PRIVATE simdsearch::simdsearch)
     add_test(NAME test_search COMMAND test_search)
 
-    # Needle-Hammer's own battery: block boundaries at every alignment, small
+    # Needle-Hammer tests: block boundaries at every alignment, small
     # haystacks, periodic needles, escalation and guard give-up, fuzz.
     add_executable(test_needle_hammer tests/test_needle_hammer.cpp)
     target_link_libraries(test_needle_hammer PRIVATE simdsearch::simdsearch)

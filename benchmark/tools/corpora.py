@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """Build the corpus set used by the data-diversity and haystack-size sweeps.
 
-The paper's headline "real data" number comes from one 141 KB English book, which
-is (a) LLC-resident on every machine we test and (b) Latin-1-ish text with the
-byte-frequency skew that anchor-and-verify filters like best. Neither property is
-universal, so this script materialises two extra axes.
+The default horspool file is one 141 KB English book, which is (a) LLC-resident
+on every machine we test and (b) Latin-1-ish text with the byte-frequency skew
+that anchor-and-verify filters like best. Neither property is universal, so this
+script materialises two extra axes.
 
 *Diversity* (`corpora/<name>.dat`, ~1 MB each). Low-entropy and non-Latin inputs
 are not adversaries -- they are ordinary production workloads that happen to have
 the byte-frequency structure the anchored filter depends on:
 
-  english   the Project Gutenberg book, tiled to size (the paper's baseline)
+  english   the Project Gutenberg book, tiled to size (the horspool default)
   dna       |S| = 4, the classic small-alphabet workload
   protein   |S| = 20
   json      minified JSON: heavy punctuation, repeated key names
@@ -20,9 +20,10 @@ the byte-frequency structure the anchored filter depends on:
   chinese   UTF-8 CJK -- almost every byte >= 0x80
   russian   UTF-8 Cyrillic -- two-byte sequences, high bytes throughout
 
-The last three matter specifically because `select_anchors` deprioritises high
-bytes (it treats them as UTF-8 continuation bytes), a heuristic tuned on Latin
-text. `chinese` and `russian` are where that heuristic has to earn its keep.
+The last three matter because UTF-8 CJK and Cyrillic spend most bytes at or
+above 0x80, unlike the Latin book the default run uses. The StringZilla-style
+selector's optional FilterHighBytes rule skips UTF-8 lead bytes; chinese and
+russian are where that rule is tested.
 
 *Size* (`corpora/size_<n>.dat`). The same English text tiled from 1 KB to 1 GB,
 so the ranking can be checked once the haystack leaves cache and every searcher

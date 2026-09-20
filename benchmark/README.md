@@ -6,24 +6,13 @@ NEON**. A build on anything else stops at a `#error`. The headers live in
 `../include/simdsearch/`; the top-level README covers using them as a
 library, this one covers the driver.
 
-`needle_hammer.h` is Needle-Hammer, the featured searcher
-(`find_avx512_needle_hammer`, and `find_avx512_needle_hammer_unguarded` for
-measuring the guard): a single wide kernel that tests every candidate position
-on two to four needle bytes chosen for selectivity -- first and last byte,
-then the middle and a quarter point, or, when the needle has one, a byte that
-is rare in it -- 256 positions per iteration, then narrows the survivors byte
-by byte. Two anchors are used while the haystack shows they suffice and a
-third and a fourth are added, one at a time, once survivors become frequent;
-needles of one to three bytes take a dedicated loop with no verification at
-all; and a work counter bounds the narrowing, in the block loop and in the
-windows at the ends of the haystack alike, resuming with the vectorized
-two-way in `twoway_simd.h` (`find_twoway_simd`) so every input is
-searched in linear time. There is no needle-length threshold to fit per
-machine. The constants are documented in the header; `NH2_START_ANCHORS` and
-`NH2_THREE_ANCHOR_MAX` can be set at compile time. The same design has an
-AArch64 NEON backend in the same header (`find_neon_needle_hammer`,
-`_unguarded`), with the window and block a quarter as wide and the
-block-derived constants scaled.
+`needle_hammer.h` is Needle-Hammer (`find_avx512_needle_hammer`, and
+`find_avx512_needle_hammer_unguarded` for measuring the guard). The algorithm
+and its knobs are in the header and the top-level README; `NH2_START_ANCHORS`
+and `NH2_THREE_ANCHOR_MAX` can be set at compile time. The same header has an
+AArch64 NEON backend (`find_neon_needle_hammer`, `_unguarded`), with the
+window and block a quarter as wide. The linear-time fallback is
+`find_twoway_simd` in `twoway_simd.h`.
 
 `ssef.h` is SSEF (Külekci, 2009), the sublinear block-skipping filter
 for needles of at least 32 bytes, after SMART's implementation with the
@@ -33,7 +22,7 @@ once per needle, the setting the classical searchers get) and `find_ssef`
 the StringZilla library itself (`sz_find`, v5.1.2, fetched at configure time),
 beside our ports of its anchored kernel.
 
-`avx512search.h` carries the x86 component kernels the featured one is
+`avx512search.h` carries the x86 component kernels Needle-Hammer is
 read against -- `find_avx512` (single-window naive), `find_avx512_256`
 (256-byte-stride naive, the loop Needle-Hammer's is built on),
 `find_avx512_stringzilla` (three-anchor filter, StringZilla's design) and
@@ -141,7 +130,7 @@ Three test binaries, all against `std::string::find`:
   enumerator, a seeded fuzz sweep, and two deterministic guard tests that
   drive Needle-Hammer's wide kernel to its give-up and check the two-way
   resume.
-- `test_needle_hammer` — the featured kernel's own battery.
+- `test_needle_hammer` — Needle-Hammer tests.
 - `test_api` — the public header at C++17, from two translation units, with
   exact-size heap buffers and the full byte range.
 

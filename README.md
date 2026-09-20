@@ -242,7 +242,7 @@ Modes: `synthetic` (64 KiB random text, 100k short needles), `horspool`
 `worstcase` (adversarial haystack/needle shapes), `bigscan` (the file tiled
 up to 1 GiB, GB/s once the haystack no longer fits in cache), `findall`.
 `benchmark/README.md` has the full algorithm list, the options and what each
-row measures. `benchmark/tools/corpora.py` builds the eight ~1 MB datasets
+row measures. `benchmark/tools/corpora.py` builds the nine ~1 MB datasets
 (English, DNA, protein, JSON, base64, logs, C source, Cyrillic and CJK UTF-8)
 into `corpora/` with a `MANIFEST.txt` of SHA-256 digests.
 
@@ -253,9 +253,8 @@ Tests (`ctest`, or the binaries in `build/benchmark/`):
   the find-all enumerator, and two deterministic guard tests that make
   Needle-Hammer exhaust its budget and check that the two-way resume still
   finds a match placed past the give-up point.
-- `test_needle_hammer` -- the featured kernel's own battery: block boundaries
-  at every alignment, small haystacks, periodic needles, escalation, 320k
-  fuzz cases.
+- `test_needle_hammer` -- Needle-Hammer tests: block boundaries at every
+  alignment, small haystacks, periodic needles, escalation, 320k fuzz cases.
 - `test_api` -- the public header at C++17 from two translation units,
   exact-size heap buffers (so an over-read is a sanitizer error, not a read
   into `std::string`'s slack), NUL bytes, the full byte range.

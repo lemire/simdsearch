@@ -3,8 +3,7 @@
 // Needle-Hammer (needle_hammer.h): the masked alignment head, and the naive
 // kernels that filter on the needle's first four bytes -- the loop
 // Needle-Hammer's wide kernel is built on, and what it dispatches to for a
-// four-byte needle. Split out so the library's public header does not pull in
-// the benchmark's baselines.
+// four-byte needle. Not part of the public header's include closure.
 #include <immintrin.h>
 #include <cstddef>
 #include <cstdint>
@@ -13,12 +12,12 @@
 
 // Scan the first `count` candidate positions with a single masked window.
 //
-// Its purpose is alignment. The strided loops below issue four loads per
-// 64-byte chunk, at offsets 0 to 3; the offset-0 load is aligned exactly when
-// the scan pointer is, and a misaligned buffer therefore splits a cache line on
-// all four rather than three. Walking the scan pointer up to a 64-byte boundary
-// first costs one masked window and removes a quarter of the split loads for the
-// whole rest of the search.
+// The strided loops below issue four loads per 64-byte chunk, at offsets 0 to
+// 3; the offset-0 load is aligned exactly when the scan pointer is, and a
+// misaligned buffer therefore splits a cache line on all four rather than
+// three. Walking the scan pointer up to a 64-byte boundary first costs one
+// masked window and removes a quarter of the split loads for the rest of the
+// search.
 //
 // Requires count < 64 and count + m - 1 <= n, so every masked lane reads in
 // bounds. Returns the first match below `count`, if any.
@@ -42,8 +41,7 @@ static inline size_t avx512_align_head(const char* text, size_t n, size_t m) {
     return head < positions ? head : positions;
 }
 
-// Single-window kernel, 64 bytes per iteration. Three ideas, each needed for
-// a different reason:
+// Single-window kernel, 64 bytes per iteration.
 //
 //   independent compares  the four peeled compares do not chain through one
 //                         mask register, so they issue in parallel. Chaining
@@ -91,7 +89,7 @@ avx512_naive_search_body(const char* text, size_t n,
             const __mmask64 c3 = _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(text+i+3)), p3);
             __mmask64 f = (c0 & c1) & (c2 & c3);
             if (f == 0) continue;
-            if ((f & (f - 1)) == 0) {                       // one survivor
+            if ((f & (f - 1)) == 0) {
                 const size_t b = (size_t)__builtin_ctzll(f);
                 if (fits) {
                     if (_mm512_mask_cmpneq_epi8_mask(
@@ -102,7 +100,7 @@ avx512_naive_search_body(const char* text, size_t n,
                 }
                 continue;
             }
-            for (size_t k = 4; k < m && f != 0; ++k)        // many: narrow
+            for (size_t k = 4; k < m && f != 0; ++k)
                 f = _mm512_mask_cmpeq_epi8_mask(
                         f, _mm512_loadu_si512((const void*)(text + i + k)),
                         _mm512_set1_epi8((char)pattern[k]));
@@ -163,7 +161,7 @@ avx512_naive_search256_body(const char* text, size_t n,
 
             const int nz = (fA != 0) + (fB != 0) + (fC != 0) + (fD != 0);
             const __mmask64 one = fA | fB | fC | fD;
-            if (nz == 1 && (one & (one - 1)) == 0) {          // one survivor in the block
+            if (nz == 1 && (one & (one - 1)) == 0) {
                 const size_t off = (fA != 0) ? 0 : (fB != 0) ? 64 : (fC != 0) ? 128 : 192;
                 const size_t b = off + (size_t)__builtin_ctzll(one);
                 if (fits) {
