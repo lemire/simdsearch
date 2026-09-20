@@ -87,7 +87,7 @@ static inline void sz_locate_needle_anomalies(const char* start, size_t length,
 // C library strstr. Requires NUL-terminated text and pattern (the benchmark
 // inputs are std::string data, which is NUL-terminated and contains no NUL
 // bytes). Reports byte offset of the first occurrence.
-std::pair<bool, size_t> strstr_search(const char* text, size_t n, const char* pattern, size_t m) {
+inline std::pair<bool, size_t> strstr_search(const char* text, size_t n, const char* pattern, size_t m) {
     if (m == 0) return {true, 0};
     if (n < m) return {false, 0};
     const char* hit = std::strstr(text, pattern);
@@ -98,7 +98,7 @@ std::pair<bool, size_t> strstr_search(const char* text, size_t n, const char* pa
 // C library memmem (POSIX 2024; long-standing extension on glibc/BSD/macOS).
 // Unlike strstr it is length-delimited, so it needs no NUL terminator and is
 // safe on inputs containing NUL bytes.
-std::pair<bool, size_t> memmem_search(const char* text, size_t n, const char* pattern, size_t m) {
+inline std::pair<bool, size_t> memmem_search(const char* text, size_t n, const char* pattern, size_t m) {
     if (m == 0) return {true, 0};
     if (n < m) return {false, 0};
     const char* hit = (const char*)::memmem(text, n, pattern, m);
@@ -109,7 +109,7 @@ std::pair<bool, size_t> memmem_search(const char* text, size_t n, const char* pa
 // std::search with std::default_searcher (C++17). The searcher is rebuilt per
 // call to match the interface of the other functions here (which also do not
 // amortize per-pattern preprocessing across calls).
-std::pair<bool, size_t> std_default_searcher(const char* text, size_t n, const char* pattern, size_t m) {
+inline std::pair<bool, size_t> std_default_searcher(const char* text, size_t n, const char* pattern, size_t m) {
     if (m == 0) return {true, 0};
     if (n < m) return {false, 0};
     auto it = std::search(text, text + n,
@@ -119,7 +119,7 @@ std::pair<bool, size_t> std_default_searcher(const char* text, size_t n, const c
 }
 
 // std::search with std::boyer_moore_searcher (C++17).
-std::pair<bool, size_t> std_boyer_moore_searcher(const char* text, size_t n, const char* pattern, size_t m) {
+inline std::pair<bool, size_t> std_boyer_moore_searcher(const char* text, size_t n, const char* pattern, size_t m) {
     if (m == 0) return {true, 0};
     if (n < m) return {false, 0};
     auto it = std::search(text, text + n,
@@ -129,7 +129,7 @@ std::pair<bool, size_t> std_boyer_moore_searcher(const char* text, size_t n, con
 }
 
 // std::search with std::boyer_moore_horspool_searcher (C++17).
-std::pair<bool, size_t> std_boyer_moore_horspool_searcher(const char* text, size_t n, const char* pattern, size_t m) {
+inline std::pair<bool, size_t> std_boyer_moore_horspool_searcher(const char* text, size_t n, const char* pattern, size_t m) {
     if (m == 0) return {true, 0};
     if (n < m) return {false, 0};
     auto it = std::search(text, text + n,
@@ -144,7 +144,7 @@ std::pair<bool, size_t> std_boyer_moore_horspool_searcher(const char* text, size
 // for the last text byte of the current window. The table uses uint8_t so init
 // is one cache-line-friendly memset; shifts are clamped to 255 (smaller shifts
 // stay correct, just non-optimal for needles longer than 255 bytes).
-std::pair<bool, size_t> bmh_search(const char* text, size_t n, const char* pattern, size_t m) {
+inline std::pair<bool, size_t> bmh_search(const char* text, size_t n, const char* pattern, size_t m) {
     if (m == 0) return {true, 0};
     if (n < m) return {false, 0};
 
@@ -174,7 +174,7 @@ std::pair<bool, size_t> bmh_search(const char* text, size_t n, const char* patte
 // the bad-character shifts are stored as uint16_t, so they clamp at 65535
 // instead of 255: needles up to 65535 bytes get their full skip distance, which
 // matters for long patterns where the 8-bit version caps every skip at 255.
-std::pair<bool, size_t> bmh_search16(const char* text, size_t n, const char* pattern, size_t m) {
+inline std::pair<bool, size_t> bmh_search16(const char* text, size_t n, const char* pattern, size_t m) {
     if (m == 0) return {true, 0};
     if (n < m) return {false, 0};
 

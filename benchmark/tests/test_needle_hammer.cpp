@@ -5,7 +5,7 @@
 #include <string>
 #include <vector>
 #include <cmath>
-#include "needle_hammer.h"
+#include "simdsearch/needle_hammer.h"
 
 #if defined(__AVX512F__) && defined(__AVX512BW__)
   #define NH_GUARDED avx512_needle_hammer
@@ -76,7 +76,7 @@ int main() {
         std::string h3; while (h3.size() < 65536) h3 += "abcabx"; check(h3, per, "periodic absent");
         std::string h4 = h3; for (size_t i = 0; i < L; ++i) h4[40000 + i] = per[i]; check(h4, per, "periodic present");
     }
-    // escalation: log-like haystack where three anchors admit many survivors
+    // escalation: log-like haystack where two anchors admit many survivors
     {
         std::string line = "2026-09-17 12:34:56 INFO  server-01 request id=0000000 path=/api/v1/items status=200\n";
         std::string hay; int k = 0;
@@ -100,7 +100,7 @@ int main() {
         if (g() % 4 == 0) { size_t per = 1 + g() % 4; for (size_t i = per; i < m; ++i) p[i] = p[i - per]; }
         check(t, p, "fuzz");
     }
-    // fuzz on wide alphabets with long needles (three-anchor path, escalation, guard)
+    // fuzz on wide alphabets with long needles (rare-byte anchor, escalation, guard)
     for (int r = 0; r < 20000; ++r) {
         int sigma = 2 + g() % 60;
         size_t n = 1024 + g() % 20000;

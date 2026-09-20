@@ -28,17 +28,105 @@
 // NEON kernel keeps candidates as 0x00/0xFF lanes, tests "any lane alive"
 // with shrn + fcmp, and covers the ends of the haystack with overlap windows
 // instead of masked loads, as neonsearch.h does; the design is otherwise the
-// same, with the block-derived constants scaled.
-#include <algorithm>
+// same, with the block-derived constants scaled. What does not depend on the
+// register width -- the anchor structure and its positional choice, the
+// kernel result, the escalation driver and the public entry points -- is
+// written once, above and below the two backends.
+//
+// Public API (any backend): needle_hammer::find(text, n, pattern, m) returns
+// {found, index}; needle_hammer::find(haystack, needle) on string_views
+// returns the index or std::string_view::npos. See the README.
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <string_view>
 #include <utility>
 #include "twoway_simd.h"
 
+namespace needle_hammer {
+
+// ---------------------------------------------------------------------------
+// Shared by both backends
+// ---------------------------------------------------------------------------
+
+struct anchors {
+    size_t o[4];   // offsets into the needle, ascending; unused slots are spares
+    int k;         // anchors in use: 2, 3 or 4
+};
+
+// Positional anchors: first, quarter, middle and last byte, each walked
+// inward (at most 64 steps) so the four byte values are distinct where
+// possible. The walk rules are StringZilla's: the middle anchor moves only
+// while it equals the first byte, since it is the anchor most likely to sit on
+// an anomaly and a stricter rule walks it off that anomaly on a two-letter
+// alphabet; the last moves while it equals first or middle; the quarter point
+// moves while it equals the first byte.
+static inline void positional(const unsigned char* s, size_t m, size_t o[4]) {
+    o[0] = 0; o[1] = m / 4; o[2] = m / 2; o[3] = m - 1;
+    { int w = 64; while (w-- && s[o[1]] == s[o[0]] && o[1] + 1 < o[2]) ++o[1]; }
+    { int w = 64; while (w-- && s[o[2]] == s[o[0]] && o[2] + 1 < o[3]) ++o[2]; }
+    { int w = 64; while (w-- && (s[o[3]] == s[o[2]] || s[o[3]] == s[o[0]]) && o[3] > o[2] + 1) --o[3]; }
+}
+
+// Sort the first k anchor offsets (k <= 4). An insertion sort, not
+// std::sort: four elements do not need introsort, and GCC's -Warray-bounds
+// cannot see that introsort's 16-element threshold is unreachable here.
+static inline void sort_anchors(size_t* o, int k) {
+    for (int i = 1; i < k; ++i) {
+        const size_t v = o[i];
+        int j = i;
+        while (j > 0 && o[j - 1] > v) { o[j] = o[j - 1]; --j; }
+        o[j] = v;
+    }
+}
+
+// One more anchor: the next spare joins the active set, kept sorted.
+static inline anchors escalate(anchors a) {
+    ++a.k;
+    sort_anchors(a.o, a.k);
+    return a;
+}
+
+// What a kernel pass reports back to the driver.
+struct result {
+    bool found = false;
+    size_t index = 0;
+    int state = 0;         // 0 done; 1 budget exhausted; 2 escalate to one more anchor
+    size_t resume = 0;     // first position not yet ruled out, for states 1 and 2
+    size_t rounds = 0;     // narrowing rounds counted so far (Guarded only)
+    size_t survivors = 0;  // positions that passed the anchors so far (K < 4 only)
+};
+
+// Cost of a surviving lane, in filter-compare units, for the escalation rule:
+// a mispredicted branch plus, for long needles, the restart of the far load
+// streams the anchors at m/2 and m-1 keep in flight.
+static inline size_t survivor_cost(size_t m) { return 20 + m / 32; }
+
+// The escalation driver. `run(anchors, carried_rounds, from)` is one pass of
+// a kernel with the given anchors from position `from`. Survivors too
+// frequent (state 2): add the next anchor and continue from the block that
+// showed it, carrying the rounds already spent. The budget spent with fewer
+// than four anchors (state 1): continue with all four and a fresh budget, so
+// the bound is 2(n/kBudgetDen + 1) rounds plus the two-way pass. Out of
+// budget with four anchors: resume with the linear-time two-way from the
+// first position not ruled out.
+template <class Run>
+static inline std::pair<bool, size_t>
+drive(Run run, anchors an, const char* text, size_t n, const char* pattern, size_t m) {
+    result r = run(an, 0, 0);
+    while (r.state != 0 && an.k < 4) {
+        if (r.state == 1) { an.k = 4; sort_anchors(an.o, 4); r = run(an, 0, r.resume); }
+        else              { an = escalate(an); r = run(an, r.rounds, r.resume); }
+    }
+    if (r.state == 0) return {r.found, r.index};
+    return twoway_simd::search_from(text, n, pattern, m, r.resume);
+}
+
+}  // namespace needle_hammer
+
 #if defined(__AVX512F__) && defined(__AVX512BW__)
 #include <immintrin.h>
-#include "avx512search.h"
+#include "avx512_naive.h"
 
 namespace needle_hammer {
 
@@ -57,9 +145,11 @@ namespace needle_hammer {
 static constexpr size_t kBudgetDen = NH2_BUDGET_DEN;
 
 // Below this needle length the guard is absent. A block admits at most m - 2
-// narrowing rounds, so the whole haystack admits at most n(m - 2)/256 rounds,
-// about n/7.5 for m = 36: bounded by construction, and cheaper than
-// what two-way costs on the short periodic needles that would trip a guard
+// narrowing rounds, so the block loop admits at most n(m - 2)/256 rounds,
+// about n/7.5 for m = 36; the masked windows (alignment head, remainder,
+// small haystacks) admit up to m rounds per 64 positions, n(m - 2)/64 in the
+// worst case, still bounded by construction. Both are cheaper than what
+// two-way costs on the short periodic needles that would trip a guard
 // (8 GB/s of narrowing against 2 GB/s of two-way on the block shape at L=16).
 static constexpr size_t kFreeBelow = 36;
 
@@ -86,33 +176,9 @@ static constexpr size_t kThreeAnchorMax = NH2_THREE_ANCHOR_MAX;
 #endif
 static constexpr int kStartAnchors = NH2_START_ANCHORS;
 
-// Cost of a surviving lane, in filter-compare units, for the escalation rule
-// below: a mispredicted branch plus, for long needles, the restart of the far
-// load streams the anchors at m/2 and m-1 keep in flight.
-static inline size_t survivor_cost(size_t m) { return 20 + m / 32; }
-
 // ---------------------------------------------------------------------------
 // Anchor selection
 // ---------------------------------------------------------------------------
-
-struct anchors {
-    size_t o[4];   // offsets into the needle, ascending; unused slots are spares
-    int k;         // anchors in use: 2, 3 or 4
-};
-
-// Positional anchors: first, quarter, middle and last byte, each walked
-// inward (at most 64 steps) so the four byte values are distinct where
-// possible. The walk rules are StringZilla's: the middle anchor moves only
-// while it equals the first byte, since it is the anchor most likely to sit on
-// an anomaly and a stricter rule walks it off that anomaly on a two-letter
-// alphabet; the last moves while it equals first or middle; the quarter point
-// moves while it equals the first byte.
-static inline void positional(const unsigned char* s, size_t m, size_t o[4]) {
-    o[0] = 0; o[1] = m / 4; o[2] = m / 2; o[3] = m - 1;
-    { int w = 64; while (w-- && s[o[1]] == s[o[0]] && o[1] + 1 < o[2]) ++o[1]; }
-    { int w = 64; while (w-- && s[o[2]] == s[o[0]] && o[2] + 1 < o[3]) ++o[2]; }
-    { int w = 64; while (w-- && (s[o[3]] == s[o[2]] || s[o[3]] == s[o[0]]) && o[3] > o[2] + 1) --o[3]; }
-}
 
 // Select the anchors for a needle of m >= 5 bytes.
 //
@@ -164,14 +230,7 @@ static inline anchors select(const char* pattern, size_t m) {
         if (a.k == 3) std::swap(a.o[1], a.o[2]);
         if (a.k == 4) std::swap(a.o[1], a.o[2]);
     }
-    std::sort(a.o, a.o + a.k);
-    return a;
-}
-
-// One more anchor: the next spare joins the active set, kept sorted.
-static inline anchors escalate(anchors a) {
-    ++a.k;
-    std::sort(a.o, a.o + a.k);
+    sort_anchors(a.o, a.k);
     return a;
 }
 
@@ -182,14 +241,6 @@ static inline anchors escalate(anchors a) {
 // and whole small haystacks. Candidate p is live only while p + m <= n, so
 // every load text + p + k with k < m stays inside the buffer.
 // ---------------------------------------------------------------------------
-struct result {
-    bool found;
-    size_t index;
-    int state;       // 0 done; 1 budget exhausted; 2 escalate to one more anchor
-    size_t resume;   // first position not yet ruled out, for states 1 and 2
-    size_t rounds;   // narrowing rounds counted so far (Guarded only)
-    size_t survivors;  // positions that passed the anchors so far (K < 4 only)
-};
 
 // Masked windows over [first, last_exclusive). With fewer than four anchors
 // the survivors of the anchor filter are counted and the escalation rule
@@ -199,7 +250,7 @@ struct result {
 // has seen a single block.
 template <bool Guarded, int K>
 static inline __attribute__((always_inline)) result
-masked_windows(const char* text, size_t n, const char* pattern, size_t m,
+masked_windows(const char* text, [[maybe_unused]] size_t n, const char* pattern, size_t m,
                size_t first, size_t last_exclusive, const size_t* o, const __m512i* pv,
                size_t budget_rounds, size_t rounds, size_t survivors, size_t allowance) {
     for (size_t i = first; i < last_exclusive; i += 64) {
@@ -456,12 +507,14 @@ template <bool Guarded>
 [[gnu::noinline]] static std::pair<bool, size_t>
 search_long(const char* text, size_t n, const char* pattern, size_t m) {
     if (n < m) return {false, 0};
-    if (n < kMinWide || n < m + 255) {
-        if (m == 4) return avx512_naive_search_body(text, n, pattern, m);
-        const anchors a = select(pattern, m);
-        const size_t budget = Guarded ? n / kBudgetDen + 1 : ~(size_t)0;
-        const bool guarded = Guarded && m > kFreeBelow;
-        auto run = [&](const anchors& an, size_t carried, size_t from) -> result {
+    const bool small = n < kMinWide || n < m + 255;
+    if (m == 4) return small ? avx512_naive_search_body(text, n, pattern, m)
+                             : avx512_naive_search256_body(text, n, pattern, m);
+    const anchors a = select(pattern, m);
+    const size_t budget = Guarded ? n / kBudgetDen + 1 : ~(size_t)0;
+    const bool guarded = Guarded && m > kFreeBelow;
+    if (small) {
+        return drive([&](const anchors& an, size_t carried, size_t from) -> result {
             __m512i pv[4];
             for (int k = 0; k < an.k; ++k) pv[k] = _mm512_set1_epi8((char)pattern[an.o[k]]);
             switch (an.k) {
@@ -472,21 +525,9 @@ search_long(const char* text, size_t n, const char* pattern, size_t m) {
                 default: return guarded ? masked_windows<true, 4>(text, n, pattern, m, from, n - m + 1, an.o, pv, budget, carried, 0, 128)
                                         : masked_windows<false, 4>(text, n, pattern, m, from, n - m + 1, an.o, pv, budget, carried, 0, 128);
             }
-        };
-        anchors an = a;
-        result r = run(an, 0, 0);
-        while (r.state != 0 && an.k < 4) {
-            if (r.state == 1) { an.k = 4; std::sort(an.o, an.o + 4); r = run(an, 0, r.resume); }
-            else              { an = escalate(an); r = run(an, r.rounds, r.resume); }
-        }
-        if (r.state == 0) return {r.found, r.index};
-        return twoway_simd::search_from(text, n, pattern, m, r.resume);
+        }, a, text, n, pattern, m);
     }
-    if (m == 4) return avx512_naive_search256_body(text, n, pattern, m);
-    const anchors a = select(pattern, m);
-    const size_t budget = Guarded ? n / kBudgetDen + 1 : ~(size_t)0;
-    const bool guarded = Guarded && m > kFreeBelow;
-    auto run = [&](const anchors& an, size_t carried, size_t from) -> result {
+    return drive([&](const anchors& an, size_t carried, size_t from) -> result {
         switch (an.k) {
             case 2: return guarded ? wide<true, 2>(text, n, pattern, m, an, budget, carried, from)
                                    : wide<false, 2>(text, n, pattern, m, an, budget, carried, from);
@@ -495,45 +536,10 @@ search_long(const char* text, size_t n, const char* pattern, size_t m) {
             default: return guarded ? wide<true, 4>(text, n, pattern, m, an, budget, carried, from)
                                     : wide<false, 4>(text, n, pattern, m, an, budget, carried, from);
         }
-    };
-    anchors an = a;
-    result r = run(an, 0, 0);
-    while (r.state != 0 && an.k < 4) {
-        // Survivors too frequent (2): add the next anchor and continue from
-        // the block that showed it. The budget spent with fewer than four
-        // anchors (1): continue with all four and a fresh budget, so the
-        // bound is 2(n/64 + 1) rounds plus the two-way pass.
-        if (r.state == 1) { an.k = 4; std::sort(an.o, an.o + 4); r = run(an, 0, r.resume); }
-        else              { an = escalate(an); r = run(an, r.rounds, r.resume); }
-    }
-    if (r.state == 0) return {r.found, r.index};
-    return twoway_simd::search_from(text, n, pattern, m, r.resume);
-}
-
-// Inlined into the entry point so that a one-byte search is the memchr loop
-// and a switch, with no call in between.
-template <bool Guarded = true>
-[[gnu::always_inline]] static inline std::pair<bool, size_t>
-search(const char* text, size_t n, const char* pattern, size_t m) {
-    switch (m) {
-        case 0: return {true, 0};
-        case 1: return short_search<1>(text, n, pattern);
-        case 2: return short_search<2>(text, n, pattern);
-        case 3: return short_search<3>(text, n, pattern);
-        default: return search_long<Guarded>(text, n, pattern, m);
-    }
+    }, a, text, n, pattern, m);
 }
 
 }  // namespace needle_hammer
-
-// Entry points in the style of the other kernels.
-std::pair<bool, size_t> avx512_needle_hammer(const char* text, size_t n, const char* pattern, size_t m) {
-    return needle_hammer::search<true>(text, n, pattern, m);
-}
-// The same kernel with the guard compiled out, to measure what the guard costs.
-std::pair<bool, size_t> avx512_needle_hammer_unguarded(const char* text, size_t n, const char* pattern, size_t m) {
-    return needle_hammer::search<false>(text, n, pattern, m);
-}
 
 #elif defined(__aarch64__) || defined(_M_ARM64)
 #include <arm_neon.h>
@@ -552,8 +558,8 @@ static constexpr size_t kB = 64;
 #endif
 static constexpr size_t kBudgetDen = NH2_BUDGET_DEN;
 // Below this needle length the guard is absent: a block admits at most m - 2
-// rounds, so the haystack admits at most n(m - 2)/64, under n/10 for m <= 8
-// and bounded by construction.
+// rounds, so the block loop admits at most n(m - 2)/64, under n/10 for m <= 8,
+// and the single windows at most n(m - 2)/16; bounded by construction.
 static constexpr size_t kFreeBelow = 8;
 // Small haystacks take single windows rather than the block loop.
 static constexpr size_t kMinWide = 512;
@@ -575,7 +581,6 @@ static constexpr size_t kThreeAnchorMax = NH2_THREE_ANCHOR_MAX;
 #define NH2_START_ANCHORS 2
 #endif
 static constexpr int kStartAnchors = NH2_START_ANCHORS;
-static inline size_t survivor_cost(size_t m) { return 20 + m / 32; }
 
 static inline uint64_t lane_mask(uint8x16_t v) {
     return vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(v), 4)), 0) & 0x8888888888888888ull;
@@ -594,15 +599,6 @@ static inline size_t lane_index(uint64_t mask) { return (size_t)__builtin_ctzll(
 // extra compares are cheap relative to verifying DNA-like survivors. A wide
 // alphabet still starts with kStartAnchors (default 2).
 // ---------------------------------------------------------------------------
-struct anchors { size_t o[4]; int k; };
-
-static inline void positional(const unsigned char* s, size_t m, size_t o[4]) {
-    o[0] = 0; o[1] = m / 4; o[2] = m / 2; o[3] = m - 1;
-    { int w = 64; while (w-- && s[o[1]] == s[o[0]] && o[1] + 1 < o[2]) ++o[1]; }
-    { int w = 64; while (w-- && s[o[2]] == s[o[0]] && o[2] + 1 < o[3]) ++o[2]; }
-    { int w = 64; while (w-- && (s[o[3]] == s[o[2]] || s[o[3]] == s[o[0]]) && o[3] > o[2] + 1) --o[3]; }
-}
-
 static inline anchors select(const char* pattern, size_t m) {
     const unsigned char* s = (const unsigned char*)pattern;
     anchors a;
@@ -652,14 +648,7 @@ static inline anchors select(const char* pattern, size_t m) {
         a.k = kStartAnchors;
         if (a.k == 3) std::swap(a.o[1], a.o[2]);   // first, middle, last; spare quarter
     }
-    std::sort(a.o, a.o + a.k);
-    return a;
-}
-
-// One more anchor: the next spare joins the active set, kept sorted.
-static inline anchors escalate(anchors a) {
-    ++a.k;
-    std::sort(a.o, a.o + a.k);
+    sort_anchors(a.o, a.k);
     return a;
 }
 
@@ -669,8 +658,6 @@ static inline anchors escalate(anchors a) {
 // an overlap window: it starts at the last in-bounds position and lanes below
 // `first` -- already scanned, known not to match -- are ignored.
 // ---------------------------------------------------------------------------
-struct result { bool found; size_t index; int state; size_t resume; size_t rounds; size_t survivors; };
-
 // Windows over [first, n - m]. With fewer than four anchors the survivors
 // of the anchor filter are counted and the escalation rule applies here as
 // in the block loop, `allowance` standing for the blocks scanned so far.
@@ -883,7 +870,7 @@ search_long(const char* text, size_t n, const char* pattern, size_t m) {
     const size_t budget = Guarded ? n / kBudgetDen + 1 : ~(size_t)0;
     const bool guarded = Guarded && m > kFreeBelow;
     if (n < kMinWide || n < m + kB - 1) {
-        auto run = [&](const anchors& an, size_t carried, size_t from) -> result {
+        return drive([&](const anchors& an, size_t carried, size_t from) -> result {
             uint8x16_t pv[4];
             for (int k = 0; k < an.k; ++k) pv[k] = vdupq_n_u8((uint8_t)pattern[an.o[k]]);
             switch (an.k) {
@@ -894,17 +881,9 @@ search_long(const char* text, size_t n, const char* pattern, size_t m) {
                 default: return guarded ? windows<true, 4>(text, n, pattern, m, from, an.o, pv, budget, carried, 0, 128)
                                         : windows<false, 4>(text, n, pattern, m, from, an.o, pv, budget, carried, 0, 128);
             }
-        };
-        anchors an = a;
-        result r = run(an, 0, 0);
-        while (r.state != 0 && an.k < 4) {
-            if (r.state == 1) { an.k = 4; std::sort(an.o, an.o + 4); r = run(an, 0, r.resume); }
-            else              { an = escalate(an); r = run(an, r.rounds, r.resume); }
-        }
-        if (r.state == 0) return {r.found, r.index};
-        return twoway_simd::search_from(text, n, pattern, m, r.resume);
+        }, a, text, n, pattern, m);
     }
-    auto run = [&](const anchors& an, size_t carried, size_t from) -> result {
+    return drive([&](const anchors& an, size_t carried, size_t from) -> result {
         switch (an.k) {
             case 2: return guarded ? wide<true, 2>(text, n, pattern, m, an, budget, carried, from)
                                    : wide<false, 2>(text, n, pattern, m, an, budget, carried, from);
@@ -913,21 +892,22 @@ search_long(const char* text, size_t n, const char* pattern, size_t m) {
             default: return guarded ? wide<true, 4>(text, n, pattern, m, an, budget, carried, from)
                                     : wide<false, 4>(text, n, pattern, m, an, budget, carried, from);
         }
-    };
-    anchors an = a;
-    result r = run(an, 0, 0);
-    while (r.state != 0 && an.k < 4) {
-        // Survivors too frequent (2): add the next anchor and continue from
-        // the block that showed it. The budget spent with fewer than four
-        // anchors (1): continue with all four and a fresh budget, so the
-        // bound is 2(n/16 + 1) rounds plus the two-way pass.
-        if (r.state == 1) { an.k = 4; std::sort(an.o, an.o + 4); r = run(an, 0, r.resume); }
-        else              { an = escalate(an); r = run(an, r.rounds, r.resume); }
-    }
-    if (r.state == 0) return {r.found, r.index};
-    return twoway_simd::search_from(text, n, pattern, m, r.resume);
+    }, a, text, n, pattern, m);
 }
 
+}  // namespace needle_hammer
+
+#else
+#error "needle_hammer.h: no SIMD backend (needs AVX-512F+BW or AArch64 NEON)"
+#endif
+
+// ---------------------------------------------------------------------------
+// Entry points, the same on both backends
+// ---------------------------------------------------------------------------
+namespace needle_hammer {
+
+// Inlined into the entry point so that a one-byte search is the memchr loop
+// and a switch, with no call in between.
 template <bool Guarded = true>
 [[gnu::always_inline]] static inline std::pair<bool, size_t>
 search(const char* text, size_t n, const char* pattern, size_t m) {
@@ -940,15 +920,40 @@ search(const char* text, size_t n, const char* pattern, size_t m) {
     }
 }
 
+// First occurrence of pattern[0..m) in text[0..n): {true, index} or
+// {false, 0}. The empty needle matches at 0. Neither buffer needs a NUL
+// terminator and both may contain any byte value; no byte outside
+// [text, text + n) or [pattern, pattern + m) is ever read.
+inline std::pair<bool, size_t> find(const char* text, size_t n, const char* pattern, size_t m) {
+    return search<true>(text, n, pattern, m);
+}
+// The same on string_views: the index, or std::string_view::npos.
+inline size_t find(std::string_view haystack, std::string_view needle) {
+    const auto [found, index] = search<true>(haystack.data(), haystack.size(), needle.data(), needle.size());
+    return found ? index : std::string_view::npos;
+}
+// The same kernel with the guard compiled out. Faster by a few percent on
+// text; no longer linear in the worst case. For measurement, not for use on
+// input you do not control.
+inline std::pair<bool, size_t> find_unguarded(const char* text, size_t n, const char* pattern, size_t m) {
+    return search<false>(text, n, pattern, m);
+}
+
 }  // namespace needle_hammer
 
-std::pair<bool, size_t> neon_needle_hammer(const char* text, size_t n, const char* pattern, size_t m) {
-    return needle_hammer::search<true>(text, n, pattern, m);
+// Entry points in the style of the other kernels, for the benchmark table.
+#if defined(__AVX512F__) && defined(__AVX512BW__)
+inline std::pair<bool, size_t> avx512_needle_hammer(const char* text, size_t n, const char* pattern, size_t m) {
+    return needle_hammer::find(text, n, pattern, m);
 }
-std::pair<bool, size_t> neon_needle_hammer_unguarded(const char* text, size_t n, const char* pattern, size_t m) {
-    return needle_hammer::search<false>(text, n, pattern, m);
+inline std::pair<bool, size_t> avx512_needle_hammer_unguarded(const char* text, size_t n, const char* pattern, size_t m) {
+    return needle_hammer::find_unguarded(text, n, pattern, m);
 }
-
 #else
-#error "needle_hammer.h: no SIMD backend (needs AVX-512F+BW or AArch64 NEON)"
+inline std::pair<bool, size_t> neon_needle_hammer(const char* text, size_t n, const char* pattern, size_t m) {
+    return needle_hammer::find(text, n, pattern, m);
+}
+inline std::pair<bool, size_t> neon_needle_hammer_unguarded(const char* text, size_t n, const char* pattern, size_t m) {
+    return needle_hammer::find_unguarded(text, n, pattern, m);
+}
 #endif

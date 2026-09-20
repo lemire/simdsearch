@@ -287,7 +287,7 @@ neon_naive_search_body(const char* text, size_t n, const char* pattern, size_t m
     return {false, 0};
 }
 
-std::pair<bool, size_t> neon_naive_search(const char* text, size_t n,
+inline std::pair<bool, size_t> neon_naive_search(const char* text, size_t n,
                                           const char* pattern, size_t m) {
     return neon_naive_search_body(text, n, pattern, m);
 }
@@ -365,7 +365,7 @@ neon_naive_search64_body(const char* text, size_t n, const char* pattern, size_t
     return {false, 0};
 }
 
-std::pair<bool, size_t> neon_naive_search64(const char* text, size_t n,
+inline std::pair<bool, size_t> neon_naive_search64(const char* text, size_t n,
                                             const char* pattern, size_t m) {
     return neon_naive_search64_body(text, n, pattern, m);
 }
@@ -376,7 +376,7 @@ std::pair<bool, size_t> neon_naive_search64(const char* text, size_t n,
 // Occurrences are reported in increasing index order and include overlapping
 // ones. callback must be a callable taking a single size_t index.
 template <typename F>
-void neon_naive_search_all(const char* text, size_t n, const char* pattern,
+inline void neon_naive_search_all(const char* text, size_t n, const char* pattern,
                            size_t m, F callback) {
     // Empty needle: match at every index in [0, n], matching the first-match
     // loop baseline (returns {true, 0} then advances one byte).
@@ -569,7 +569,7 @@ static inline simd_guarded_result neon_stringzilla_body(
 
 // The kernel as the algorithm table sees it: the shared body with a budget it
 // can never exhaust, so this is the original algorithm with no guard behaviour.
-std::pair<bool, size_t> neon_stringzilla_find(const char* haystack, size_t h_len,
+inline std::pair<bool, size_t> neon_stringzilla_find(const char* haystack, size_t h_len,
                                               const char* needle, size_t n_len) {
     auto r = neon_stringzilla_body<false>(haystack, h_len, needle, n_len,
                                           ~(size_t)0);
@@ -578,7 +578,7 @@ std::pair<bool, size_t> neon_stringzilla_find(const char* haystack, size_t h_len
 
 // The same kernel with upstream's UTF-8 lead-byte anchor rule enabled, so the
 // cost of that choice can be measured rather than assumed.
-std::pair<bool, size_t> neon_stringzilla_find_hifilter(const char* haystack,
+inline std::pair<bool, size_t> neon_stringzilla_find_hifilter(const char* haystack,
                                                        size_t h_len,
                                                        const char* needle,
                                                        size_t n_len) {
@@ -587,7 +587,7 @@ std::pair<bool, size_t> neon_stringzilla_find_hifilter(const char* haystack,
     return {r.found, r.index};
 }
 
-std::pair<bool, size_t> neon_stringzilla64_find(const char* text, size_t n,
+inline std::pair<bool, size_t> neon_stringzilla64_find(const char* text, size_t n,
                                                 const char* pattern, size_t m) {
     if (m == 0) return {true, 0};
     if (n < m) return {false, 0};

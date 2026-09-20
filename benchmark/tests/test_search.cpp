@@ -19,12 +19,12 @@
 #include <vector>
 
 #if defined(__AVX512F__) && defined(__AVX512BW__)
-  #include "avx512search.h"
-  #include "needle_hammer.h"
+  #include "simdsearch/avx512search.h"
+  #include "simdsearch/needle_hammer.h"
   #define SIMDSEARCH_AVX512 1
 #elif defined(__aarch64__) || defined(_M_ARM64)
-  #include "neonsearch.h"
-  #include "needle_hammer.h"
+  #include "simdsearch/neonsearch.h"
+  #include "simdsearch/needle_hammer.h"
   #define SIMDSEARCH_NEON 1
 #else
   #error "No SIMD backend: this project targets AVX-512 (F + BW) or AArch64 NEON."
@@ -90,6 +90,30 @@ static void check(const NamedFn &nf, const char *text, size_t n,
 static void check(const NamedFn &nf, const std::string &text,
                   const std::string &pat) {
   check(nf, text.data(), text.size(), pat.data(), pat.size());
+}
+
+// Run the guarded wide kernel the way needle_hammer::drive does -- another
+// anchor on state 2, all four anchors and a fresh budget on state 1 -- but
+// stop where drive would resume with two-way, so a test can observe the
+// give-up (state 1 with four anchors) and the position it resumes from.
+static needle_hammer::result run_wide_guarded(const std::string &hay,
+                                              const std::string &needle,
+                                              needle_hammer::anchors a,
+                                              size_t budget) {
+  const size_t n = hay.size(), m = needle.size();
+  auto run = [&](const needle_hammer::anchors &an, size_t carried, size_t from) {
+    switch (an.k) {
+      case 2: return needle_hammer::wide<true, 2>(hay.data(), n, needle.data(), m, an, budget, carried, from);
+      case 3: return needle_hammer::wide<true, 3>(hay.data(), n, needle.data(), m, an, budget, carried, from);
+      default: return needle_hammer::wide<true, 4>(hay.data(), n, needle.data(), m, an, budget, carried, from);
+    }
+  };
+  needle_hammer::result r = run(a, 0, 0);
+  while (r.state != 0 && a.k < 4) {
+    if (r.state == 1) { a.k = 4; needle_hammer::sort_anchors(a.o, 4); r = run(a, 0, r.resume); }
+    else { a = needle_hammer::escalate(a); r = run(a, r.rounds, r.resume); }
+  }
+  return r;
 }
 
 int main() {
@@ -423,18 +447,11 @@ int main() {
     hay += needle;
     const size_t match = hay.find(needle);
     const size_t budget = hay.size() / needle_hammer::kBudgetDen + 1;
+    // Driven as the dispatcher drives it (escalation on state 2, four anchors
+    // and a fresh budget on state 1) but stopping where the dispatcher would
+    // hand over to two-way, so the give-up itself is observable.
     needle_hammer::anchors a = needle_hammer::select(needle.data(), m);
-    needle_hammer::result r = a.k == 3
-        ? needle_hammer::wide<true, 3>(hay.data(), hay.size(), needle.data(), m, a, budget, 0, 0)
-        : needle_hammer::wide<true, 4>(hay.data(), hay.size(), needle.data(), m, a, budget, 0, 0);
-    if (r.state == 2) {
-      // Three anchors found the survivors too frequent, as the dispatcher
-      // would: continue with four from where it stopped.
-      a.k = 4;
-      std::sort(a.o, a.o + 4);
-      r = needle_hammer::wide<true, 4>(hay.data(), hay.size(), needle.data(), m, a,
-                                       budget, r.rounds, r.resume);
-    }
+    needle_hammer::result r = run_wide_guarded(hay, needle, a, budget);
     const bool gave_up = (r.state == 1);
     ++g_checks;
     if (!gave_up) {
@@ -481,18 +498,7 @@ int main() {
     for (size_t i = 0; i < n; ++i) hay[i] = q[i % m];
     const size_t budget = n / needle_hammer::kBudgetDen + 1;
     needle_hammer::anchors a = needle_hammer::select(needle.data(), m);
-    auto run = [&](const needle_hammer::anchors &an, size_t carried, size_t from) {
-      switch (an.k) {
-        case 2: return needle_hammer::wide<true, 2>(hay.data(), n, needle.data(), m, an, budget, carried, from);
-        case 3: return needle_hammer::wide<true, 3>(hay.data(), n, needle.data(), m, an, budget, carried, from);
-        default: return needle_hammer::wide<true, 4>(hay.data(), n, needle.data(), m, an, budget, carried, from);
-      }
-    };
-    needle_hammer::result r = run(a, 0, 0);
-    while (r.state != 0 && a.k < 4) {
-      if (r.state == 1) { a.k = 4; std::sort(a.o, a.o + 4); r = run(a, 0, r.resume); }
-      else { a = needle_hammer::escalate(a); r = run(a, r.rounds, r.resume); }
-    }
+    needle_hammer::result r = run_wide_guarded(hay, needle, a, budget);
     ++g_checks;
     if (r.state != 1) {
       std::printf("MISMATCH near-match test: the guarded kernel did not give up "

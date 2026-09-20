@@ -19,7 +19,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <utility>
-#include "kmp_twoway.h"
+#include "twoway_prep.h"
 
 #if defined(__AVX512F__) && defined(__AVX512BW__)
 #include <immintrin.h>
@@ -331,6 +331,6 @@ search_from(const char* text, size_t n, const char* pat, size_t m, size_t from) 
 #endif
 
 // Stateless entry point in the style of the other searchers.
-std::pair<bool, size_t> twoway_simd_search(const char* text, size_t n, const char* pattern, size_t m) {
+inline std::pair<bool, size_t> twoway_simd_search(const char* text, size_t n, const char* pattern, size_t m) {
     return twoway_simd::search_from(text, n, pattern, m, 0);
 }

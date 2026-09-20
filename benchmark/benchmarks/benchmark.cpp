@@ -22,15 +22,15 @@
 // Pick the SIMD backend for the host architecture. Both headers pull the
 // portable scalar and library searchers in from common_search.h.
 #if defined(__AVX512F__) && defined(__AVX512BW__)
-  #include "avx512search.h"
-  #include "needle_hammer.h"
-  #include "ssef.h"
+  #include "simdsearch/avx512search.h"
+  #include "simdsearch/needle_hammer.h"
+  #include "simdsearch/ssef.h"
   #define SIMDSEARCH_AVX512 1
   #define SIMD_NAIVE_SEARCH avx512_naive_search
   #define SIMD_NAIVE_SEARCH_ALL avx512_naive_search_all
 #elif defined(__aarch64__) || defined(_M_ARM64)
-  #include "neonsearch.h"
-  #include "needle_hammer.h"
+  #include "simdsearch/neonsearch.h"
+  #include "simdsearch/needle_hammer.h"
   #define SIMDSEARCH_NEON 1
   #define SIMD_NAIVE_SEARCH neon_naive_search
   #define SIMD_NAIVE_SEARCH_ALL neon_naive_search_all
@@ -229,11 +229,12 @@ static const std::vector<Algo> kAlgos = {
      avx512_stringzilla_find_hifilter},
     {"find_avx512_stringzilla_256", Kind::Stateless, avx512_stringzilla256_find},
     // Needle-Hammer (needle_hammer.h): one wide kernel whose filter bytes are
-    // chosen (first, middle, last, a quarter point or a byte rare in the
-    // needle), three of them until the haystack shows that four are needed, a
-    // dedicated loop for needles of 1-3 bytes, and a work counter that resumes
-    // with the vectorized two-way in twoway_simd.h. The _unguarded row is the
-    // same kernel with the counter compiled out, to measure the guard.
+    // chosen (first and last, then the middle, a quarter point or a byte rare
+    // in the needle), two of them until the haystack shows that three or four
+    // are needed, a dedicated loop for needles of 1-3 bytes, and a work
+    // counter that resumes with the vectorized two-way in twoway_simd.h. The
+    // _unguarded row is the same kernel with the counter compiled out, to
+    // measure the guard.
     {"find_avx512_needle_hammer", Kind::Stateless, avx512_needle_hammer},
     {"find_avx512_needle_hammer_unguarded", Kind::Stateless, avx512_needle_hammer_unguarded},
     // The fallback on its own: two-way with 64-byte comparison loops, with the
