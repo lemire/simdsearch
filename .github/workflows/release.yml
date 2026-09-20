@@ -1,0 +1,104 @@
+# Cut a release. Run it from the Actions tab (Release -> Run workflow) or
+#
+#     gh workflow run release.yml -f bump=patch     # or minor, major
+#
+# It runs the CI workflow, computes the next version from the last v* tag
+# (patch, minor or major, as chosen; the first release starts from v0.0.0),
+# writes it into CMakeLists.txt and the README's release section, commits
+# that to main, tags the commit, and publishes a GitHub release with the
+# single header and its checksum attached. Pushes made with GITHUB_TOKEN do
+# not trigger other workflows, so the version commit does not rerun CI; the
+# code it carries is exactly what CI just tested.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version component to bump"
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+
+  release:
+    needs: ci
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Compute the next version
+        id: version
+        run: |
+          set -euo pipefail
+          last=$(git tag --list 'v[0-9]*' --sort=-v:refname | head -n1)
+          last=${last:-v0.0.0}
+          IFS=. read -r major minor patch <<< "${last#v}"
+          case "${{ inputs.bump }}" in
+            major) major=$((major + 1)); minor=0; patch=0 ;;
+            minor) minor=$((minor + 1)); patch=0 ;;
+            patch) patch=$((patch + 1)) ;;
+          esac
+          next="v${major}.${minor}.${patch}"
+          echo "last=$last next=$next"
+          echo "last=$last" >> "$GITHUB_OUTPUT"
+          echo "next=$next" >> "$GITHUB_OUTPUT"
+
+      - name: Check the single header is in sync with the sources
+        run: python3 tools/amalgamate.py --check
+
+      - name: Write the version into CMakeLists.txt and the README
+        env:
+          NEXT: ${{ steps.version.outputs.next }}
+        run: |
+          set -euo pipefail
+          sed -i -E "s#^project\(simdsearch VERSION [0-9]+\.[0-9]+\.[0-9]+#project(simdsearch VERSION ${NEXT#v}#" CMakeLists.txt
+          sed -i -E "s#releases/download/v[0-9]+\.[0-9]+\.[0-9]+/#releases/download/${NEXT}/#g; s#latest release is \*\*v[0-9]+\.[0-9]+\.[0-9]+\*\*#latest release is **${NEXT}**#" README.md
+          grep -q "VERSION ${NEXT#v} " CMakeLists.txt || { echo "CMakeLists.txt version not updated"; exit 1; }
+          grep -q "releases/download/${NEXT}/simdsearch.h" README.md || { echo "README download URL not updated"; exit 1; }
+          grep -q "latest release is \*\*${NEXT}\*\*" README.md || { echo "README release line not updated"; exit 1; }
+          git diff --stat
+
+      - name: Commit, tag and push
+        env:
+          NEXT: ${{ steps.version.outputs.next }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "Release ${NEXT}"
+          git tag -a "${NEXT}" -m "simdsearch ${NEXT}"
+          git push origin main "${NEXT}"
+
+      - name: Assemble the release assets
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp singleheader/simdsearch.h dist/simdsearch.h
+          (cd dist && sha256sum simdsearch.h > SHA256SUMS)
+          cat dist/SHA256SUMS
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NEXT: ${{ steps.version.outputs.next }}
+          LAST: ${{ steps.version.outputs.last }}
+        run: |
+          set -euo pipefail
+          notes_args=(--generate-notes)
+          if git rev-parse -q --verify "refs/tags/${LAST}" >/dev/null; then
+            notes_args+=(--notes-start-tag "${LAST}")
+          fi
+          gh release create "${NEXT}" dist/simdsearch.h dist/SHA256SUMS \
+              --title "simdsearch ${NEXT}" "${notes_args[@]}" \
+              --notes "Single-header build attached as \`simdsearch.h\` (checksum in \`SHA256SUMS\`). Needs AVX-512F+BW on x86-64 (\`-mavx512f -mavx512bw\`) or AArch64 NEON; C++17. See the README for the other ways to consume the library."

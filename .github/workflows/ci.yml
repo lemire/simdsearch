@@ -1,0 +1,104 @@
+# Correctness on both backends.
+#
+#   NEON     native, on GitHub's Linux ARM64 and macOS (Apple Silicon) runners.
+#   AVX-512  under Intel SDE (Software Development Emulator) on an x86-64
+#            runner. GitHub's x86-64 runners do not reliably offer AVX-512 and
+#            QEMU's TCG stops at AVX2 (qemu-project/qemu#2878), so the binaries
+#            are built with -mavx512f -mavx512bw and executed under SDE's
+#            Sapphire Rapids model, which translates the AVX-512 instructions.
+#            Sanitizers are run natively when the runner happens to have
+#            AVX-512, and skipped (with a notice) otherwise.
+#
+# Every job builds with -Wall -Wextra -Werror: the headers are meant to be
+# included into other people's warning-clean builds.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:      # the Release workflow runs this first
+
+env:
+  WARNINGS: -Wall -Wextra -Werror
+
+jobs:
+  neon-linux:
+    name: NEON (Linux ARM64, GCC 14)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GCC 14
+        run: sudo apt-get update && sudo apt-get install -y g++-14
+      - name: Build
+        run: |
+          cmake -B build -S . -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_CXX_FLAGS="$WARNINGS"
+          cmake --build build -j
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+      - name: Benchmark smoke test
+        run: |
+          ./build/benchmark/benchmark horspool benchmark/data/43-0.txt \
+              --lengths 4,16,64 --patterns 50 --algos find_neon_needle_hammer,find_memmem,find_twoway_simd
+      - name: Sanitizers (ASan + UBSan)
+        run: |
+          cmake -B build-san -S . -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+                -DSIMDSEARCH_BENCHMARKS=OFF \
+                -DCMAKE_CXX_FLAGS="$WARNINGS -fsanitize=address,undefined -fno-omit-frame-pointer"
+          cmake --build build-san -j
+          ASAN_OPTIONS=detect_leaks=0 ctest --test-dir build-san --output-on-failure
+
+  neon-macos:
+    name: NEON (macOS, Apple clang)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          cmake -B build -S . -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_FLAGS="$WARNINGS"
+          cmake --build build -j
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+      - name: Sanitizers (ASan + UBSan)
+        run: |
+          cmake -B build-san -S . -DCMAKE_BUILD_TYPE=RelWithDebInfo -DSIMDSEARCH_BENCHMARKS=OFF \
+                -DCMAKE_CXX_FLAGS="$WARNINGS -fsanitize=address,undefined -fno-omit-frame-pointer"
+          cmake --build build-san -j
+          ASAN_OPTIONS=detect_leaks=0 ctest --test-dir build-san --output-on-failure
+
+  avx512-sde:
+    name: AVX-512 (Linux x86-64, GCC 14, Intel SDE)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install GCC 14
+        run: sudo apt-get update && sudo apt-get install -y g++-14
+      - name: Install Intel SDE
+        uses: petarpetrovt/setup-sde@v6.0
+      - name: Build
+        run: |
+          cmake -B build -S . -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_CXX_FLAGS="$WARNINGS"
+          cmake --build build -j
+      - name: Test under SDE (Sapphire Rapids)
+        run: |
+          for t in test_api test_search test_needle_hammer; do
+            echo "== $t"
+            "$SDE_PATH/sde64" -spr -- "./build/benchmark/$t"
+          done
+      - name: Benchmark smoke test under SDE
+        run: |
+          "$SDE_PATH/sde64" -spr -- ./build/benchmark/benchmark horspool benchmark/data/43-0.txt \
+              --lengths 16 --patterns 5 --algos find_avx512_needle_hammer,find_memmem
+      - name: Sanitizers (native, when the runner has AVX-512)
+        run: |
+          if grep -q avx512bw /proc/cpuinfo; then
+            cmake -B build-san -S . -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+                  -DSIMDSEARCH_BENCHMARKS=OFF \
+                  -DCMAKE_CXX_FLAGS="$WARNINGS -fsanitize=address,undefined -fno-omit-frame-pointer"
+            cmake --build build-san -j
+            ASAN_OPTIONS=detect_leaks=0 ctest --test-dir build-san --output-on-failure
+          else
+            echo "::notice::This runner has no AVX-512; the sanitizer run is skipped (the tests above ran under SDE)."
+          fi
