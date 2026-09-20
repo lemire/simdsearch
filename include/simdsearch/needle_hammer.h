@@ -296,6 +296,18 @@ masked_windows(const char* text, [[maybe_unused]] size_t n, const char* pattern,
 // ---------------------------------------------------------------------------
 // The wide kernel
 // ---------------------------------------------------------------------------
+// How far ahead of the current block the block loop prefetches, in bytes.
+// The filter keeps few lines in flight on its own: it rejects almost every
+// block without a branch, so the core's demand misses are all that pulls the
+// haystack in, and from DRAM that is short of what the memory system can
+// deliver. Prefetching 4 KiB ahead brought the kernel from 37 to 45 GB/s on a
+// 1 GiB haystack on Zen 5 (level with a 256-bit loop that streams at that
+// rate) and from 15 to 20 GB/s on an Emerald Rapids core, at no cost in
+// cache; 1-2 KiB got part of the way, 256-512 B nothing. The NEON backend
+// does not prefetch: on an Apple M4 the same prefetch, at any distance,
+// halved the rate from DRAM, whose hardware prefetcher already saturates it.
+static constexpr size_t kPrefetchAhead = 4096;
+
 // 256 positions per iteration as four 64-byte chunks; each chunk loads the
 // haystack at the chunk base plus each anchor offset and ANDs the compares.
 // Loads reach text + i + 192 + 63 + o[K-1] <= text + i + 255 + m - 1, inside
@@ -360,6 +372,10 @@ wide(const char* text, size_t n, const char* pattern, size_t m,
        & _mm512_cmpeq_epi8_mask(_mm512_loadu_si512((const void*)(t1+i+(OFF))), p1)))
     const size_t last_block = n - m - 255;   // n >= m + 255 here
     for (; i <= last_block; i += 256) {
+        _mm_prefetch((const char*)(text + i + kPrefetchAhead), _MM_HINT_T0);
+        _mm_prefetch((const char*)(text + i + kPrefetchAhead + 64), _MM_HINT_T0);
+        _mm_prefetch((const char*)(text + i + kPrefetchAhead + 128), _MM_HINT_T0);
+        _mm_prefetch((const char*)(text + i + kPrefetchAhead + 192), _MM_HINT_T0);
         __mmask64 fA = NH2_CHUNK(0), fB = NH2_CHUNK(64);
         __mmask64 fC = NH2_CHUNK(128), fD = NH2_CHUNK(192);
         if ((fA | fB | fC | fD) == 0) continue;
