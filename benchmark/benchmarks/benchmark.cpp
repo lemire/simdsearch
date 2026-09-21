@@ -15,6 +15,11 @@
 #include <vector>
 
 #include "counters/bench.h"
+#include <cstdlib>
+#include <cstring>
+#ifdef __linux__
+#include <sys/mman.h>
+#endif
 // StringZilla, the library, header-only: sz_find dispatches at compile time
 // to its AVX-512 (Skylake) or NEON kernel from the flags this build uses.
 #include <stringzilla/find.h>
@@ -1044,6 +1049,37 @@ void worstcase_benchmark(size_t haystack_size, const std::string &needle_shape,
   }
 }
 
+// A buffer for a large haystack, 2 MiB aligned and advised into transparent
+// huge pages on Linux. describe() reports how much of it the kernel actually
+// backed with huge pages once it was written.
+struct HugeBuffer {
+  char *p = nullptr; size_t n = 0; bool advised = false;
+  explicit HugeBuffer(size_t size) : n(size) {
+    const size_t align = 2u << 20;
+    const size_t bytes = (size + align - 1) / align * align;
+    void *m = nullptr;
+    if (posix_memalign(&m, align, bytes) != 0) { std::cerr << "bigscan: allocation failed\n"; exit(1); }
+    p = (char *)m;
+#ifdef __linux__
+    advised = madvise(p, bytes, MADV_HUGEPAGE) == 0;
+#endif
+  }
+  ~HugeBuffer() { free(p); }
+  HugeBuffer(const HugeBuffer &) = delete; HugeBuffer &operator=(const HugeBuffer &) = delete;
+  char *data() { return p; }
+  size_t size() const { return n; }
+  std::string describe() const {
+#ifdef __linux__
+    // AnonHugePages of this process, which is dominated by this buffer.
+    std::ifstream f("/proc/self/smaps_rollup"); std::string line; size_t kb = 0;
+    while (std::getline(f, line)) if (line.rfind("AnonHugePages:", 0) == 0) { kb = std::stoull(line.substr(14)); break; }
+    return std::format("huge pages: {}, {} MiB of {} MiB backed", advised ? "madvise ok" : "madvise failed", kb / 1024, n >> 20);
+#else
+    return "huge pages: not requested (not Linux)";
+#endif
+  }
+};
+
 // Large-haystack mode: the datafile tiled to each requested size (a mebibyte
 // to a gibibyte), searched end to end for needles that never occur, so a
 // search reads the whole haystack once. Reports gigabytes scanned per second,
@@ -1084,10 +1120,18 @@ void bigscan_benchmark(const std::string &text, const std::string &text_desc,
   std::print("values are GB/s scanned (haystack bytes per search / ns), one full-haystack search per needle\n");
   std::print("rows = algorithm, columns = needle length\n");
   for (size_t S : sizes) {
-    std::string hay;
-    hay.reserve(S);
-    while (hay.size() < S) hay.append(text, 0, std::min(text.size(), S - hay.size()));
-    std::print("\n@@@@@ SIZE {}\n", S);
+    // The haystack lives in transparent huge pages where the kernel offers
+    // them (Linux, THP "always" or "madvise"): a program that scans a
+    // gibibyte should ask for them, and with 4 KiB pages the rate from DRAM
+    // depends on how the searcher's loads happen to cross page boundaries
+    // (on Zen 5 the 512-bit kernels lose a fifth of it, the 256-bit crate
+    // nothing). The header line reports what the kernel actually gave.
+    HugeBuffer hay(S);
+    {
+      size_t off = 0;
+      while (off < S) { const size_t k = std::min(text.size(), S - off); std::memcpy(hay.data() + off, text.data(), k); off += k; }
+    }
+    std::print("\n@@@@@ SIZE {} ({})\n", S, hay.describe());
     std::print("{:<48}", "algo");
     for (size_t L : lengths) std::print(" {:>10}", L);
     std::print("\n");
