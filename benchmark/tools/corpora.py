@@ -17,6 +17,7 @@ the byte-frequency structure the anchored filter depends on:
   base64    |S| = 64, near-uniform over a restricted range
   log       timestamped log lines with long repeated runs
   source    real C/C++ source: identifiers, braces, long comment runs
+            (data/cpp_source.txt, a fixed file shipped with the repository)
   chinese   UTF-8 CJK -- almost every byte >= 0x80
   russian   UTF-8 Cyrillic -- two-byte sequences, high bytes throughout
 
@@ -29,8 +30,8 @@ russian are where that rule is tested.
 so the ranking can be checked once the haystack leaves cache and every searcher
 converges toward memory bandwidth.
 
-Real text is fetched from Project Gutenberg when a network is available and
-regenerated deterministically otherwise; every synthetic corpus is seeded, so
+The non-Latin text is fetched from Project Gutenberg when a network is
+available and synthesised deterministically otherwise; every synthetic corpus is seeded, so
 runs are reproducible. Usage:
 
     python3 benchmark/tools/corpora.py --out corpora [--sizes] [--max-size 1G]
@@ -55,20 +56,20 @@ TARGET = 1 << 20
 # numeric ID; if the network is unavailable we fall back to a synthetic
 # generator with the same byte statistics.
 GUTENBERG = {
-    "chinese": "https://www.gutenberg.org/files/25328/25328-0.txt",   # 紅樓夢
-    # Cyrillic-script Russian (Lukomskii, *Moskoviia*). Most Gutenberg
-    # "Russian" entries are English translations -- this one is the original
-    # script, ~69% of bytes >= 0x80.
+    # Aina Jushi, *Tou Peng Hsien Hua* (豆棚閒話), eBook #25328.
+    "chinese": "https://www.gutenberg.org/files/25328/25328-0.txt",
+    # Cyrillic-script Russian (P. N. Apostol, *Moskoviia v predstavlenii
+    # inostrantsev XVI-XVII v.*, eBook #30774). Most Gutenberg "Russian"
+    # entries are English translations -- this one is the original script,
+    # ~86% of bytes >= 0x80.
     "russian": "https://www.gutenberg.org/files/30774/30774-0.txt",
 }
 
-# Local checkouts to draw real source code from, in preference order.
-SOURCE_DIRS = [
-    os.path.join(os.path.expanduser("~"), "CVS/github/simdjson/src"),
-    os.path.join(os.path.expanduser("~"), "CVS/github/CRoaring/src"),
-    os.path.join(os.path.expanduser("~"), "CVS/github/simdsearch"),
-]
-SOURCE_EXT = (".c", ".h", ".cpp", ".hpp", ".cc")
+# The C/C++ corpus: the benchmark's own sources at commit c52bda8 (driver,
+# headers, tests; 261,785 bytes), concatenated once and shipped as a fixed file.
+# Walking a checkout instead gave different bytes per commit and even per file
+# system, since os.walk lists directories in on-disk order.
+SOURCE_FILE = os.path.join(HERE, "..", "data", "cpp_source.txt")
 
 
 def tile(buf: bytes, n: int) -> bytes:
@@ -125,50 +126,9 @@ def gen_log(n: int, seed: int) -> bytes:
     return tile(b"".join(out), n)
 
 
-def source_dirs_from_book(book_path):
-    """Candidate C/C++ trees implied by the baseline text's location.
-
-    The book lives at <repo>/benchmark/data/43-0.txt, so <repo> is a checkout of
-    the benchmark itself and always present wherever we measure.
-    """
-    if not book_path:
-        return ()
-    d = os.path.dirname(os.path.abspath(book_path))
-    out = []
-    for _ in range(4):                       # walk up to the repository root
-        d = os.path.dirname(d)
-        if not d or d == os.path.dirname(d):
-            break
-        out.append(d)
-    return tuple(out)
-
-
-def gen_source(n: int, extra_dirs=()) -> bytes:
-    """Real C/C++ source, concatenated from whichever checkout exists.
-
-    extra_dirs comes from the --book path: the benchmark repository is cloned on
-    every machine we measure, so its own sources are the one C/C++ tree that is
-    always present. Without it a fresh cloud instance has none of the checkouts
-    below and silently produces no source corpus, which is how an earlier sweep
-    ended up with this corpus on the local machine only.
-    """
-    for d in list(extra_dirs) + SOURCE_DIRS:
-        if not os.path.isdir(d):
-            continue
-        chunks = []
-        for root, _, files in os.walk(d):
-            for f in sorted(files):
-                if f.endswith(SOURCE_EXT):
-                    try:
-                        chunks.append(open(os.path.join(root, f), "rb").read())
-                    except OSError:
-                        pass
-            if sum(len(c) for c in chunks) > (1 << 20):
-                break
-        if chunks:
-            print(f"    (source from {d})")
-            return tile(b"".join(chunks), n)
-    return None
+def gen_source(n: int) -> bytes:
+    """Real C/C++ source: the shipped fixed file, tiled to size."""
+    return tile(open(SOURCE_FILE, "rb").read(), n)
 
 
 def utf8_fallback(ranges, n: int, seed: int) -> bytes:
@@ -199,7 +159,7 @@ def strip_gutenberg(raw: bytes) -> bytes:
     return s.strip() or raw
 
 
-def build_diversity(out: str, book: bytes, book_path: str = ""):
+def build_diversity(out: str, book: bytes):
     jobs = {
         "english": lambda: tile(book, TARGET),
         "dna":     lambda: gen_alphabet("ACGT", TARGET, 1),
@@ -219,12 +179,7 @@ def build_diversity(out: str, book: bytes, book_path: str = ""):
     path = os.path.join(out, "source.dat")
     if not (os.path.exists(path) and os.path.getsize(path) == TARGET):
         print("  source ...")
-        src = gen_source(TARGET, source_dirs_from_book(book_path))
-        if src is None:
-            print("    (no C/C++ checkout found; skipping source corpus)",
-                  file=sys.stderr)
-        else:
-            open(path, "wb").write(src)
+        open(path, "wb").write(gen_source(TARGET))
 
     fallbacks = {
         "chinese": [(0x4E00, 0x9FFF)],
@@ -316,7 +271,7 @@ def main():
     print(f"baseline text: {bookpath} ({len(book)} bytes)")
 
     print("diversity corpora:")
-    build_diversity(a.out, book, bookpath)
+    build_diversity(a.out, book)
     write_manifest(a.out)
     if a.sizes:
         print("size sweep:")

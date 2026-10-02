@@ -244,7 +244,11 @@ up to 1 GiB, GB/s once the haystack no longer fits in cache), `findall`.
 `benchmark/README.md` has the full algorithm list, the options and what each
 row measures. `benchmark/tools/corpora.py` builds the nine ~1 MB datasets
 (English, DNA, protein, JSON, base64, logs, C source, Cyrillic and CJK UTF-8)
-into `corpora/` with a `MANIFEST.txt` of SHA-256 digests.
+into `corpora/` with a `MANIFEST.txt` of SHA-256 digests;
+`benchmark/data/corpora.sha256` lists the digests the build should produce. The
+English and C/C++ texts ship in `benchmark/data/`, five corpora are generated
+from fixed seeds, and the Chinese and Russian books are fetched from Project
+Gutenberg (eBooks #25328 and #30774).
 
 Tests (`ctest`, or the binaries in `build/benchmark/`):
 
@@ -318,5 +322,7 @@ benchmark/
   tools/corpora.py      builds the datasets in corpora/
   rust/                 optional Rust searchers (-DSIMDSEARCH_RUST=ON)
   data/43-0.txt         a Project Gutenberg text the driver defaults to
+  data/cpp_source.txt   the fixed C/C++ text behind corpora/source.dat
+  data/corpora.sha256   expected digests of the built corpora
 corpora/                generated datasets (git-ignored; MANIFEST.txt lists digests)
 ```
