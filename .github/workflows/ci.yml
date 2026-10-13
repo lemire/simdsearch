@@ -39,7 +39,8 @@ jobs:
         run: |
           for t in build/benchmark/test_guardzilla_* build/benchmark/test_api build/benchmark/test_api_singleheader; do
             echo "== $t"
-            "$SDE_PATH/sde64" -spr -- "./$t"
+            case "$t" in *test_guardzilla_*) arg=--quick ;; *) arg= ;; esac
+            "$SDE_PATH/sde64" -spr -- "./$t" $arg
           done
           python3 tools/amalgamate.py --check
       - name: Benchmark smoke test under SDE

@@ -27,10 +27,12 @@ static void check(const char* text, size_t n, const char* pat, size_t m, const c
     }
 }
 
-int main() {
+int main(int argc, char** argv) {
+    // --quick: fewer and smaller cases, for running under an emulator (CI).
+    const bool quick = argc > 1 && std::string(argv[1]) == "--quick";
     std::mt19937_64 g(20261013);
     // Random cases, exact-size buffers at random alignments.
-    for (int r = 0; r < 200000; ++r) {
+    for (int r = 0; r < (quick ? 10000 : 200000); ++r) {
         const int alpha = (int)(g() % 5 == 0 ? 256 : 1 + g() % 6);
         const size_t n = g() % (r % 10 == 0 ? 20000 : 1200);
         const size_t m = 1 + g() % (r % 7 == 0 ? 3000 : 200);
@@ -61,8 +63,8 @@ int main() {
             }
     }
     // Adversarial families, where the guard hands over to two-way.
-    for (size_t m : {16, 64, 65, 128, 1000, 4096}) {
-        const size_t n = 1 << 18;
+    for (size_t m : {16, 64, 65, 128, 1000, quick ? 2000 : 4096}) {
+        const size_t n = quick ? 1 << 13 : 1 << 18;
         std::string h(n, 'a'), p(m, 'a');
         p[m - 1] = 'b';
         check(h.data(), n, p.data(), m, "tail");
