@@ -1,24 +1,31 @@
-# Tests and the benchmark driver, added by the top-level CMakeLists.txt, which
-# defines the simdsearch::simdsearch target, the architecture flags and
-# Needle-Hammer's knobs. Configure from the repository root: cmake -B build -S .
+# Tests and the benchmark, added by the top-level CMakeLists.txt, which defines
+# the simdsearch::simdsearch target and the architecture flags. Configure from
+# the repository root: cmake -B build -S .
 
 # ---------------------------------------------------------------------------
 # Tests: C++17 is enough for the library.
 # ---------------------------------------------------------------------------
 if(SIMDSEARCH_TESTS)
-    add_executable(test_search tests/test_search.cpp)
-    target_link_libraries(test_search PRIVATE simdsearch::simdsearch)
-    add_test(NAME test_search COMMAND test_search)
+    # Guardzilla against std::string_view::find: fuzz, every alignment, the
+    # adversarial families and the guard's hand-over to two-way. Built once per
+    # setting the benchmark measures, so that every measured variant is tested.
+    set(GUARDZILLA_TEST_SETTINGS
+        "default\;"
+        "anchors1\;GUARDZILLA_ANCHORS=1" "anchors2\;GUARDZILLA_ANCHORS=2" "anchors4\;GUARDZILLA_ANCHORS=4"
+        "anchors8\;GUARDZILLA_ANCHORS=8" "noalign\;GUARDZILLA_ALIGN=0" "budget1\;GUARDZILLA_BUDGET=1")
+    foreach(setting ${GUARDZILLA_TEST_SETTINGS})
+        list(GET setting 0 tag)
+        list(GET setting 1 def)
+        add_executable(test_guardzilla_${tag} tests/test_guardzilla.cpp)
+        target_link_libraries(test_guardzilla_${tag} PRIVATE simdsearch::simdsearch)
+        if(def)
+            target_compile_definitions(test_guardzilla_${tag} PRIVATE ${def})
+        endif()
+        add_test(NAME test_guardzilla_${tag} COMMAND test_guardzilla_${tag})
+    endforeach()
 
-    # Needle-Hammer tests: block boundaries at every alignment, small
-    # haystacks, periodic needles, escalation and guard give-up, fuzz.
-    add_executable(test_needle_hammer tests/test_needle_hammer.cpp)
-    target_link_libraries(test_needle_hammer PRIVATE simdsearch::simdsearch)
-    add_test(NAME test_needle_hammer COMMAND test_needle_hammer)
-
-    # Compiles the public header in a translation unit of its own, at the
-    # library's C++ standard, and checks that including it from two
-    # translation units links.
+    # The public header in a translation unit of its own, at the library's C++
+    # standard, included from two translation units of one program.
     add_executable(test_api tests/test_api.cpp tests/test_api_second_tu.cpp)
     target_link_libraries(test_api PRIVATE simdsearch::simdsearch)
     set_target_properties(test_api PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
@@ -41,27 +48,19 @@ if(SIMDSEARCH_TESTS)
 endif()
 
 # ---------------------------------------------------------------------------
-# Benchmark driver: C++23 (std::print), the counters library and StringZilla
-# fetched with CPM, optionally the Rust searchers.
+# The benchmark: one executable per searcher, search_bench_<id>. The searcher
+# is fixed at compile time; with several in one program, the measured speed
+# of one moved by up to 1.45x depending on what else was compiled in.
 # ---------------------------------------------------------------------------
 if(SIMDSEARCH_BENCHMARKS)
     include(cmake/CPM.cmake)
-    CPMAddPackage("gh:lemire/counters#v3.1.0")
-    # StringZilla, header-only, for the find_stringzilla row (the library as
-    # shipped, beside our ports of its anchored kernel).
+    # StringZilla, header-only, as shipped.
     CPMAddPackage(NAME stringzilla GITHUB_REPOSITORY ashvardanian/StringZilla GIT_TAG v5.1.2 DOWNLOAD_ONLY YES)
 
-    add_executable(benchmark benchmarks/benchmark.cpp)
-    target_include_directories(benchmark PRIVATE benchmarks)
-    # SYSTEM: third-party headers are not held to this project's warning flags.
-    target_include_directories(benchmark SYSTEM PRIVATE ${stringzilla_SOURCE_DIR}/include)
-    target_link_libraries(benchmark PRIVATE simdsearch::simdsearch counters)
-    set_target_properties(benchmark PROPERTIES CXX_STANDARD 23 CXX_STANDARD_REQUIRED ON)
-
-    # The Rust searchers (memchr crate, std::str::find) as extra rows, built from
-    # rust/ with cargo and linked statically. Off by default so the benchmark
-    # builds without a Rust toolchain; the rows appear in --list only when on.
-    option(SIMDSEARCH_RUST "Link the Rust searchers (memchr crate, std) via cargo" OFF)
+    # The Rust searchers (memchr crate, std's str::find), built from rust/ with
+    # cargo and linked statically. Off by default so that the benchmark builds
+    # without a Rust toolchain.
+    option(SIMDSEARCH_RUST "Build the Rust searchers (memchr crate, str::find) with cargo" OFF)
     if(SIMDSEARCH_RUST)
         find_program(CARGO_EXECUTABLE cargo REQUIRED)
         set(RUST_DIR ${CMAKE_CURRENT_SOURCE_DIR}/rust)
@@ -74,11 +73,41 @@ if(SIMDSEARCH_BENCHMARKS)
             COMMENT "cargo build --release (rust/)"
             VERBATIM)
         add_custom_target(simdsearch_rust DEPENDS ${RUST_LIB})
-        add_dependencies(benchmark simdsearch_rust)
-        target_compile_definitions(benchmark PRIVATE SIMDSEARCH_RUST=1)
-        target_link_libraries(benchmark PRIVATE ${RUST_LIB})
-        if(NOT APPLE)
-            target_link_libraries(benchmark PRIVATE pthread dl m)
-        endif()
     endif()
+
+    # search_bench_<name> for SEARCHER=<id> plus extra definitions.
+    function(add_search_bench name id)
+        add_executable(search_bench_${name} benchmarks/search_bench.cpp)
+        target_link_libraries(search_bench_${name} PRIVATE simdsearch::simdsearch)
+        target_include_directories(search_bench_${name} SYSTEM PRIVATE ${stringzilla_SOURCE_DIR}/include)
+        target_compile_definitions(search_bench_${name} PRIVATE SEARCHER=SEARCHER_${id} ${ARGN})
+        set_target_properties(search_bench_${name} PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+        if(id MATCHES "^rust_")
+            add_dependencies(search_bench_${name} simdsearch_rust)
+            target_link_libraries(search_bench_${name} PRIVATE ${RUST_LIB})
+            if(NOT APPLE)
+                target_link_libraries(search_bench_${name} PRIVATE pthread dl m)
+            endif()
+        endif()
+    endfunction()
+
+    # The searchers compared in the paper.
+    add_search_bench(guardzilla guardzilla)
+    add_search_bench(stringzilla stringzilla)
+    add_search_bench(memmem memmem)
+    add_search_bench(string_view string_view)
+    add_search_bench(boyer_moore_horspool boyer_moore_horspool)
+    add_search_bench(twoway twoway)
+    if(SIMDSEARCH_RUST)
+        add_search_bench(rust_memmem rust_memmem)
+        add_search_bench(rust_finder rust_finder)
+        add_search_bench(rust_str rust_str)
+    endif()
+    # Sensitivity: the number of anchors, alignment, the budget.
+    foreach(k 1 2 4 5 6 7 8)
+        add_search_bench(guardzilla_anchors${k} guardzilla GUARDZILLA_ANCHORS=${k})
+    endforeach()
+    add_search_bench(guardzilla_noalign guardzilla GUARDZILLA_ALIGN=0)
+    add_search_bench(guardzilla_budget2 guardzilla GUARDZILLA_BUDGET=2)
+    add_search_bench(guardzilla_budget8 guardzilla GUARDZILLA_BUDGET=8)
 endif()

@@ -16,6 +16,7 @@ the byte-frequency structure the anchored filter depends on:
   json      minified JSON: heavy punctuation, repeated key names
   base64    |S| = 64, near-uniform over a restricted range
   log       timestamped log lines with long repeated runs
+  replog    log lines identical but for their counters (periodic text)
   source    real C/C++ source: identifiers, braces, long comment runs
             (data/cpp_source.txt, a fixed file shipped with the repository)
   chinese   UTF-8 CJK -- almost every byte >= 0x80
@@ -126,6 +127,15 @@ def gen_log(n: int, seed: int) -> bytes:
     return tile(b"".join(out), n)
 
 
+def gen_replog(n: int) -> bytes:
+    """Log lines identical but for their counters: periodic text, where a
+    needle's anchors match on every line and candidates match deep."""
+    lines = "".join(
+        f"2026-10-07T12:{(i // 60) % 60:02d}:{i % 60:02d} INFO req id={i:06d} "
+        f"status=200 path=/api/v1/items\n" for i in range(20000))
+    return tile(lines.encode(), n)
+
+
 def gen_source(n: int) -> bytes:
     """Real C/C++ source: the shipped fixed file, tiled to size."""
     return tile(open(SOURCE_FILE, "rb").read(), n)
@@ -168,6 +178,7 @@ def build_diversity(out: str, book: bytes):
             string.ascii_letters + string.digits + "+/", TARGET, 3),
         "json":    lambda: gen_json(TARGET, 4),
         "log":     lambda: gen_log(TARGET, 5),
+        "replog":  lambda: gen_replog(TARGET),
     }
     for name, fn in jobs.items():
         path = os.path.join(out, name + ".dat")

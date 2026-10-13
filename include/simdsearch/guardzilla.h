@@ -1,0 +1,222 @@
+#pragma once
+// Guardzilla: StringZilla's substring search, made linear-time.
+//
+// StringZilla (github.com/ashvardanian/StringZilla) tests three needle bytes
+// (the anchors) at 64 haystack positions per AVX-512 step and compares every
+// position that passes against the needle. On repetitive input many positions
+// pass and match deep, and the search costs O(n m). Guardzilla changes two
+// things:
+//
+//  1. The scan is aligned: it steps on 64-byte boundaries of the haystack.
+//  2. The work is guarded. A candidate is first compared against the needle's
+//     first 64 bytes, a constant cost per position. Comparisons beyond those
+//     64 bytes are counted; when they exceed GUARDZILLA_BUDGET per 64 bytes
+//     scanned, the search finishes with the two-way algorithm. Every search
+//     takes O(n + m) time.
+//
+// Needs AVX-512F and AVX-512BW. The anchor choice is StringZilla's
+// sz_locate_needle_anomalies_ (Apache License 2.0), ported.
+//
+// Settings, for measurement only:
+//   GUARDZILLA_ANCHORS  number of anchors, 1 to 8 (default 3, StringZilla's)
+//   GUARDZILLA_ALIGN    0 to scan without aligning (default 1)
+//   GUARDZILLA_BUDGET   64-byte compares allowed per 64 bytes scanned (default 4)
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <utility>
+
+#if !(defined(__AVX512F__) && defined(__AVX512BW__))
+#error "Guardzilla needs AVX-512F and AVX-512BW (-mavx512f -mavx512bw)"
+#endif
+#include <immintrin.h>
+
+#ifndef GUARDZILLA_ANCHORS
+#define GUARDZILLA_ANCHORS 3
+#endif
+#ifndef GUARDZILLA_ALIGN
+#define GUARDZILLA_ALIGN 1
+#endif
+#ifndef GUARDZILLA_BUDGET
+#define GUARDZILLA_BUDGET 4
+#endif
+static_assert(GUARDZILLA_ANCHORS >= 1 && GUARDZILLA_ANCHORS <= 8, "GUARDZILLA_ANCHORS: 1 to 8");
+
+namespace guardzilla {
+namespace detail {
+
+constexpr int K = GUARDZILLA_ANCHORS;
+
+inline __mmask64 low_mask(size_t k) { return k >= 64 ? ~__mmask64(0) : (__mmask64(1) << k) - 1; }
+
+// The number of leading bytes on which a[0..len) and b[0..len) agree.
+inline size_t same_prefix(const uint8_t* a, const uint8_t* b, size_t len) {
+    for (size_t k = 0; k < len; k += 64) {
+        const __mmask64 lm = low_mask(len - k);
+        const __mmask64 ne = _mm512_mask_cmpneq_epi8_mask(lm, _mm512_maskz_loadu_epi8(lm, a + k),
+                                                          _mm512_maskz_loadu_epi8(lm, b + k));
+        if (ne) return k + size_t(__builtin_ctzll(ne));
+    }
+    return len;
+}
+
+// The number of trailing bytes on which a[0..len) and b[0..len) agree.
+inline size_t same_suffix(const uint8_t* a, const uint8_t* b, size_t len) {
+    for (size_t k = len; k > 0;) {
+        const size_t c = k < 64 ? k : 64;
+        k -= c;
+        const __mmask64 lm = low_mask(c);
+        const __mmask64 ne = _mm512_mask_cmpneq_epi8_mask(lm, _mm512_maskz_loadu_epi8(lm, a + k),
+                                                          _mm512_maskz_loadu_epi8(lm, b + k));
+        if (ne) return len - k - size_t(64 - __builtin_clzll(ne));
+    }
+    return len;
+}
+
+// Crochemore-Perrin two-way search of p[0..m) in t[from..n): linear time,
+// constant space. Returns the first match at or after `from`, or n.
+inline size_t twoway(const uint8_t* t, size_t n, const uint8_t* p, size_t m, size_t from) {
+    // Critical factorization: the later of the two maximal suffixes, under the
+    // byte order and under its reverse.
+    auto max_suffix = [&](bool reverse, size_t* period) {
+        size_t ms = SIZE_MAX, j = 0, k = 1, q = 1;   // ms + k wraps to k - 1
+        while (j + k < m) {
+            const uint8_t a = p[j + k], b = p[ms + k];
+            if (reverse ? a > b : a < b) { j += k; k = 1; q = j - ms; }
+            else if (a == b) { if (k == q) { j += q; k = 1; } else ++k; }
+            else { ms = j++; k = q = 1; }
+        }
+        *period = q;
+        return ms + 1;
+    };
+    size_t per1, per2;
+    const size_t c1 = max_suffix(false, &per1), c2 = max_suffix(true, &per2);
+    const size_t crit = c1 > c2 ? c1 : c2;
+    size_t period = c1 > c2 ? per1 : per2;
+    const bool periodic = std::memcmp(p, p + period, crit) == 0;
+    if (!periodic) period = (crit > m - crit ? crit : m - crit) + 1;
+    size_t memory = 0;
+    for (size_t j = from; j + m <= n;) {
+        // Byte by byte for up to four bytes, where most windows end, then 64
+        // bytes at a time.
+        size_t i = crit > memory ? crit : memory;
+        const size_t lim = i + 4 < m ? i + 4 : m;
+        while (i < lim && p[i] == t[j + i]) ++i;
+        if (i == lim) i += same_prefix(p + i, t + j + i, m - i);
+        if (i < m) { j += i - crit + 1; memory = 0; continue; }
+        size_t k = crit;
+        const size_t low = memory + 4 < crit ? crit - 4 : memory;
+        while (k > low && p[k - 1] == t[j + k - 1]) --k;
+        if (k == low) k -= same_suffix(p + memory, t + j + memory, k - memory);
+        if (k <= memory) return j;
+        j += period;
+        memory = periodic ? m - period : 0;
+    }
+    return n;
+}
+
+// K anchor offsets. Three are StringZilla's: the first, middle and last bytes,
+// moved to distinct values and, past 8 bytes, off UTF-8 lead bytes (>= 0xC0).
+// Other counts space the anchors evenly over the needle; one is the last byte.
+// A needle shorter than K repeats its last anchor.
+inline void anchors(const uint8_t* s, size_t m, size_t o[K]) {
+    if (K == 3 && m >= 3) {
+        size_t a = 0, b = m / 2, c = m - 1;
+        if (m > 3 && (s[a] == s[b] || s[a] == s[c] || s[b] == s[c])) {
+            while (s[b] == s[a] && b + 1 < c) ++b;
+            while ((s[c] == s[b] || s[c] == s[a]) && c > b + 1) --c;
+        }
+        if (m > 8) {
+            size_t va = a, vb = b;
+            while ((s[vb] > 191 || s[vb] == s[c]) && vb + 1 < c) ++vb;
+            if (s[vb] < 191) b = vb; else vb = b;
+            while ((s[va] > 191 || s[va] == s[vb] || s[va] == s[c]) && va + 1 < vb) ++va;
+            if (s[va] < 191) a = va;
+        }
+        o[0] = a, o[1] = b, o[2] = c;
+        return;
+    }
+    const size_t k = size_t(K) < m ? size_t(K) : m;
+    for (size_t j = 0; j < size_t(K); ++j)
+        o[j] = k == 1 ? m - 1 : (j < k ? j : k - 1) * (m - 1) / (k - 1);
+}
+
+// Whether a[64..m) == b[64..m), counting the 64-byte compares in *work.
+// Out of line: it is rarely called, and inlined it slows the scan.
+__attribute__((noinline)) inline bool rest_matches(const uint8_t* a, const uint8_t* b, size_t m, size_t* work) {
+    for (size_t d = 64; d < m; d += 64) {
+        const __mmask64 lm = low_mask(m - d);
+        ++*work;
+        if (_mm512_mask_cmpneq_epi8_mask(lm, _mm512_maskz_loadu_epi8(lm, a + d), _mm512_maskz_loadu_epi8(lm, b + d)))
+            return false;
+    }
+    return true;
+}
+
+// The first match among candidates [0, n - m], n if there is none, or
+// n + 1 + q if the work budget ran out at candidate q.
+inline size_t scan(const uint8_t* t, size_t n, const uint8_t* p, size_t m) {
+    size_t o[K];
+    __m512i v[K];
+    anchors(p, m, o);
+    for (int j = 0; j < K; ++j) v[j] = _mm512_set1_epi8(char(p[o[j]]));
+    const __mmask64 head_mask = low_mask(m);
+    const __m512i head = _mm512_maskz_loadu_epi8(head_mask, p);
+    const size_t last = n - m, slack = m / 8 + 64;
+    size_t work = 0;   // 64-byte compares beyond the first 64 needle bytes
+
+    // Candidates in [i, i + 64) among `live`, with masked loads.
+    auto filter = [&](size_t i, __mmask64 live) {
+        for (int j = 0; j < K; ++j)
+            live &= _mm512_mask_cmpeq_epi8_mask(live, _mm512_maskz_loadu_epi8(live, t + i + o[j]), v[j]);
+        return live;
+    };
+    // Checks the candidates w at i: 0 if none matches, else 1 + the result.
+    auto verify = [&](size_t i, __mmask64 w) -> size_t {
+        for (; w; w &= w - 1) {
+            const size_t q = i + size_t(__builtin_ctzll(w));
+            if (_mm512_mask_cmpneq_epi8_mask(head_mask, _mm512_maskz_loadu_epi8(head_mask, t + q), head)) continue;
+            if (m <= 64 || rest_matches(t + q, p, m, &work)) return q + 1;
+            if (work > GUARDZILLA_BUDGET * (q / 64) + slack) return n + 2 + q;
+        }
+        return 0;
+    };
+
+    size_t i = 0, r = 0;
+    if (GUARDZILLA_ALIGN) {   // a masked head up to the first 64-byte boundary
+        const size_t h = (64 - (uintptr_t(t) & 63)) & 63;
+        i = h < last + 1 ? h : last + 1;
+        if (i && (r = verify(0, filter(0, low_mask(i))))) return r - 1;
+    }
+    for (; i + 63 <= last; i += 64) {
+        __mmask64 s = ~__mmask64(0);
+        for (int j = 0; j < K; ++j)
+            s &= _mm512_cmpeq_epi8_mask(_mm512_loadu_si512(t + i + o[j]), v[j]);
+        if (s && (r = verify(i, s))) return r - 1;
+    }
+    if (i <= last && (r = verify(i, filter(i, low_mask(last - i + 1))))) return r - 1;
+    return n;
+}
+
+}  // namespace detail
+
+// First occurrence of pattern[0..m) in text[0..n): {true, index} or
+// {false, 0}. The empty needle matches at 0. No byte outside either buffer is
+// read. O(n + m) time.
+inline std::pair<bool, size_t> find(const char* text, size_t n, const char* pattern, size_t m) {
+    if (m == 0) return {true, 0};
+    if (n < m) return {false, 0};
+    const auto* t = reinterpret_cast<const uint8_t*>(text);
+    const auto* p = reinterpret_cast<const uint8_t*>(pattern);
+    size_t r;
+    if (m == 1) {
+        const void* x = std::memchr(t, p[0], n);
+        r = x ? size_t(static_cast<const uint8_t*>(x) - t) : n;
+    } else {
+        r = detail::scan(t, n, p, m);
+        if (r > n) r = detail::twoway(t, n, p, m, r - n - 1);   // the budget ran out
+    }
+    return r < n ? std::pair<bool, size_t>{true, r} : std::pair<bool, size_t>{false, 0};
+}
+
+}  // namespace guardzilla

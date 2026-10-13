@@ -1,26 +1,22 @@
 #pragma once
-// simdsearch: the public header.
+// simdsearch: substring search with AVX-512.
 //
 //   #include <simdsearch/simdsearch.h>
 //   auto [found, index] = simdsearch::find(text, n, pattern, m);
-//   size_t pos = simdsearch::find(haystack_view, needle_view);   // or npos
+//   size_t pos = simdsearch::find(haystack, needle);   // string_views; npos if absent
 //
-// Needle-Hammer (needle_hammer.h): SIMD filter plus a linear-time two-way
-// fallback, so every input is searched in O(n + m). AVX-512 (F + BW) on
-// x86-64 or NEON on AArch64, chosen at compile time; see the README.
-#include "needle_hammer.h"
+// The searcher is Guardzilla (guardzilla.h). Needs AVX-512F and AVX-512BW.
+#include <string_view>
+
+#include "guardzilla.h"
 
 namespace simdsearch {
 
-// First occurrence of pattern[0..m) in text[0..n): {true, index} or
-// {false, 0}. The empty needle matches at 0. Neither buffer needs a NUL
-// terminator, both may contain any byte value, and no byte outside them is
-// read.
-using needle_hammer::find;
+using guardzilla::find;
 
-// The same kernel without the work counter: a few percent faster on ordinary
-// text, no longer linear in the worst case. For measurement, not for input
-// you do not control.
-using needle_hammer::find_unguarded;
+inline size_t find(std::string_view haystack, std::string_view needle) {
+    const auto [found, index] = guardzilla::find(haystack.data(), haystack.size(), needle.data(), needle.size());
+    return found ? index : std::string_view::npos;
+}
 
 }  // namespace simdsearch

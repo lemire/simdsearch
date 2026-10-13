@@ -58,7 +58,7 @@ int main() {
         }
         const size_t ref = std::string_view(text, n).find(std::string_view(pat, m));
         const size_t got = simdsearch::find(std::string_view(text, n), std::string_view(pat, m));
-        const auto got2 = simdsearch::find_unguarded(text, n, pat, m);
+        const auto got2 = simdsearch::find(text, n, pat, m);
         if (got != ref || got2 != std::pair<bool, size_t>{ref != std::string_view::npos, ref == std::string_view::npos ? 0 : ref}) {
             if (fails < 10) std::fprintf(stderr, "FAIL: n=%zu m=%zu ref=%zu got=%zu\n", n, m, ref, got);
             ++fails;
