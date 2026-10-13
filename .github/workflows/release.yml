@@ -101,4 +101,4 @@ jobs:
           fi
           gh release create "${NEXT}" dist/simdsearch.h dist/SHA256SUMS \
               --title "simdsearch ${NEXT}" "${notes_args[@]}" \
-              --notes "Single-header build attached as \`simdsearch.h\` (checksum in \`SHA256SUMS\`). Needs AVX-512F+BW on x86-64 (\`-mavx512f -mavx512bw\`) or AArch64 NEON; C++17. See the README for the other ways to consume the library."
+              --notes "Single-header build attached as \`simdsearch.h\` (checksum in \`SHA256SUMS\`). Needs AVX-512F+BW on x86-64 (\`-mavx512f -mavx512bw\`); C++17. See the README for the other ways to consume the library."

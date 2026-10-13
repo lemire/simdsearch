@@ -3,8 +3,7 @@
 
 Starts at simdsearch.h and pastes every header it includes by quoted name in
 place of the #include, once each, dropping their #pragma once. System
-includes are left where they are. The result is one self-contained header
-with both backends, selected by the same preprocessor tests as the sources.
+includes are left where they are. The result is one self-contained header.
 
     python3 tools/amalgamate.py           # write singleheader/simdsearch.h
     python3 tools/amalgamate.py --check   # exit 1 if the file is out of date
@@ -47,8 +46,8 @@ def build():
         "//   #include \"simdsearch.h\"\n",
         "//   size_t pos = simdsearch::find(haystack, needle);   // or npos\n",
         "//\n",
-        "// Needs AVX-512F + AVX-512BW (compile with -mavx512f -mavx512bw) on x86-64,\n",
-        "// or AArch64 NEON; C++17. See the README at github.com/lemire/simdsearch.\n",
+        "// Needs AVX-512F + AVX-512BW (compile with -mavx512f -mavx512bw); C++17.\n",
+        "// See the README at github.com/lemire/simdsearch.\n",
         "#pragma once\n",
     ]
     amalgamate(ENTRY, set(), out)

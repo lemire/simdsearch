@@ -4,8 +4,8 @@
 //   #include "simdsearch.h"
 //   size_t pos = simdsearch::find(haystack, needle);   // or npos
 //
-// Needs AVX-512F + AVX-512BW (compile with -mavx512f -mavx512bw) on x86-64,
-// or AArch64 NEON; C++17. See the README at github.com/lemire/simdsearch.
+// Needs AVX-512F + AVX-512BW (compile with -mavx512f -mavx512bw); C++17.
+// See the README at github.com/lemire/simdsearch.
 #pragma once
 // ---- begin simdsearch.h ------------------------------------------------
 // simdsearch: substring search with AVX-512.
