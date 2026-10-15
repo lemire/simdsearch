@@ -115,25 +115,31 @@ inline size_t twoway(const uint8_t* t, size_t n, const uint8_t* p, size_t m, siz
     return n;
 }
 
-// K anchor offsets. Three are StringZilla's: the first, middle and last bytes,
-// moved to distinct values and, past 8 bytes, off UTF-8 lead bytes (>= 0xC0).
-// Other counts space the anchors evenly over the needle; one is the last byte.
-// A needle shorter than K repeats its last anchor.
+// StringZilla's three anchor offsets (m >= 3): the first, middle and last
+// bytes, moved to distinct values and, past 8 bytes, off UTF-8 lead bytes
+// (>= 0xC0).
+inline void sz_anchors(const uint8_t* s, size_t m, size_t o[3]) {
+    size_t a = 0, b = m / 2, c = m - 1;
+    if (m > 3 && (s[a] == s[b] || s[a] == s[c] || s[b] == s[c])) {
+        while (s[b] == s[a] && b + 1 < c) ++b;
+        while ((s[c] == s[b] || s[c] == s[a]) && c > b + 1) --c;
+    }
+    if (m > 8) {
+        size_t va = a, vb = b;
+        while ((s[vb] > 191 || s[vb] == s[c]) && vb + 1 < c) ++vb;
+        if (s[vb] < 191) b = vb; else vb = b;
+        while ((s[va] > 191 || s[va] == s[vb] || s[va] == s[c]) && va + 1 < vb) ++va;
+        if (s[va] < 191) a = va;
+    }
+    o[0] = a, o[1] = b, o[2] = c;
+}
+
+// K anchor offsets: StringZilla's for K = 3; other counts space the anchors
+// evenly over the needle, and one is the last byte. A needle shorter than K
+// repeats its last anchor.
 inline void anchors(const uint8_t* s, size_t m, size_t o[K]) {
     if (K == 3 && m >= 3) {
-        size_t a = 0, b = m / 2, c = m - 1;
-        if (m > 3 && (s[a] == s[b] || s[a] == s[c] || s[b] == s[c])) {
-            while (s[b] == s[a] && b + 1 < c) ++b;
-            while ((s[c] == s[b] || s[c] == s[a]) && c > b + 1) --c;
-        }
-        if (m > 8) {
-            size_t va = a, vb = b;
-            while ((s[vb] > 191 || s[vb] == s[c]) && vb + 1 < c) ++vb;
-            if (s[vb] < 191) b = vb; else vb = b;
-            while ((s[va] > 191 || s[va] == s[vb] || s[va] == s[c]) && va + 1 < vb) ++va;
-            if (s[va] < 191) a = va;
-        }
-        o[0] = a, o[1] = b, o[2] = c;
+        sz_anchors(s, m, o);
         return;
     }
     const size_t k = size_t(K) < m ? size_t(K) : m;

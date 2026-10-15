@@ -24,6 +24,18 @@ if(SIMDSEARCH_TESTS)
         add_test(NAME test_guardzilla_${tag} COMMAND test_guardzilla_${tag})
     endforeach()
 
+    # NeedleHammer (needs AVX-512 VBMI2): as published, and switching to its
+    # second scan almost at once, in windows of 128 bytes, and staying there.
+    function(add_needlehammer_test tag)
+        add_executable(test_needlehammer_${tag} tests/test_guardzilla.cpp)
+        target_link_libraries(test_needlehammer_${tag} PRIVATE simdsearch::simdsearch)
+        target_compile_definitions(test_needlehammer_${tag} PRIVATE TEST_NEEDLEHAMMER ${ARGN})
+        target_compile_options(test_needlehammer_${tag} PRIVATE -mavx512vbmi2)
+        add_test(NAME test_needlehammer_${tag} COMMAND test_needlehammer_${tag})
+    endfunction()
+    add_needlehammer_test(default)
+    add_needlehammer_test(eager NEEDLEHAMMER_WINDOW=2 NEEDLEHAMMER_BAND=1 NEEDLEHAMMER_TIMED=0)
+
     # The public header in a translation unit of its own, at the library's C++
     # standard, included from two translation units of one program.
     add_executable(test_api tests/test_api.cpp tests/test_api_second_tu.cpp)
@@ -95,6 +107,8 @@ if(SIMDSEARCH_BENCHMARKS)
 
     # The searchers compared in the paper.
     add_search_bench(guardzilla guardzilla)
+    add_search_bench(needlehammer needlehammer)
+    target_compile_options(search_bench_needlehammer PRIVATE -mavx512vbmi2)
     add_search_bench(stringzilla stringzilla)
     add_search_bench(memmem memmem)
     add_search_bench(string_view string_view)
@@ -112,4 +126,11 @@ if(SIMDSEARCH_BENCHMARKS)
     add_search_bench(guardzilla_noalign guardzilla GUARDZILLA_ALIGN=0)
     add_search_bench(guardzilla_budget2 guardzilla GUARDZILLA_BUDGET=2)
     add_search_bench(guardzilla_budget8 guardzilla GUARDZILLA_BUDGET=8)
+    # NeedleHammer's switch threshold and window.
+    foreach(b 10 25)
+        add_search_bench(needlehammer_band${b} needlehammer NEEDLEHAMMER_BAND=${b})
+        target_compile_options(search_bench_needlehammer_band${b} PRIVATE -mavx512vbmi2)
+    endforeach()
+    add_search_bench(needlehammer_window16 needlehammer NEEDLEHAMMER_WINDOW=16)
+    target_compile_options(search_bench_needlehammer_window16 PRIVATE -mavx512vbmi2)
 endif()

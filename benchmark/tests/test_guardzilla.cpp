@@ -1,9 +1,16 @@
-// Guardzilla against std::string_view::find: random text over small and full
+// Guardzilla (or, with TEST_NEEDLEHAMMER, NeedleHammer) against
+// std::string_view::find: random text over small and full
 // alphabets, needles drawn from the text (some with one byte changed) or at
 // random, every haystack alignment, block boundaries, the adversarial families
 // that defeat StringZilla's filter, and the guard's hand-over to two-way.
 // Builds and passes for every GUARDZILLA_ANCHORS / _ALIGN / _BUDGET setting.
+#if defined(TEST_NEEDLEHAMMER)
+#include <simdsearch/needlehammer.h>
+#define SEARCH needlehammer::find
+#else
 #include <simdsearch/simdsearch.h>
+#define SEARCH guardzilla::find
+#endif
 
 #include <cstdio>
 #include <cstdlib>
@@ -19,7 +26,7 @@ static size_t cases = 0;
 static void check(const char* text, size_t n, const char* pat, size_t m, const char* what) {
     ++cases;
     const size_t ref = std::string_view(text, n).find(std::string_view(pat, m));
-    const auto g = guardzilla::find(text, n, pat, m);
+    const auto g = SEARCH(text, n, pat, m);
     const size_t got = g.first ? g.second : std::string_view::npos;
     if (got != ref) {
         if (fails < 20) std::fprintf(stderr, "FAIL %s: n=%zu m=%zu ref=%zu got=%zu\n", what, n, m, ref, got);
@@ -76,7 +83,12 @@ int main(int argc, char** argv) {
         h[n - 3 * m] = 'a';   // a^{m} now occurs late: found after the hand-over
         check(h.data(), n, p.data(), m, "block-found");
     }
+#if defined(TEST_NEEDLEHAMMER)
+    std::printf("needlehammer tests (window %d, band %d): %zu cases, %s\n", NEEDLEHAMMER_WINDOW, NEEDLEHAMMER_BAND,
+                cases, fails ? "FAILED" : "ok");
+#else
     std::printf("guardzilla tests (anchors %d, align %d, budget %d): %zu cases, %s\n", GUARDZILLA_ANCHORS,
                 GUARDZILLA_ALIGN, GUARDZILLA_BUDGET, cases, fails ? "FAILED" : "ok");
+#endif
     return fails ? 1 : 0;
 }

@@ -61,9 +61,13 @@ static constexpr R kNotApplicable{false, SIZE_MAX};
 #define SEARCHER_rust_finder 8
 #define SEARCHER_rust_str 9
 #define SEARCHER_twoway 10
+#define SEARCHER_needlehammer 11
 
 #if SEARCHER_IS(guardzilla) || SEARCHER_IS(twoway)
 #include <simdsearch/simdsearch.h>
+#endif
+#if SEARCHER_IS(needlehammer)
+#include <simdsearch/needlehammer.h>
 #endif
 #if SEARCHER_IS(stringzilla)
 #include <stringzilla/stringzilla.h>
@@ -92,6 +96,16 @@ static const std::string kName = "Guardzilla";
 #endif
 static void* prepare(const char*, size_t) { return nullptr; }
 static R search(void*, const char* t, size_t n, const char* p, size_t m) { return guardzilla::find(t, n, p, m); }
+static void release(void*) {}
+#elif SEARCHER_IS(needlehammer)
+#if NEEDLEHAMMER_WINDOW != 64 || NEEDLEHAMMER_BAND != 16
+static const std::string kName = "NeedleHammer (window " + std::to_string(NEEDLEHAMMER_WINDOW) + ", band " +
+                                 std::to_string(NEEDLEHAMMER_BAND) + ")";
+#else
+static const std::string kName = "NeedleHammer";
+#endif
+static void* prepare(const char*, size_t) { return nullptr; }
+static R search(void*, const char* t, size_t n, const char* p, size_t m) { return needlehammer::find(t, n, p, m); }
 static void release(void*) {}
 #elif SEARCHER_IS(twoway)
 static const std::string kName = "two-way";
