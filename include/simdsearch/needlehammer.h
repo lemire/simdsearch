@@ -35,6 +35,8 @@
 // Settings, for measurement only:
 //   NEEDLEHAMMER_WINDOW  blocks per window (default 64)
 //   NEEDLEHAMMER_BAND    the switch threshold, percent (default 16)
+//   NEEDLEHAMMER_ANCHORS anchors of the second scan, 1 to 8 (default 3: the
+//                        first scan's; other counts are evenly spaced)
 //   NEEDLEHAMMER_TIMED   0 to keep the second scan without timing it (default 1)
 #include "guardzilla.h"
 
@@ -48,9 +50,13 @@
 #ifndef NEEDLEHAMMER_BAND
 #define NEEDLEHAMMER_BAND 16
 #endif
+#ifndef NEEDLEHAMMER_ANCHORS
+#define NEEDLEHAMMER_ANCHORS 3
+#endif
 #ifndef NEEDLEHAMMER_TIMED
 #define NEEDLEHAMMER_TIMED 1
 #endif
+static_assert(NEEDLEHAMMER_ANCHORS >= 1 && NEEDLEHAMMER_ANCHORS <= 8, "NEEDLEHAMMER_ANCHORS: 1 to 8");
 static_assert(NEEDLEHAMMER_WINDOW >= 1 && NEEDLEHAMMER_WINDOW <= 4096, "NEEDLEHAMMER_WINDOW");
 
 namespace needlehammer {
@@ -62,10 +68,18 @@ using guardzilla::detail::rest_matches;
 // to end, at most NEEDLEHAMMER_WINDOW of them: 0 if none matches, 1 + q if q
 // does, n + 2 + q if the guard trips at q.
 __attribute__((noinline)) inline size_t compress_chunk(const uint8_t* t, size_t n, const uint8_t* p, size_t m,
-                                                       const size_t o[3], size_t i, size_t end, size_t& work) {
-    const size_t slack = m / 8 + 64, o0 = o[0], o1 = o[1], o2 = o[2];
-    const __m512i v0 = _mm512_set1_epi8(char(p[o0])), v1 = _mm512_set1_epi8(char(p[o1])),
-                  v2 = _mm512_set1_epi8(char(p[o2]));
+                                                       const size_t o3[3], size_t i, size_t end, size_t& work) {
+    constexpr int A = NEEDLEHAMMER_ANCHORS;
+    const size_t slack = m / 8 + 64;
+    size_t o[A];
+    if (A == 3) {
+        for (int j = 0; j < A; ++j) o[j] = o3[j];
+    } else {
+        const size_t a = size_t(A) < m ? size_t(A) : m;
+        for (size_t j = 0; j < size_t(A); ++j) o[j] = a == 1 ? m - 1 : (j < a ? j : a - 1) * (m - 1) / (a - 1);
+    }
+    __m512i v[A];
+    for (int j = 0; j < A; ++j) v[j] = _mm512_set1_epi8(char(p[o[j]]));
     const __mmask64 head_mask = low_mask(m);
     const __m512i head = _mm512_maskz_loadu_epi8(head_mask, p);
     // Candidate q: 1 + q if it matches, n + 2 + q if the guard trips, else 0.
@@ -79,7 +93,8 @@ __attribute__((noinline)) inline size_t compress_chunk(const uint8_t* t, size_t 
     size_t k = 0;
     int fewest = 4;
     for (size_t j = 0; m >= 4 && j + 4 <= m && fewest; ++j) {
-        const int ov = (o0 - j < 4) + (o1 - j < 4) + (o2 - j < 4);
+        int ov = 0;
+        for (int a = 0; a < A; ++a) ov += o[a] - j < 4;
         if (ov < fewest) fewest = ov, k = j;
     }
     uint32_t word = 0;
@@ -102,9 +117,8 @@ __attribute__((noinline)) inline size_t compress_chunk(const uint8_t* t, size_t 
         uint8_t* out = pos8;
         __m512i idx = iota;
         for (uint64_t b = 0; i < end; i += 64, ++b) {
-            __mmask64 s = _mm512_cmpeq_epi8_mask(_mm512_loadu_si512(t + i + o0), v0) &
-                          _mm512_cmpeq_epi8_mask(_mm512_loadu_si512(t + i + o1), v1) &
-                          _mm512_cmpeq_epi8_mask(_mm512_loadu_si512(t + i + o2), v2);
+            __mmask64 s = _mm512_cmpeq_epi8_mask(_mm512_loadu_si512(t + i + o[0]), v[0]);
+            for (int j = 1; j < A; ++j) s &= _mm512_cmpeq_epi8_mask(_mm512_loadu_si512(t + i + o[j]), v[j]);
             s |= uint64_t((b & 3) == 3) << 63;   // the sentinel, position 255 of the window
             _mm512_storeu_si512(out, _mm512_maskz_compress_epi8(s, idx));
             out += _mm_popcnt_u64(s);

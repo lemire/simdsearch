@@ -23,7 +23,7 @@ for r in $(seq "$ROUNDS"); do
     for k in 1 2 4 5 6 7 8; do run "guardzilla_anchors$k" corpora $C >> "$OUT/sensitivity.csv"; done
     for s in guardzilla_budget2 guardzilla_budget8; do run "$s" corpora $C >> "$OUT/sensitivity.csv"; done
     for s in guardzilla_budget2 guardzilla_budget8; do run "$s" adversarial >> "$OUT/adversarial.csv"; done
-    for s in needlehammer_band10 needlehammer_band25 needlehammer_window16; do run "$s" corpora $C >> "$OUT/sensitivity.csv"; done
+    for s in needlehammer_band10 needlehammer_band25 needlehammer_window16 needlehammer_anchors1 needlehammer_anchors2 needlehammer_anchors4 needlehammer_anchors5 needlehammer_anchors6; do run "$s" corpora $C >> "$OUT/sensitivity.csv"; done
     # The haystack 0, 16, 32 and 48 bytes past a 64-byte boundary.
     for off in 0 16 32 48; do
         for s in guardzilla guardzilla_noalign needlehammer stringzilla; do

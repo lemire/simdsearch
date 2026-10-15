@@ -98,9 +98,10 @@ static void* prepare(const char*, size_t) { return nullptr; }
 static R search(void*, const char* t, size_t n, const char* p, size_t m) { return guardzilla::find(t, n, p, m); }
 static void release(void*) {}
 #elif SEARCHER_IS(needlehammer)
-#if NEEDLEHAMMER_WINDOW != 64 || NEEDLEHAMMER_BAND != 16
+#if NEEDLEHAMMER_WINDOW != 64 || NEEDLEHAMMER_BAND != 16 || NEEDLEHAMMER_ANCHORS != 3
 static const std::string kName = "NeedleHammer (window " + std::to_string(NEEDLEHAMMER_WINDOW) + ", band " +
-                                 std::to_string(NEEDLEHAMMER_BAND) + ")";
+                                 std::to_string(NEEDLEHAMMER_BAND) + ", anchors " +
+                                 std::to_string(NEEDLEHAMMER_ANCHORS) + ")";
 #else
 static const std::string kName = "NeedleHammer";
 #endif
