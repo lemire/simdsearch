@@ -127,6 +127,12 @@ if(SIMDSEARCH_BENCHMARKS)
     add_search_bench(guardzilla_noalign guardzilla GUARDZILLA_ALIGN=0)
     add_search_bench(guardzilla_budget2 guardzilla GUARDZILLA_BUDGET=2)
     add_search_bench(guardzilla_budget8 guardzilla GUARDZILLA_BUDGET=8)
+    # The constants of NeedleHammer's switch threshold on this processor.
+    add_executable(branch_penalty tools/branch_penalty.cpp)
+    target_link_libraries(branch_penalty PRIVATE simdsearch::simdsearch counters)
+    target_compile_options(branch_penalty PRIVATE -mavx512vbmi2)
+    set_target_properties(branch_penalty PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+
     # NeedleHammer's switch threshold, window and second-scan anchors.
     foreach(b 10 25)
         add_search_bench(needlehammer_band${b} needlehammer NEEDLEHAMMER_BAND=${b})

@@ -17,6 +17,9 @@ SEARCHERS="guardzilla needlehammer stringzilla memmem string_view boyer_moore_ho
 mkdir -p "$OUT"
 run() { taskset -c "$CPU" "$B/search_bench_$1" "${@:2}"; }
 
+# The cost of a misprediction and of NeedleHammer's second scan.
+taskset -c "$CPU" "$B/branch_penalty" corpora/english.dat > "$OUT/branch_penalty.csv" || true
+
 for r in $(seq "$ROUNDS"); do
     for s in $SEARCHERS; do run "$s" corpora $C >> "$OUT/corpora.csv"; done
     for s in guardzilla needlehammer stringzilla twoway memmem rust_finder; do run "$s" adversarial >> "$OUT/adversarial.csv"; done
