@@ -4,36 +4,42 @@
 //
 // Guardzilla takes one branch per 64 haystack positions: whether any position
 // passed the three-anchor filter. When candidates are rare or nearly
-// everywhere, the branch is predicted; when a fair share of the blocks have
-// one, at an irregular rate (DNA, some log files), it is not, and on Intel
-// Emerald Rapids every misprediction costs about 25 cycles, as much as six
-// blocks of scanning. NeedleHammer counts the blocks with a candidate (in the
-// branch taken for them) over windows of 64 blocks (4 KiB). When two consecutive
+// everywhere, the branch is predicted. When a fair share of the blocks have
+// one, at an irregular rate (DNA, some log files), it is not, and every
+// misprediction costs about 27 cycles on Granite Rapids and Zen 5, as much as
+// seven to ten blocks of scanning.
+//
+// NeedleHammer runs Guardzilla's scan and counts the blocks with a candidate,
+// in the branch taken for them, per window: two windows of 64 blocks (4 KiB)
+// for a quick decision, then windows of 2048 blocks (128 KiB), since leaving
+// the loop at the end of a window costs a misprediction. When two consecutive
 // windows have a share r of such blocks with min(r, 1 - r) above 16%, the
-// expected misprediction cost per block (25 cycles times min(r, 1 - r)) is
-// above the cost of the second scan (about 4 cycles per block), and the
-// search continues with that scan, one window at a time, for as long as it
-// takes fewer cycles (RDTSC, on a sample of the windows) than the last window
-// of the first scan did. Periodic input can be in the band yet predictable; there the second
-// scan is slower, the first scan resumes, and it waits twice as many windows
-// before it tries again. The second scan:
+// expected cost of the mispredictions (27 cycles times min(r, 1 - r) per
+// block) exceeds the extra cost of the second scan (4.6 to 6.2 cycles per
+// block), and the search goes on with the second scan. Periodic input can be
+// in the band yet predictable, so the switch is checked: the last window of
+// the first scan and a sample of the second scan's chunks are timed (RDTSC),
+// and when the second scan is slower, the first resumes and waits for twice
+// as many windows in the band before it switches again.
 //
-//  1. Over a window, the filter's mask compresses (VPCOMPRESSB) a byte
-//     vector of positions that wraps every 256 bytes; the last block of every
-//     256-byte window always emits position 255, so that each window leaves a
-//     mark. No branch depends on the data.
-//  2. The positions are decoded 16 at a time: a new window starts wherever a
+// The second scan, over chunks of 64 blocks:
+//  1. The filter's mask compresses (VPCOMPRESSB) a byte vector of positions
+//     that wraps every 256 bytes; the last block of every 256-byte span always
+//     emits position 255, so that each span leaves a mark. No branch depends
+//     on the data.
+//  2. The positions are decoded 16 at a time: a new span starts wherever a
 //     position is not above the previous one (a prefix sum). A gather then
-//     compares 4 more needle bytes at each candidate and VPCOMPRESSD keeps the
+//     compares 4 more needle bytes at each candidate, and VPCOMPRESSD keeps the
 //     candidates that pass.
-//  3. Those are compared against the needle in order, with Guardzilla's guard.
+//  3. Those are compared with the needle in order, with Guardzilla's guard.
 //
-// The idea of compressing the candidates, and the sentinel, are Geoff
-// Langdale's (Hyperscan). Needs AVX-512F, AVX-512BW and AVX-512 VBMI2 (Ice
-// Lake, Sapphire Rapids and later; Zen 4 and later). O(n + m) time.
+// Compressing the candidates, and the sentinel, are Geoff Langdale's ideas
+// (Hyperscan). Needs AVX-512F, AVX-512BW and AVX-512 VBMI2 (Ice Lake, Sapphire
+// Rapids and later; Zen 4 and later). O(n + m) time.
 //
 // Settings, for measurement only:
-//   NEEDLEHAMMER_WINDOW  blocks per window (default 64)
+//   NEEDLEHAMMER_WINDOW  blocks in each of the first two windows (default 64)
+//   NEEDLEHAMMER_LONG_WINDOW  blocks in each later window (default 2048)
 //   NEEDLEHAMMER_BAND    the switch threshold, percent (default 16)
 //   NEEDLEHAMMER_ANCHORS anchors of the second scan, 1 to 8 (default 3: the
 //                        first scan's; other counts are evenly spaced)
@@ -47,6 +53,9 @@
 #ifndef NEEDLEHAMMER_WINDOW
 #define NEEDLEHAMMER_WINDOW 64
 #endif
+#ifndef NEEDLEHAMMER_LONG_WINDOW
+#define NEEDLEHAMMER_LONG_WINDOW 2048
+#endif
 #ifndef NEEDLEHAMMER_BAND
 #define NEEDLEHAMMER_BAND 16
 #endif
@@ -59,15 +68,27 @@
 static_assert(NEEDLEHAMMER_ANCHORS >= 1 && NEEDLEHAMMER_ANCHORS <= 8, "NEEDLEHAMMER_ANCHORS: 1 to 8");
 static_assert(NEEDLEHAMMER_WINDOW >= 1 && NEEDLEHAMMER_WINDOW <= 4096, "NEEDLEHAMMER_WINDOW");
 
+// Out of line, and opaque to GCC's interprocedural passes: when GCC sees into
+// the functions that the main loop calls, it stops keeping the anchors in
+// registers in that loop (GCC 14).
+#if defined(__GNUC__) && !defined(__clang__)
+#define NEEDLEHAMMER_OPAQUE __attribute__((noinline, noipa))
+#else
+#define NEEDLEHAMMER_OPAQUE __attribute__((noinline))
+#endif
+
 namespace needlehammer {
 namespace detail {
 using guardzilla::detail::low_mask;
 using guardzilla::detail::rest_matches;
 
+// The blocks of a chunk of the second scan (4 KiB).
+constexpr size_t kChunk = 64;
+
 // The second scan over the full blocks from the 64-byte-aligned position i
-// to end, at most NEEDLEHAMMER_WINDOW of them: 0 if none matches, 1 + q if q
+// to end, at most kChunk of them: 0 if none matches, 1 + q if q
 // does, n + 2 + q if the guard trips at q.
-__attribute__((noinline)) inline size_t compress_chunk(const uint8_t* t, size_t n, const uint8_t* p, size_t m,
+NEEDLEHAMMER_OPAQUE inline size_t compress_chunk(const uint8_t* t, size_t n, const uint8_t* p, size_t m,
                                                        const size_t o3[3], size_t i, size_t end, size_t& work) {
     constexpr int A = NEEDLEHAMMER_ANCHORS;
     const size_t slack = m / 8 + 64;
@@ -107,7 +128,7 @@ __attribute__((noinline)) inline size_t compress_chunk(const uint8_t* t, size_t 
                                          1, 0);
     const __m512i step = _mm512_set1_epi8(64), zero = _mm512_setzero_si512(), one = _mm512_set1_epi32(1),
                   lane15 = _mm512_set1_epi32(15);
-    constexpr size_t kMax = 64 * NEEDLEHAMMER_WINDOW + NEEDLEHAMMER_WINDOW / 4;   // positions and sentinels
+    constexpr size_t kMax = 64 * kChunk + kChunk / 4;   // positions and sentinels
     alignas(64) uint8_t pos8[kMax + 64];
     alignas(64) uint32_t pos32[kMax + 16];
     size_t r;
@@ -153,23 +174,23 @@ __attribute__((noinline)) inline size_t compress_chunk(const uint8_t* t, size_t 
     return 0;
 }
 
-// The second scan from the aligned position i, one window at a time; the
-// first window, and one in 16 after it, are timed against `first_cost`, the
-// cycles of the first scan's last window. Returns {r, i}: r as
+// The second scan from the aligned position i, in chunks of kChunk blocks;
+// the first chunk, and one in 16 after it, are timed against the cycles per
+// block of the first scan's last window. Returns {r, i}: r as
 // compress_chunk() when nonzero, else the position where the first scan
 // resumes (the end of the full blocks, or where the second scan was slower).
-__attribute__((noinline)) inline std::pair<size_t, size_t> second_scan(const uint8_t* t, size_t n, const uint8_t* p,
-                                                                        size_t m, const size_t o[3], size_t i,
-                                                                        size_t& work, uint64_t first_cost) {
+NEEDLEHAMMER_OPAQUE inline std::pair<size_t, size_t> second_scan(const uint8_t* t, size_t n, const uint8_t* p,
+                                                                  size_t m, const size_t o[3], size_t i,
+                                                                  size_t& work, uint64_t first_per_block) {
     const size_t last = n - m;
     for (size_t k = 0; i + 63 <= last; ++k) {
-        const size_t end = last - 63 - i >= 64 * NEEDLEHAMMER_WINDOW ? i + 64 * NEEDLEHAMMER_WINDOW : last - 62;
+        const size_t end = last - 63 - i >= 64 * kChunk ? i + 64 * kChunk : last - 62;
         const bool timed = NEEDLEHAMMER_TIMED && k % 16 == 0;
         const uint64_t start = timed ? __rdtsc() : 0;
         const size_t r = compress_chunk(t, n, p, m, o, i, end, work);
         if (r) return {r, i};
+        if (timed && __rdtsc() - start > first_per_block * ((end - i) / 64)) return {0, end};
         i = end;
-        if (timed && __rdtsc() - start > first_cost) break;
     }
     return {0, i};
 }
@@ -180,12 +201,17 @@ __attribute__((noinline)) inline std::pair<size_t, size_t> second_scan(const uin
 // blocks with a candidate in the branch taken for them. After `patience`
 // consecutive windows in the band (the last of them timed), the search goes
 // on with second_scan(); when that turns out slower, the first scan resumes
-// and the patience doubles.
+// and the patience doubles. The inner loop's exit is mispredicted once per
+// window, so after the first two, which give a quick decision, the windows
+// are long.
 inline size_t scan(const uint8_t* t, size_t n, const uint8_t* p, size_t m) {
     size_t o[3] = {0, 1, 1};
     if (m >= 3) guardzilla::detail::sz_anchors(p, m, o);
-    const __m512i v0 = _mm512_set1_epi8(char(p[o[0]])), v1 = _mm512_set1_epi8(char(p[o[1]])),
-                  v2 = _mm512_set1_epi8(char(p[o[2]]));
+    // Copies: o escapes to second_scan(), and read through it, the offsets
+    // would be reloaded at every block.
+    const size_t o0 = o[0], o1 = o[1], o2 = o[2];
+    const __m512i v0 = _mm512_set1_epi8(char(p[o0])), v1 = _mm512_set1_epi8(char(p[o1])),
+                  v2 = _mm512_set1_epi8(char(p[o2]));
     const __mmask64 head_mask = low_mask(m);
     const __m512i head = _mm512_maskz_loadu_epi8(head_mask, p);
     const size_t last = n - m, slack = m / 8 + 64;
@@ -193,9 +219,9 @@ inline size_t scan(const uint8_t* t, size_t n, const uint8_t* p, size_t m) {
 
     // As in Guardzilla.
     auto filter = [&](size_t i, __mmask64 live) {
-        live &= _mm512_mask_cmpeq_epi8_mask(live, _mm512_maskz_loadu_epi8(live, t + i + o[0]), v0);
-        live &= _mm512_mask_cmpeq_epi8_mask(live, _mm512_maskz_loadu_epi8(live, t + i + o[1]), v1);
-        return _mm512_mask_cmpeq_epi8_mask(live, _mm512_maskz_loadu_epi8(live, t + i + o[2]), v2);
+        live &= _mm512_mask_cmpeq_epi8_mask(live, _mm512_maskz_loadu_epi8(live, t + i + o0), v0);
+        live &= _mm512_mask_cmpeq_epi8_mask(live, _mm512_maskz_loadu_epi8(live, t + i + o1), v1);
+        return _mm512_mask_cmpeq_epi8_mask(live, _mm512_maskz_loadu_epi8(live, t + i + o2), v2);
     };
     auto verify = [&](size_t i, __mmask64 w) -> size_t {
         for (; w; w &= w - 1) {
@@ -211,29 +237,30 @@ inline size_t scan(const uint8_t* t, size_t n, const uint8_t* p, size_t m) {
     const size_t h = (64 - (uintptr_t(t) & 63)) & 63;   // a masked head up to the first 64-byte boundary
     size_t i = h < last + 1 ? h : last + 1;
     if (i && (r = verify(0, filter(0, low_mask(i))))) return r - 1;
-    size_t in_band = 0, patience = 2;
+    size_t in_band = 0, patience = 2, windows = 0;
     while (i + 63 <= last) {
-        const bool full = last - 63 - i >= 64 * NEEDLEHAMMER_WINDOW;
-        const size_t end = full ? i + 64 * NEEDLEHAMMER_WINDOW : last - 62;
+        const size_t blocks = windows++ < 2 ? NEEDLEHAMMER_WINDOW : NEEDLEHAMMER_LONG_WINDOW;
+        const bool full = last - 63 - i >= 64 * blocks;
+        const size_t end = full ? i + 64 * blocks : last - 62;
         const bool timed = in_band + 1 >= patience;   // this window could complete the streak
         const uint64_t start = timed ? __rdtsc() : 0;
         size_t hits = 0;
         for (; i < end; i += 64) {
-            const __mmask64 s = _mm512_cmpeq_epi8_mask(_mm512_loadu_si512(t + i + o[0]), v0) &
-                                _mm512_cmpeq_epi8_mask(_mm512_loadu_si512(t + i + o[1]), v1) &
-                                _mm512_cmpeq_epi8_mask(_mm512_loadu_si512(t + i + o[2]), v2);
+            const __mmask64 s = _mm512_cmpeq_epi8_mask(_mm512_loadu_si512(t + i + o0), v0) &
+                                _mm512_cmpeq_epi8_mask(_mm512_loadu_si512(t + i + o1), v1) &
+                                _mm512_cmpeq_epi8_mask(_mm512_loadu_si512(t + i + o2), v2);
             if (s) {
                 ++hits;
                 if ((r = verify(i, s))) return r - 1;
             }
         }
-        const bool band = hits * 100 > NEEDLEHAMMER_WINDOW * NEEDLEHAMMER_BAND &&
-                          hits * 100 < NEEDLEHAMMER_WINDOW * (100 - NEEDLEHAMMER_BAND);
+        const bool band = hits * 100 > blocks * NEEDLEHAMMER_BAND && hits * 100 < blocks * (100 - NEEDLEHAMMER_BAND);
         in_band = full && band ? in_band + 1 : 0;
         if (in_band >= patience && i + 63 <= last) {
-            const auto x = second_scan(t, n, p, m, o, i, work, __rdtsc() - start);
+            const uint64_t per_block = (__rdtsc() - start) / blocks;
+            const auto x = second_scan(t, n, p, m, o, i, work, per_block);
             if (x.first) return x.first - 1;
-            i = x.second;
+            i = x.second;   // the second scan reached the end, or was slower
             in_band = 0;
             patience *= 2;
         }

@@ -34,8 +34,8 @@ if(SIMDSEARCH_TESTS)
         add_test(NAME test_needlehammer_${tag} COMMAND test_needlehammer_${tag})
     endfunction()
     add_needlehammer_test(default)
-    add_needlehammer_test(eager NEEDLEHAMMER_WINDOW=2 NEEDLEHAMMER_BAND=1 NEEDLEHAMMER_TIMED=0)
-    add_needlehammer_test(eager_anchors2 NEEDLEHAMMER_WINDOW=2 NEEDLEHAMMER_BAND=1 NEEDLEHAMMER_TIMED=0 NEEDLEHAMMER_ANCHORS=2)
+    add_needlehammer_test(eager NEEDLEHAMMER_WINDOW=2 NEEDLEHAMMER_LONG_WINDOW=3 NEEDLEHAMMER_BAND=1 NEEDLEHAMMER_TIMED=0)
+    add_needlehammer_test(eager_anchors2 NEEDLEHAMMER_WINDOW=2 NEEDLEHAMMER_LONG_WINDOW=3 NEEDLEHAMMER_BAND=1 NEEDLEHAMMER_TIMED=0 NEEDLEHAMMER_ANCHORS=2)
 
     # The public header in a translation unit of its own, at the library's C++
     # standard, included from two translation units of one program.
