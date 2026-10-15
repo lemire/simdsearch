@@ -54,6 +54,8 @@ endif()
 # ---------------------------------------------------------------------------
 if(SIMDSEARCH_BENCHMARKS)
     include(cmake/CPM.cmake)
+    # The counters library: cycles, instructions and branch misses per search.
+    CPMAddPackage("gh:lemire/counters#v3.1.0")
     # StringZilla, header-only, as shipped.
     CPMAddPackage(NAME stringzilla GITHUB_REPOSITORY ashvardanian/StringZilla GIT_TAG v5.1.2 DOWNLOAD_ONLY YES)
 
@@ -78,7 +80,7 @@ if(SIMDSEARCH_BENCHMARKS)
     # search_bench_<name> for SEARCHER=<id> plus extra definitions.
     function(add_search_bench name id)
         add_executable(search_bench_${name} benchmarks/search_bench.cpp)
-        target_link_libraries(search_bench_${name} PRIVATE simdsearch::simdsearch)
+        target_link_libraries(search_bench_${name} PRIVATE simdsearch::simdsearch counters)
         target_include_directories(search_bench_${name} SYSTEM PRIVATE ${stringzilla_SOURCE_DIR}/include)
         target_compile_definitions(search_bench_${name} PRIVATE SEARCHER=SEARCHER_${id} ${ARGN})
         set_target_properties(search_bench_${name} PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)

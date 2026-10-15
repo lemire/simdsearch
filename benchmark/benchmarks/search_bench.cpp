@@ -7,12 +7,17 @@
 //   search_bench_<id> adversarial        the five adversarial families
 //
 // Output is CSV on stdout, one row per measurement:
-//   mode,input,case,m,searcher,ns_per_search,bytes_per_search
+//   mode,input,case,m,searcher,ns_per_search,bytes_per_search,
+//   cycles_per_search,instructions_per_search,branches_per_search,
+//   branch_misses_per_search
 // ns_per_search is the best of `--rounds` timed passes over every needle,
 // divided by the number of needles; bytes_per_search is the average number of
 // haystack bytes a search had to consider (up to the end of the first match,
-// or the whole haystack). Every answer is checked against
-// std::string_view::find before anything is timed.
+// or the whole haystack). The last four columns are the hardware counters of
+// that fastest pass, per search (the counters library: Linux perf events or
+// Apple's counters), or nan where the system does not give access to them.
+// Every answer is checked against std::string_view::find before anything is
+// timed.
 //
 // Options: --offset K   place the haystack K bytes past a 64-byte boundary
 //                       (default 0)
@@ -21,6 +26,7 @@
 //          --header     print the CSV header
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -32,6 +38,8 @@
 #include <string_view>
 #include <utility>
 #include <vector>
+
+#include <counters/event_counter.h>
 
 using R = std::pair<bool, size_t>;
 static constexpr R kNotApplicable{false, SIZE_MAX};
@@ -196,8 +204,12 @@ static std::string reverse_code_points(const std::string& s) {
 // Checks every needle, then times `rounds` passes over all of them. Returns
 // false when the searcher does not take this input (Rust's str::find on bytes
 // that are not UTF-8).
+struct result {
+    double ns, bytes, cycles, instructions, branches, branch_misses;  // per search
+};
+
 static bool measure(const haystack& H, const std::string& reference, const std::vector<std::string>& needles,
-                    double* ns_per_search, double* bytes_per_search, const char* what) {
+                    result* out, const char* what) {
     std::vector<void*> st;
     for (auto& nd : needles) st.push_back(searcher::prepare(nd.data(), nd.size()));
     double scanned = 0;
@@ -219,25 +231,37 @@ static bool measure(const haystack& H, const std::string& reference, const std::
         // hidden from the optimizer: an inlined searcher declared pure (memmem)
         // was otherwise hoisted out of the timed loop.
         R (*volatile fn)(void*, const char*, size_t, const char*, size_t) = searcher::search;
-        double best = 1e300;
+        static counters::event_collector collector;
+        static const bool have_counters = collector.has_events();
+        counters::event_count best;
+        best.elapsed = std::chrono::duration<double>(1e300);
         size_t sink = 0;
         for (int r = 0; r < g_rounds; ++r) {
-            const auto t0 = std::chrono::steady_clock::now();
+            collector.start();
             for (size_t k = 0; k < needles.size(); ++k) {
                 const char* h = H.data;
                 asm volatile("" : "+r"(h) : : "memory");
                 const R x = fn(st[k], h, H.size, needles[k].data(), needles[k].size());
                 sink += x.second + x.first;
             }
-            const auto t1 = std::chrono::steady_clock::now();
-            best = std::min(best, std::chrono::duration<double, std::nano>(t1 - t0).count());
+            const counters::event_count& c = collector.end();
+            if (c.elapsed < best.elapsed) best = c;
         }
         if (sink == 42) std::fputs("", stderr);
-        *ns_per_search = best / (double)needles.size();
-        *bytes_per_search = scanned / (double)needles.size();
+        const double k = (double)needles.size(), nan = std::nan("");
+        *out = {best.elapsed_ns() / k,
+                scanned / k,
+                have_counters ? best.cycles() / k : nan,
+                have_counters ? best.instructions() / k : nan,
+                have_counters ? best.branches() / k : nan,
+                have_counters ? best.branch_misses() / k : nan};
     }
     for (void* s : st) searcher::release(s);
     return ok;
+}
+
+static void print_result(const result& x) {
+    std::printf("%.1f,%.0f,%.1f,%.1f,%.1f,%.2f\n", x.ns, x.bytes, x.cycles, x.instructions, x.branches, x.branch_misses);
 }
 
 // Needles copied from random positions of the corpus (present: the search
@@ -275,10 +299,12 @@ static void run_corpora(int argc, char** argv, int first) {
                     needles.push_back(std::move(nd));
                 }
                 if ((int)needles.size() < want) continue;   // e.g. every 8-letter DNA string occurs
-                double ns, bytes;
-                if (measure(H, h, needles, &ns, &bytes, name.c_str()))
-                    std::printf("corpora,%s,%s,%zu,%s,%.1f,%.0f\n", name.c_str(), present ? "present" : "absent", m,
-                                searcher::kName.c_str(), ns, bytes);
+                result x;
+                if (measure(H, h, needles, &x, name.c_str())) {
+                    std::printf("corpora,%s,%s,%zu,%s,", name.c_str(), present ? "present" : "absent", m,
+                                searcher::kName.c_str());
+                    print_result(x);
+                }
                 std::fflush(stdout);
             }
         }
@@ -313,9 +339,11 @@ static void run_adversarial() {
                 for (size_t i = 0; i < n; ++i) h[i] = c[i % m];
             }
             const haystack H(h);
-            double ns, bytes;
-            if (measure(H, h, {p}, &ns, &bytes, fam))
-                std::printf("adversarial,%s,absent,%zu,%s,%.1f,%.0f\n", fam, m, searcher::kName.c_str(), ns, bytes);
+            result x;
+            if (measure(H, h, {p}, &x, fam)) {
+                std::printf("adversarial,%s,absent,%zu,%s,", fam, m, searcher::kName.c_str());
+                print_result(x);
+            }
             std::fflush(stdout);
         }
     }
@@ -337,7 +365,8 @@ int main(int argc, char** argv) {
                 if (c == std::string::npos) break;
                 pos = c + 1;
             }
-        } else if (s == "--header") std::printf("mode,input,case,m,searcher,ns_per_search,bytes_per_search\n");
+        } else if (s == "--header") std::printf("mode,input,case,m,searcher,ns_per_search,bytes_per_search,cycles_per_search,"
+                                           "instructions_per_search,branches_per_search,branch_misses_per_search\n");
         else { mode = s; ++a; break; }
     }
     if (mode == "corpora") run_corpora(argc, argv, a);
