@@ -37,9 +37,9 @@ jobs:
           cmake --build build -j
       - name: Test under SDE (Sapphire Rapids)
         run: |
-          for t in build/benchmark/test_guardzilla_* build/benchmark/test_api build/benchmark/test_api_singleheader; do
+          for t in build/benchmark/test_guardzilla_* build/benchmark/test_needlehammer_* build/benchmark/test_api build/benchmark/test_api_singleheader; do
             echo "== $t"
-            case "$t" in *test_guardzilla_*) arg=--quick ;; *) arg= ;; esac
+            case "$t" in *test_guardzilla_*|*test_needlehammer_*) arg=--quick ;; *) arg= ;; esac
             "$SDE_PATH/sde64" -spr -- "./$t" $arg
           done
           python3 tools/amalgamate.py --check

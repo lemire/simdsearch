@@ -18,6 +18,21 @@ The searcher is **Guardzilla**: the substring search of
 On ordinary text it is as fast as StringZilla, about twice as fast as Rust's
 `memchr` crate, and several times faster than the C library's `memmem`.
 
+A second searcher, **NeedleHammer** (`simdsearch/needlehammer.h`, namespace
+`needlehammer`), is Guardzilla with a second scan for inputs that defeat the
+branch predictor: when a fair share of the 64-byte blocks have a candidate, at
+an irregular rate (DNA, some logs), it compresses the candidates' positions
+(VPCOMPRESSB) and checks them without a data-dependent branch, an idea of
+Geoff Langdale's. It is 2 to 4 times faster than Guardzilla on DNA and at most
+about 5% slower elsewhere, also in O(n + m) time. It also needs AVX-512 VBMI2 and VL
+(Ice Lake, Sapphire Rapids and later; Zen 4 and later): compile with
+`-mavx512vbmi2 -mavx512vl`.
+
+```cpp
+#include <simdsearch/needlehammer.h>
+auto [found, index] = needlehammer::find(hay.data(), hay.size(), "fox", 3);
+```
+
 ## Requirements
 
 An x86-64 processor with **AVX-512F and AVX-512BW** (Intel Skylake-SP and
@@ -58,9 +73,14 @@ and `str::find` to the comparison. Each searcher is its own executable,
 `build/benchmark/search_bench_<name>`: compiled into one program, the
 searchers' speeds moved by up to 1.45x depending on what else was linked in.
 
-The compared searchers are Guardzilla, StringZilla 5.1.2 (`sz_find`), the C
+The compared searchers are Guardzilla, NeedleHammer, StringZilla 5.1.2 (`sz_find`), the C
 library's `memmem`, `std::string_view::find`,
 `std::boyer_moore_horspool_searcher`, and Rust's `memchr::memmem::find`,
 `memchr::memmem::Finder` and `str::find`. The settings `GUARDZILLA_ANCHORS`,
-`GUARDZILLA_ALIGN` and `GUARDZILLA_BUDGET` (see `guardzilla.h`) exist for the
-sensitivity measurements.
+`GUARDZILLA_ALIGN` and `GUARDZILLA_BUDGET` (see `guardzilla.h`), and the
+`NEEDLEHAMMER_*` settings (see `needlehammer.h`), exist for the sensitivity
+measurements. When the processor allows it, each search also records cycles,
+instructions, branches and mispredicted branches (the
+[counters](https://github.com/lemire/counters) library); on Linux this needs
+`kernel.perf_event_paranoid` at 1 or less. `build/benchmark/branch_penalty`
+measures the two constants of NeedleHammer's switch on the current processor.

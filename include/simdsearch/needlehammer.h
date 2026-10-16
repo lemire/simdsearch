@@ -15,7 +15,7 @@
 // the loop at the end of a window costs a misprediction. When two consecutive
 // windows have a share r of such blocks with min(r, 1 - r) above 16%, the
 // expected cost of the mispredictions (27 cycles times min(r, 1 - r) per
-// block) exceeds the extra cost of the second scan (4.6 to 6.2 cycles per
+// block) exceeds the extra cost of the second scan (4.5 to 7.1 cycles per
 // block), and the search goes on with the second scan. Periodic input can be
 // in the band yet predictable, so the switch is checked: the last window of
 // the first scan and a sample of the second scan's chunks are timed (RDTSC),
@@ -34,7 +34,7 @@
 //  3. Those are compared with the needle in order, with Guardzilla's guard.
 //
 // Compressing the candidates, and the sentinel, are Geoff Langdale's ideas
-// (Hyperscan). Needs AVX-512F, AVX-512BW and AVX-512 VBMI2 (Ice Lake, Sapphire
+// (Hyperscan). Needs AVX-512F, BW, VL and VBMI2 (Ice Lake, Sapphire
 // Rapids and later; Zen 4 and later). O(n + m) time.
 //
 // Settings, for measurement only:
@@ -46,8 +46,8 @@
 //   NEEDLEHAMMER_TIMED   0 to keep the second scan without timing it (default 1)
 #include "guardzilla.h"
 
-#if !defined(__AVX512VBMI2__)
-#error "NeedleHammer needs AVX-512 VBMI2 (-mavx512vbmi2)"
+#if !(defined(__AVX512VBMI2__) && defined(__AVX512VL__))
+#error "NeedleHammer needs AVX-512 VBMI2 and VL (-mavx512vbmi2 -mavx512vl)"
 #endif
 
 #ifndef NEEDLEHAMMER_WINDOW
