@@ -58,6 +58,18 @@ link `simdsearch::simdsearch`; the target adds `-mavx512f -mavx512bw`
 (override with `-DSIMDSEARCH_ARCH_FLAGS=-march=native`). Otherwise copy
 `singleheader/simdsearch.h` and compile with those flags.
 
+**Single header from a release** (no git, no CMake): every release on the
+[releases page](https://github.com/lemire/simdsearch/releases) attaches the
+library amalgamated into one file, `simdsearch.h` (Guardzilla), and its
+checksum. The latest release is **v0.3.1**.
+
+```sh
+curl -LO https://github.com/lemire/simdsearch/releases/download/v0.3.1/simdsearch.h
+curl -LO https://github.com/lemire/simdsearch/releases/download/v0.3.1/SHA256SUMS
+sha256sum -c SHA256SUMS            # shasum -a 256 -c SHA256SUMS on macOS
+g++ -std=c++17 -O2 -mavx512f -mavx512bw app.cpp
+```
+
 ## Tests and benchmarks
 
 ```sh
