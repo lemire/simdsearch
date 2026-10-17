@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.14)
 
 # The VERSION is the last release; the Release workflow bumps it, do not edit.
-project(simdsearch VERSION 0.4.0 LANGUAGES CXX
+project(simdsearch VERSION 0.5.0 LANGUAGES CXX
         DESCRIPTION "AVX-512 substring search: Guardzilla and its benchmarks")
 
 if(CMAKE_VERSION VERSION_LESS 3.21)

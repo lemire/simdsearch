@@ -61,11 +61,11 @@ link `simdsearch::simdsearch`; the target adds `-mavx512f -mavx512bw`
 **Single header from a release** (no git, no CMake): every release on the
 [releases page](https://github.com/lemire/simdsearch/releases) attaches the
 library amalgamated into one file, `simdsearch.h` (Guardzilla), and its
-checksum. The latest release is **v0.4.0**.
+checksum. The latest release is **v0.5.0**.
 
 ```sh
-curl -LO https://github.com/lemire/simdsearch/releases/download/v0.4.0/simdsearch.h
-curl -LO https://github.com/lemire/simdsearch/releases/download/v0.4.0/SHA256SUMS
+curl -LO https://github.com/lemire/simdsearch/releases/download/v0.5.0/simdsearch.h
+curl -LO https://github.com/lemire/simdsearch/releases/download/v0.5.0/SHA256SUMS
 sha256sum -c SHA256SUMS            # shasum -a 256 -c SHA256SUMS on macOS
 g++ -std=c++17 -O2 -mavx512f -mavx512bw app.cpp
 ```
