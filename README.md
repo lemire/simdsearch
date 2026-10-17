@@ -80,6 +80,12 @@ python3 benchmark/tools/corpora.py     # the corpora; compare with benchmark/dat
 benchmark/run.sh results/$(hostname)   # every measurement in the paper
 ```
 
+Two corpora are downloaded from the [Pizza&Chili repetitive
+corpus](https://pizzachili.dcc.uchile.cl/repcorpus.html): `influenza` (genomes
+from NCBI's GenBank, which places no restriction on their use) and `leaders`
+(the CIA's *World Leaders* lists, a US government work in the public domain).
+The others are generated, or come from Project Gutenberg.
+
 `-DSIMDSEARCH_RUST=ON` needs a Rust toolchain; it adds Rust's `memchr` crate
 and `str::find` to the comparison. Each searcher is its own executable,
 `build/benchmark/search_bench_<name>`: compiled into one program, the

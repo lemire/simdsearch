@@ -12,7 +12,7 @@ OUT=${1:?usage: benchmark/run.sh OUTDIR [ROUNDS] [CPU]}
 ROUNDS=${2:-3}
 CPU=${3:-2}
 B=build/benchmark
-C=$(for c in english log json base64 protein dna russian chinese source replog; do printf 'corpora/%s.dat ' $c; done)
+C=$(for c in english log json base64 protein dna russian chinese source replog influenza leaders; do printf 'corpora/%s.dat ' $c; done)
 SEARCHERS="guardzilla needlehammer stringzilla memmem string_view boyer_moore_horspool rust_memmem rust_finder rust_str"
 mkdir -p "$OUT"
 run() { taskset -c "$CPU" "$B/search_bench_$1" "${@:2}"; }
@@ -25,8 +25,8 @@ for r in $(seq "$ROUNDS"); do
     for s in guardzilla needlehammer stringzilla twoway memmem rust_finder; do run "$s" adversarial >> "$OUT/adversarial.csv"; done
     for k in 1 2 4 5 6 7 8; do run "guardzilla_anchors$k" corpora $C >> "$OUT/sensitivity.csv"; done
     for s in guardzilla_budget2 guardzilla_budget8; do run "$s" corpora $C >> "$OUT/sensitivity.csv"; done
-    for s in guardzilla_budget2 guardzilla_budget8; do run "$s" adversarial >> "$OUT/adversarial.csv"; done
-    for s in needlehammer_band10 needlehammer_band25 needlehammer_window16 needlehammer_anchors1 needlehammer_anchors2 needlehammer_anchors4 needlehammer_anchors5 needlehammer_anchors6; do run "$s" corpora $C >> "$OUT/sensitivity.csv"; done
+    for s in guardzilla_budget2 guardzilla_budget8 needlehammer_budget2 needlehammer_budget8; do run "$s" adversarial >> "$OUT/adversarial.csv"; done
+    for s in needlehammer_band10 needlehammer_band25 needlehammer_window16 needlehammer_prologue0 needlehammer_prologue4 needlehammer_prologue64 needlehammer_budget2 needlehammer_budget8 needlehammer_anchors1 needlehammer_anchors2 needlehammer_anchors4 needlehammer_anchors5 needlehammer_anchors6; do run "$s" corpora $C >> "$OUT/sensitivity.csv"; done
     # The haystack 0, 16, 32 and 48 bytes past a 64-byte boundary.
     for off in 0 16 32 48; do
         for s in guardzilla guardzilla_noalign needlehammer stringzilla; do

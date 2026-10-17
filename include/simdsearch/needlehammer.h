@@ -33,6 +33,11 @@
 //     candidates that pass.
 //  3. Those are compared with the needle in order, with Guardzilla's guard.
 //
+// A search that ends early costs little but setup, and the windowed scan
+// costs more to enter than Guardzilla's (about 36 more instructions per call).
+// So the first 16 blocks (1 KiB) are scanned by a lean copy of Guardzilla's
+// loop, and the windowed scan starts after them.
+//
 // Compressing the candidates, and the sentinel, are Geoff Langdale's ideas
 // (Hyperscan). Needs AVX-512F, BW, VL and VBMI2 (Ice Lake, Sapphire
 // Rapids and later; Zen 4 and later). O(n + m) time.
@@ -44,6 +49,8 @@
 //   NEEDLEHAMMER_ANCHORS anchors of the second scan, 1 to 8 (default 3: the
 //                        first scan's; other counts are evenly spaced)
 //   NEEDLEHAMMER_TIMED   0 to keep the second scan without timing it (default 1)
+//   NEEDLEHAMMER_PROLOGUE blocks scanned first by a lean Guardzilla loop
+//                        (default 16; 0 for none)
 #include "guardzilla.h"
 
 #if !(defined(__AVX512VBMI2__) && defined(__AVX512VL__))
@@ -64,6 +71,9 @@
 #endif
 #ifndef NEEDLEHAMMER_TIMED
 #define NEEDLEHAMMER_TIMED 1
+#endif
+#ifndef NEEDLEHAMMER_PROLOGUE
+#define NEEDLEHAMMER_PROLOGUE 16
 #endif
 static_assert(NEEDLEHAMMER_ANCHORS >= 1 && NEEDLEHAMMER_ANCHORS <= 8, "NEEDLEHAMMER_ANCHORS: 1 to 8");
 static_assert(NEEDLEHAMMER_WINDOW >= 1 && NEEDLEHAMMER_WINDOW <= 4096, "NEEDLEHAMMER_WINDOW");
@@ -195,7 +205,45 @@ NEEDLEHAMMER_OPAQUE inline std::pair<size_t, size_t> second_scan(const uint8_t* 
     return {0, i};
 }
 
-// The first match among candidates [0, n - m], n if there is none, or
+// Guardzilla's scan of the candidates [0, end), end <= n - m + 1, with the
+// anchors o: the first blocks, where NeedleHammer's larger scan() costs more to
+// enter than the blocks cost to scan. The first match, `end` if none, or
+// n + 1 + q if the budget ran out at candidate q.
+inline size_t prologue(const uint8_t* t, size_t n, const uint8_t* p, size_t m, const size_t* o, size_t end) {
+    const __m512i v0 = _mm512_set1_epi8(char(p[o[0]])), v1 = _mm512_set1_epi8(char(p[o[1]])),
+                  v2 = _mm512_set1_epi8(char(p[o[2]]));
+    const __mmask64 head_mask = low_mask(m);
+    const __m512i head = _mm512_maskz_loadu_epi8(head_mask, p);
+    const size_t slack = m / 8 + 64;
+    size_t work = 0;
+    auto verify = [&](size_t i, __mmask64 w) -> size_t {
+        for (; w; w &= w - 1) {
+            const size_t q = i + size_t(__builtin_ctzll(w));
+            if (_mm512_mask_cmpneq_epi8_mask(head_mask, _mm512_maskz_loadu_epi8(head_mask, t + q), head)) continue;
+            if (m <= 64 || rest_matches(t + q, p, m, &work)) return q + 1;
+            if (work > GUARDZILLA_BUDGET * (q / 64) + slack) return n + 2 + q;
+        }
+        return 0;
+    };
+    const size_t h = (64 - (uintptr_t(t) & 63)) & 63;
+    size_t i = h, r;
+    if (i) {
+        __mmask64 live = low_mask(i);
+        live &= _mm512_mask_cmpeq_epi8_mask(live, _mm512_maskz_loadu_epi8(live, t + o[0]), v0);
+        live &= _mm512_mask_cmpeq_epi8_mask(live, _mm512_maskz_loadu_epi8(live, t + o[1]), v1);
+        live &= _mm512_mask_cmpeq_epi8_mask(live, _mm512_maskz_loadu_epi8(live, t + o[2]), v2);
+        if ((r = verify(0, live))) return r - 1;
+    }
+    for (; i < end; i += 64) {
+        const __mmask64 s = _mm512_cmpeq_epi8_mask(_mm512_loadu_si512(t + i + o[0]), v0) &
+                            _mm512_cmpeq_epi8_mask(_mm512_loadu_si512(t + i + o[1]), v1) &
+                            _mm512_cmpeq_epi8_mask(_mm512_loadu_si512(t + i + o[2]), v2);
+        if (s && (r = verify(i, s))) return r - 1;
+    }
+    return end;
+}
+
+// The first match among candidates [from, n - m], n if there is none, or
 // n + 1 + q if the work budget ran out at candidate q. Requires m >= 2.
 // Guardzilla's scan, in windows of NEEDLEHAMMER_WINDOW blocks, counting the
 // blocks with a candidate in the branch taken for them. After `patience`
@@ -204,9 +252,11 @@ NEEDLEHAMMER_OPAQUE inline std::pair<size_t, size_t> second_scan(const uint8_t* 
 // and the patience doubles. The inner loop's exit is mispredicted once per
 // window, so after the first two, which give a quick decision, the windows
 // are long.
-inline size_t scan(const uint8_t* t, size_t n, const uint8_t* p, size_t m) {
-    size_t o[3] = {0, 1, 1};
-    if (m >= 3) guardzilla::detail::sz_anchors(p, m, o);
+//
+// The anchors are o[0..3); candidates start at `from`: 0, or a 64-byte
+// boundary of the haystack.
+inline size_t scan(const uint8_t* t, size_t n, const uint8_t* p, size_t m, const size_t* o_in, size_t from) {
+    size_t o[3] = {o_in[0], o_in[1], o_in[2]};
     // Copies: o escapes to second_scan(), and read through it, the offsets
     // would be reloaded at every block.
     const size_t o0 = o[0], o1 = o[1], o2 = o[2];
@@ -235,8 +285,8 @@ inline size_t scan(const uint8_t* t, size_t n, const uint8_t* p, size_t m) {
 
     size_t r;
     const size_t h = (64 - (uintptr_t(t) & 63)) & 63;   // a masked head up to the first 64-byte boundary
-    size_t i = h < last + 1 ? h : last + 1;
-    if (i && (r = verify(0, filter(0, low_mask(i))))) return r - 1;
+    size_t i = from ? from : h < last + 1 ? h : last + 1;
+    if (!from && i && (r = verify(0, filter(0, low_mask(i))))) return r - 1;
     size_t in_band = 0, patience = 2, windows = 0;
     while (i + 63 <= last) {
         const size_t blocks = windows++ < 2 ? NEEDLEHAMMER_WINDOW : NEEDLEHAMMER_LONG_WINDOW;
@@ -284,7 +334,18 @@ inline std::pair<bool, size_t> find(const char* text, size_t n, const char* patt
         const void* x = std::memchr(t, p[0], n);
         r = x ? size_t(static_cast<const uint8_t*>(x) - t) : n;
     } else {
-        r = detail::scan(t, n, p, m);
+        size_t o[3] = {0, 1, 1};
+        if (m >= 3) guardzilla::detail::sz_anchors(p, m, o);
+        // A search that ends within the first blocks costs little but setup:
+        // those blocks go to the lean prologue(), and scan() takes the rest.
+        const size_t h = (64 - (uintptr_t(t) & 63)) & 63;
+        const size_t end = h + 64 * NEEDLEHAMMER_PROLOGUE;   // candidates [0, end)
+        if (NEEDLEHAMMER_PROLOGUE && end + 63 <= n - m) {
+            r = detail::prologue(t, n, p, m, o, end);
+            if (r == end) r = detail::scan(t, n, p, m, o, end);
+        } else {
+            r = detail::scan(t, n, p, m, o, 0);
+        }
         if (r > n) r = guardzilla::detail::twoway(t, n, p, m, r - n - 1);   // the budget ran out
     }
     return r < n ? std::pair<bool, size_t>{true, r} : std::pair<bool, size_t>{false, 0};

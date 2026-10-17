@@ -36,6 +36,10 @@ if(SIMDSEARCH_TESTS)
     add_needlehammer_test(default)
     add_needlehammer_test(eager NEEDLEHAMMER_WINDOW=2 NEEDLEHAMMER_LONG_WINDOW=3 NEEDLEHAMMER_BAND=1 NEEDLEHAMMER_TIMED=0)
     add_needlehammer_test(eager_anchors2 NEEDLEHAMMER_WINDOW=2 NEEDLEHAMMER_LONG_WINDOW=3 NEEDLEHAMMER_BAND=1 NEEDLEHAMMER_TIMED=0 NEEDLEHAMMER_ANCHORS=2)
+    add_needlehammer_test(prologue0 NEEDLEHAMMER_PROLOGUE=0)
+    add_needlehammer_test(prologue1 NEEDLEHAMMER_PROLOGUE=1)
+    add_needlehammer_test(eager_prologue0 NEEDLEHAMMER_WINDOW=2 NEEDLEHAMMER_LONG_WINDOW=3 NEEDLEHAMMER_BAND=1 NEEDLEHAMMER_TIMED=0 NEEDLEHAMMER_PROLOGUE=0)
+    add_needlehammer_test(eager_prologue1 NEEDLEHAMMER_WINDOW=2 NEEDLEHAMMER_LONG_WINDOW=3 NEEDLEHAMMER_BAND=1 NEEDLEHAMMER_TIMED=0 NEEDLEHAMMER_PROLOGUE=1)
 
     # The public header in a translation unit of its own, at the library's C++
     # standard, included from two translation units of one program.
@@ -133,13 +137,21 @@ if(SIMDSEARCH_BENCHMARKS)
     target_compile_options(branch_penalty PRIVATE -mavx512vbmi2 -mavx512vl)
     set_target_properties(branch_penalty PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
 
-    # NeedleHammer's switch threshold, window and second-scan anchors.
+    # NeedleHammer's switch threshold, window, prologue, budget and second-scan anchors.
     foreach(b 10 25)
         add_search_bench(needlehammer_band${b} needlehammer NEEDLEHAMMER_BAND=${b})
         target_compile_options(search_bench_needlehammer_band${b} PRIVATE -mavx512vbmi2 -mavx512vl)
     endforeach()
     add_search_bench(needlehammer_window16 needlehammer NEEDLEHAMMER_WINDOW=16)
+    foreach(k 0 4 64)
+        add_search_bench(needlehammer_prologue${k} needlehammer NEEDLEHAMMER_PROLOGUE=${k})
+        target_compile_options(search_bench_needlehammer_prologue${k} PRIVATE -mavx512vbmi2 -mavx512vl)
+    endforeach()
     target_compile_options(search_bench_needlehammer_window16 PRIVATE -mavx512vbmi2 -mavx512vl)
+    foreach(b 2 8)
+        add_search_bench(needlehammer_budget${b} needlehammer GUARDZILLA_BUDGET=${b})
+        target_compile_options(search_bench_needlehammer_budget${b} PRIVATE -mavx512vbmi2 -mavx512vl)
+    endforeach()
     foreach(a 1 2 4 5 6)
         add_search_bench(needlehammer_anchors${a} needlehammer NEEDLEHAMMER_ANCHORS=${a})
         target_compile_options(search_bench_needlehammer_anchors${a} PRIVATE -mavx512vbmi2 -mavx512vl)

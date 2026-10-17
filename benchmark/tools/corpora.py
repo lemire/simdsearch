@@ -21,6 +21,10 @@ the byte-frequency structure the anchored filter depends on:
             (data/cpp_source.txt, a fixed file shipped with the repository)
   chinese   UTF-8 CJK -- almost every byte >= 0x80
   russian   UTF-8 Cyrillic -- two-byte sequences, high bytes throughout
+  influenza Pizza&Chili's influenza genomes (from NCBI's GenBank): real DNA,
+            many similar strains, with header lines
+  leaders   Pizza&Chili's world_leaders: the CIA's World Leaders lists,
+            2003 to 2009, as text (a US government work, public domain)
 
 The last three matter because UTF-8 CJK and Cyrillic spend most bytes at or
 above 0x80, unlike the Latin book the default run uses. The StringZilla-style
@@ -31,7 +35,8 @@ russian are where that rule is tested.
 so the ranking can be checked once the haystack leaves cache and every searcher
 converges toward memory bandwidth.
 
-The non-Latin text is fetched from Project Gutenberg when a network is
+The two Pizza&Chili corpora are fetched (about 19 MB) and have no synthetic
+substitute: offline, they are skipped. The non-Latin text is fetched from Project Gutenberg when a network is
 available and synthesised deterministically otherwise; every synthetic corpus is seeded, so
 runs are reproducible. Usage:
 
@@ -64,6 +69,13 @@ GUTENBERG = {
     # entries are English translations -- this one is the original script,
     # ~86% of bytes >= 0x80.
     "russian": "https://www.gutenberg.org/files/30774/30774-0.txt",
+}
+
+# Pizza&Chili's repetitive corpus (pizzachili.dcc.uchile.cl/repcorpus.html).
+# Each corpus is 1 MiB from the middle of the first 24 MiB of the file.
+PIZZACHILI = {
+    "influenza": "https://pizzachili.dcc.uchile.cl/repcorpus/real/influenza.gz",
+    "leaders": "https://pizzachili.dcc.uchile.cl/repcorpus/real/world_leaders.gz",
 }
 
 # The C/C++ corpus: the benchmark's own sources at commit c52bda8 (driver,
@@ -214,6 +226,31 @@ def build_diversity(out: str, book: bytes):
                 utf8_fallback(fallbacks[name], TARGET, 6))
 
 
+def middle(raw: bytes, n: int) -> bytes:
+    """n bytes from the middle of raw, starting on a UTF-8 character."""
+    s = len(raw) // 2 - n // 2
+    b = raw[s:s + n + 4]
+    i = 0
+    while i < 4 and 0x80 <= b[i] < 0xC0:
+        i += 1
+    return b[i:i + n]
+
+
+def build_pizzachili(out: str):
+    import zlib
+    for name, url in PIZZACHILI.items():
+        path = os.path.join(out, name + ".dat")
+        if os.path.exists(path) and os.path.getsize(path) == TARGET:
+            print(f"  {name}: cached"); continue
+        print(f"  {name} ...")
+        raw = fetch(url)
+        if not raw:
+            print(f"    (offline: {name} skipped)", file=sys.stderr)
+            continue
+        body = zlib.decompressobj(16 + zlib.MAX_WBITS).decompress(raw, 24 << 20)
+        open(path, "wb").write(middle(body, TARGET))
+
+
 def build_sizes(out: str, book: bytes, max_size: int):
     n = 1024
     while n <= max_size:
@@ -283,6 +320,7 @@ def main():
 
     print("diversity corpora:")
     build_diversity(a.out, book)
+    build_pizzachili(a.out)
     write_manifest(a.out)
     if a.sizes:
         print("size sweep:")
