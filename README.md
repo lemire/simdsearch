@@ -33,6 +33,10 @@ about 5% slower elsewhere, also in O(n + m) time. It also needs AVX-512 VBMI2 an
 auto [found, index] = needlehammer::find(hay.data(), hay.size(), "fox", 3);
 ```
 
+## Rust
+
+A Rust port of Guardzilla and NeedleHammer is in [`rust/`](rust/README.md).
+
 ## Requirements
 
 An x86-64 processor with **AVX-512F and AVX-512BW** (Intel Skylake-SP and
